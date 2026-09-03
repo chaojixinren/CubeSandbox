@@ -5,11 +5,13 @@
 //! the table of processes started through `process.Process/Start`.
 
 use std::collections::HashMap;
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::sync::broadcast;
 
+use crate::cgroup::{self, Manager, ProcType};
 use crate::exec;
 use crate::msg::process::ProcessConfig;
 
@@ -66,6 +68,13 @@ pub struct AppState {
     pub initialized: AtomicBool,
     processes: Mutex<HashMap<ProcHandle, ProcEntry>>,
     next_handle: AtomicU64,
+    /// cgroup v2 subtree manager (item 1.8). Non-`Option`: startup failure is
+    /// a `NoopManager` instance, not an absent value (mirrors upstream
+    /// `createCgroupManager`'s named return + defer swap, plan §0.1). `new()`
+    /// always starts with the no-op fallback so unit tests never touch
+    /// /sys/fs/cgroup; `main.rs` swaps in the real manager exactly once via
+    /// `with_cgroup(cgroup::init())`.
+    cgroup: Arc<dyn Manager>,
 }
 
 impl AppState {
@@ -84,7 +93,24 @@ impl AppState {
             initialized: AtomicBool::new(false),
             processes: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            cgroup: Arc::new(cgroup::NoopManager),
         }
+    }
+
+    /// Startup wiring (main.rs calls this once): swap in the real cgroup
+    /// manager and keep it for the daemon lifetime. `new()` stays no-op so
+    /// every unit test constructs `AppState` without probing the host cgroup
+    /// tree; the manager choice is then fixed by this single call.
+    pub fn with_cgroup(mut self, cgroup: Arc<dyn Manager>) -> Self {
+        self.cgroup = cgroup;
+        self
+    }
+
+    /// cgroup dir fd for `t`, or `None` under the Noop fallback. Handed to
+    /// `exec::spawn` at the process service layer (mirrors upstream
+    /// `getProcType` + `GetFileDescriptor` in handler.go).
+    pub fn cgroup_fd(&self, t: ProcType) -> Option<RawFd> {
+        self.cgroup.fd(t)
     }
 
     /// Merge (not replace) env vars — matches the Go envd baseline: repeated
@@ -277,6 +303,29 @@ mod tests {
         assert_eq!(vars.get("A").map(String::as_str), Some("1"));
         assert_eq!(vars.get("B").map(String::as_str), Some("2"));
         assert_eq!(vars.get("E2B_SANDBOX").map(String::as_str), Some("false"));
+    }
+
+    /// The two lines the process service depends on (plan §3.4): a fresh
+    /// `AppState` has no cgroup manager (`fd() == None` — unit tests never
+    /// probe the host tree), and `with_cgroup` swaps in the real one so the
+    /// same call starts returning `Some`. A stub manager stands in for
+    /// `Cgroup2Manager` (whose constructor needs a real cgroup v2 mount).
+    #[test]
+    fn cgroup_fd_defaults_noop_then_with_cgroup_swaps_in() {
+        struct Stub;
+        impl Manager for Stub {
+            fn fd(&self, _t: ProcType) -> Option<RawFd> {
+                Some(42)
+            }
+        }
+
+        let s = AppState::new();
+        assert_eq!(s.cgroup_fd(ProcType::User), None);
+        assert_eq!(s.cgroup_fd(ProcType::Pty), None);
+
+        let s = s.with_cgroup(Arc::new(Stub));
+        assert_eq!(s.cgroup_fd(ProcType::User), Some(42));
+        assert_eq!(s.cgroup_fd(ProcType::Pty), Some(42));
     }
 
     #[test]
