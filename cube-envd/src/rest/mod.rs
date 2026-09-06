@@ -3,8 +3,13 @@
 
 //! REST endpoints: /health /init /envs /metrics /files.
 
+pub mod content_disposition;
+pub mod encoding;
 pub mod files;
+pub mod httpdate;
 pub mod metrics;
+pub mod preconditions;
+pub mod ranges;
 
 use std::collections::HashMap;
 use std::sync::Arc;
