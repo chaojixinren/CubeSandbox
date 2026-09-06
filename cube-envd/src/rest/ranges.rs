@@ -48,10 +48,9 @@ impl RangeError {
 
 /// `parseRange` — `None` when the header is absent; `Err(Invalid)` on syntax
 /// errors; `Err(NoOverlap)` when no listed range overlaps (callers must still
-/// special-case `size == 0` → ignore, mirroring serveContent). Multiple
-/// overlapping-eligible ranges come back as a vec (declared difference D3:
-/// served as a plain 200, matching upstream's own non-multipart behavior when
-/// it has no multipart writer).
+/// special-case `size == 0` → ignore, mirroring serveContent). Multiple ranges
+/// come back as a vec; the download handler answers any request whose vec has
+/// more than one entry with the full file (no multipart writer).
 pub fn parse_range(header: Option<&str>, size: i64) -> Result<Option<Vec<ByteRange>>, RangeError> {
     let Some(s) = header else {
         return Ok(None);
@@ -260,9 +259,8 @@ mod tests {
 
     #[test]
     fn range_multiple_ranges_stay_separate() {
-        // D3 note: overlapping ranges parse individually (serveContent would
-        // merge them for multipart); cube-envd serves a plain 200 for any
-        // multi-range request, so keeping them separate is fine.
+        // Overlapping ranges parse individually; the handler ignores any
+        // multi-range result (full 200), so they need not be merged.
         let r = parse_range(Some("bytes=0-5, 3-8"), 100).unwrap().unwrap();
         assert_eq!(r.len(), 2);
     }

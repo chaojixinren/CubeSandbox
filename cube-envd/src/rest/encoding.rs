@@ -3,21 +3,23 @@
 
 //! Accept-Encoding / content-encoding negotiation.
 //!
-//! Translated 1:1 from upstream `packages/envd/internal/api/encoding.go`
-//! (blob sha256 `9481e2e5…ff5d5`, see range-1.3-plan.md §0.1): the request
-//! half of the download pipeline. Everything here is pure so the two 406
-//! exits the handler owns stay wire-identical without I/O.
+//! 1:1 mirror of the same logic in upstream envd's `encoding.go`, which owns
+//! the request half of the download pipeline. Everything here is pure so the
+//! two 406 exits the handler emits stay wire-identical without I/O.
 //!
-//! NOTE: cube-envd only ever *serves* identity (declared difference D1 — the
-//! CubeProxy applies gzip to text types); the parser still mirrors upstream
-//! because `Range`/conditional requests with an unacceptable identity must be
-//! refused with the same 406 upstream emits.
+//! cube-envd only ever *serves* identity (the CubeProxy applies gzip to text
+//! types); the parser still mirrors upstream because a `Range`/conditional
+//! request with an unacceptable identity must be refused with the same 406
+//! upstream emits — including its `supported: [gzip]` message.
 
-/// Supported content-encoding (`SupportedEncodings` — order = preference).
+/// Content-encodings the server advertises, most preferred first. Mirror of
+/// upstream `SupportedEncodings` — the parser uses it to resolve `*` and to
+/// build the 406 message above, which is why it must stay `["gzip"]` even
+/// though responses are identity-only (see module doc).
 pub const SUPPORTED_ENCODINGS: [&str; 1] = ["gzip"];
 
-/// An encoding the client may receive. cube-envd serves identity only (D1);
-/// the variants are exercised by the parser's unit tests.
+/// An encoding the client may receive. cube-envd serves identity only; the
+/// variants are exercised by the parser's unit tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Identity,

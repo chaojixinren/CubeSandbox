@@ -3,10 +3,10 @@
 
 //! `Content-Disposition` header values for file downloads.
 //!
-//! Translated from Go stdlib `mime.FormatMediaType("inline", {"filename":
-//! base})` (go1.26.5 — `mime/mediatype.go` + `mime/grammar.go`), the exact
-//! call upstream envd's download.go makes. Pure function; the media type and
-//! attribute are fixed because upstream only ever sends `inline; filename=…`.
+//! Mirror of Go stdlib `mime.FormatMediaType("inline", {"filename": base})`
+//! — the exact call upstream envd's download.go makes. Pure function; the
+//! media type and attribute are fixed because upstream only ever sends
+//! `inline; filename=…`.
 
 /// RFC 7230 token characters (`isTokenChar`).
 fn is_token_char(c: u8) -> bool {

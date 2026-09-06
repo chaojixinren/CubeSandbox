@@ -11,8 +11,8 @@
 //! - upload: multipart (part filename = target path) or raw octet-stream
 //!   (`path` query required); parents are created; the file is chowned to
 //!   the requesting user; response is `[{"name","path","type":"file"}]`;
-//! - gzip response encoding is NOT implemented (declared difference —
-//!   identity responses are valid HTTP for any Accept-Encoding).
+//! - gzip response encoding is not implemented: responses are always
+//!   identity (valid HTTP for any Accept-Encoding).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -57,19 +57,112 @@ fn check_token_rest(state: &AppState, headers: &HeaderMap) -> Result<(), RestErr
 /// semantics: Last-Modified, conditional requests (If-Match / If-Unmodified-
 /// Since / If-None-Match / If-Modified-Since / If-Range → 304/412), Range
 /// (single range → 206, unsatisfiable → 416), Accept-Ranges, and the two 406
-/// Accept-Encoding exits — in upstream download.go's exact order (see
-/// docs/cube-envd/item-1.3-implementation-plan.md §2).
+/// Accept-Encoding exits — in upstream download.go's exact order. The stages
+/// below are extracted as helpers so each mirrors one upstream step; the
+/// order of the calls *is* the pipeline order.
 pub async fn download(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Err(e) = check_token_rest(&state, &headers) {
-        return e.into_response();
+    // Stage 1: token → user → path → stat/isdir (error order unchanged).
+    let ResolvedFile { path, meta } = match resolve_download(&state, &params, &headers).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // Stage 2: Accept-Encoding gates (parse 406 before Vary is set, identity
+    // gate after it — upstream's order).
+    if let Err(resp) = gate_accept_encoding(&headers) {
+        return resp;
     }
-    let user = match resolve_request_user(&state, &params, &headers) {
+    // Stage 3: open once; the handle is reused for sniffing, seek and stream.
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return RestError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("error opening file '{path}': {e}"),
+            )
+            .into_response();
+        }
+    };
+    // Stage 4: preset headers (Vary / Content-Disposition / Last-Modified)
+    // and the modtime the conditional steps key off.
+    let preset = Preset::new(&path, &meta);
+    // Stage 5: conditional requests → 304/412. Runs before the Content-Type
+    // probe so those answers carry no Content-Type, exactly like upstream.
+    if let Some(resp) = preset.condition_response(&headers) {
+        return resp;
+    }
+    // Stage 6: Content-Type sniff (approximates Go's DetectContentType); a
+    // failed rewind reopens the file so the body still starts at byte 0.
+    let content_type = match sniff_content_type_or_reopen(&mut file, &path).await {
+        Ok(ct) => ct,
+        Err(resp) => return resp,
+    };
+    // Stage 7: Range dispatch — If-Range gate, parse, single-range seek.
+    let single = match plan_range(&mut file, &headers, &preset, meta.len()).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    // Stage 8: assemble the success response (200 full / 206 range).
+    let (code, stream_limit) = match &single {
+        Some(r) => (StatusCode::PARTIAL_CONTENT, Some(r.length as u64)),
+        None => (StatusCode::OK, None),
+    };
+
+    // Common success headers: Content-Type always; Content-Range only on
+    // 206; Accept-Ranges always; Content-Length for 206 and for 200 when the
+    // stat size is positive.
+    let mut b = axum::response::Response::builder().status(code);
+    b = preset.apply(b);
+    b = b.header(axum::http::header::CONTENT_TYPE, content_type);
+    if let Some(r) = single {
+        b = b.header(
+            axum::http::header::CONTENT_RANGE,
+            r.content_range(meta.len() as i64),
+        );
+    }
+    b = b.header(axum::http::header::ACCEPT_RANGES, "bytes");
+    let size = meta.len();
+    let body_len = match single {
+        Some(r) => Some(r.length as u64),
+        // stat-size-0 but readable files (/proc/*, some sysfs) would get a
+        // Content-Length: 0 header that truncates the real body — stream
+        // those chunked instead. Regular files keep the explicit length
+        // (baseline sends one).
+        None if size == 0 => None,
+        None => Some(size),
+    };
+    if let Some(len) = body_len {
+        b = b.header(axum::http::header::CONTENT_LENGTH, len);
+    }
+    let stream = reader_stream(file, stream_limit);
+    b.body(axum::body::Body::from_stream(stream))
+        .expect("build download response")
+}
+
+/// Stage 1 result: the request resolved to a path whose stat succeeded and
+/// which is not a directory.
+struct ResolvedFile {
+    path: String,
+    meta: std::fs::Metadata,
+}
+
+/// Stage 1 — token → user → path → stat. Mirrors download.go's order; every
+/// error exit keeps its baseline status and message.
+#[allow(clippy::result_large_err)] // axum helpers propagate prebuilt responses, not an error type
+async fn resolve_download(
+    state: &Arc<AppState>,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<ResolvedFile, axum::response::Response> {
+    if let Err(e) = check_token_rest(state, headers) {
+        return Err(e.into_response());
+    }
+    let user = match resolve_request_user(state, params, headers) {
         Ok(u) => u,
-        Err(e) => return e.into_response(),
+        Err(e) => return Err(e.into_response()),
     };
     // Baseline: a missing `path` parameter falls back to the user's home
     // directory (which then fails with the "is a directory" error). A
@@ -87,50 +180,54 @@ pub async fn download(
     let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return RestError::new(
+            return Err(RestError::new(
                 StatusCode::NOT_FOUND,
                 format!("path '{path}' does not exist"),
             )
-            .into_response();
+            .into_response());
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return RestError::new(
+            return Err(RestError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("error opening file '{path}': permission denied"),
             )
-            .into_response();
+            .into_response());
         }
         Err(e) => {
-            return RestError::new(
+            return Err(RestError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("error opening file '{path}': {e}"),
             )
-            .into_response();
+            .into_response());
         }
     };
     if meta.is_dir() {
-        return RestError::new(
+        return Err(RestError::new(
             StatusCode::BAD_REQUEST,
             format!("path '{path}' is a directory"),
         )
-        .into_response();
+        .into_response());
     }
+    Ok(ResolvedFile { path, meta })
+}
 
-    // Accept-Encoding, then Vary, then the Range/conditional identity gate —
-    // upstream's order (download.go): the first 406 answers BEFORE Vary is
-    // set; the second one carries Vary. nginx's `add_header Vary` has no
-    // `always`, so error responses must carry it themselves when upstream
-    // does.
-    let ae = header_str(&headers, axum::http::header::ACCEPT_ENCODING).unwrap_or("");
+/// Stage 2 — the two Accept-Encoding 406 exits, in upstream order: the parse
+/// failure answers before `Vary` is set; the Range/conditional identity gate
+/// answers after it and therefore carries `Vary` itself (nginx's `add_header
+/// Vary` has no `always`, so error responses must carry it when upstream
+/// does).
+#[allow(clippy::result_large_err)] // axum helpers propagate prebuilt responses, not an error type
+fn gate_accept_encoding(headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    let ae = header_str(headers, axum::http::header::ACCEPT_ENCODING).unwrap_or("");
     if encoding::parse_accept_encoding(ae).is_err() {
-        return RestError::new(
+        return Err(RestError::new(
             StatusCode::NOT_ACCEPTABLE,
             "error parsing Accept-Encoding: no acceptable encoding found, supported: [gzip]",
         )
-        .into_response();
+        .into_response());
     }
-    // cube-envd serves identity only (declared difference D1); the parsed
-    // best encoding is deliberately unused, but the rejection above must stay.
+    // cube-envd serves identity only: the parsed best encoding is
+    // deliberately unused, but the rejection above must stay.
     let has_range_or_conditional = [
         axum::http::header::RANGE,
         axum::http::header::IF_MODIFIED_SINCE,
@@ -139,21 +236,19 @@ pub async fn download(
     ]
     .iter()
     .any(|h| {
-        header_str(&headers, h.clone())
+        header_str(headers, h.clone())
             .map(|v| !v.is_empty())
             .unwrap_or(false)
     });
     if has_range_or_conditional && !encoding::is_identity_acceptable(ae) {
         // This 406 answers AFTER Vary was set, so it must carry Vary itself
-        // (nginx's `add_header Vary` has no `always`; upstream sets the
-        // header on the writer before this exit). Body shape matches
-        // RestError / upstream jsonError.
+        // (see fn doc). Body shape matches RestError / upstream jsonError.
         let body = serde_json::json!({
             "code": 406,
             "message": "identity encoding not acceptable for Range or conditional request",
         })
         .to_string();
-        return axum::response::Response::builder()
+        return Err(axum::response::Response::builder()
             .status(StatusCode::NOT_ACCEPTABLE)
             .header(axum::http::header::VARY, "Accept-Encoding")
             .header(
@@ -161,131 +256,174 @@ pub async fn download(
                 "application/json; charset=utf-8",
             )
             .body(axum::body::Body::from(body))
-            .expect("build 406 response");
+            .expect("build 406 response"));
     }
+    Ok(())
+}
 
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            return RestError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("error opening file '{path}': {e}"),
-            )
-            .into_response();
-        }
-    };
+/// The header set shared by every download answer: Vary + Content-Disposition
+/// (+ Last-Modified when the mtime is meaningful), plus the variant that
+/// drops Last-Modified for 416 (fs.go serveError).
+struct Preset {
+    modtime: Option<i64>,
+    headers: Vec<(axum::http::HeaderName, String)>,
+    no_last_modified: Vec<(axum::http::HeaderName, String)>,
+}
 
-    // Preset headers (upstream sets Content-Disposition before
-    // http.ServeContent, which then adds Last-Modified from the stat mtime).
-    // Vary, Content-Disposition and Last-Modified survive 304/412; 416
-    // deletes Last-Modified (fs.go serveError). Content-Type / Content-Length
-    // are only added on 200/206.
-    let disposition = content_disposition::format_content_disposition(
-        std::path::Path::new(&path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("download"),
-    );
-    // Go `isZeroTime`: epoch/zero mtimes mean "no time" → no Last-Modified
-    // and the date-based conditions do not apply. The mtime is already
-    // second-truncated (`as_secs`), like Go's Truncate(time.Second).
-    let modtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .filter(|secs| *secs != 0);
-    let preset: Vec<(axum::http::HeaderName, String)> = {
-        let mut v = Vec::with_capacity(4);
-        v.push((axum::http::header::VARY, "Accept-Encoding".to_string()));
-        v.push((axum::http::header::CONTENT_DISPOSITION, disposition));
+impl Preset {
+    /// Upstream sets Content-Disposition before http.ServeContent, which then
+    /// adds Last-Modified from the stat mtime. Go `isZeroTime`: epoch/zero
+    /// mtimes mean "no time" → no Last-Modified and the date-based conditions
+    /// do not apply; the mtime is second-truncated (`as_secs`), like Go's
+    /// Truncate(time.Second).
+    fn new(path: &str, meta: &std::fs::Metadata) -> Preset {
+        let disposition = content_disposition::format_content_disposition(
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("download"),
+        );
+        let modtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .filter(|secs| *secs != 0);
+        let mut headers = Vec::with_capacity(3);
+        headers.push((axum::http::header::VARY, "Accept-Encoding".to_string()));
+        headers.push((axum::http::header::CONTENT_DISPOSITION, disposition));
         if let Some(mt) = modtime {
-            v.push((
+            headers.push((
                 axum::http::header::LAST_MODIFIED,
                 httpdate::format_http_date(mt),
             ));
         }
-        v
-    };
-    // 416 keeps Vary + Content-Disposition but drops Last-Modified.
-    let preset_no_last_modified: Vec<_> = preset
-        .iter()
-        .filter(|(k, _)| *k != axum::http::header::LAST_MODIFIED)
-        .cloned()
-        .collect();
-    let apply_preset = |mut b: axum::http::response::Builder,
-                        headers: &[(axum::http::HeaderName, String)]|
-     -> axum::http::response::Builder {
-        for (k, v) in headers {
+        let no_last_modified = headers
+            .iter()
+            .filter(|(k, _)| *k != axum::http::header::LAST_MODIFIED)
+            .cloned()
+            .collect();
+        Preset {
+            modtime,
+            headers,
+            no_last_modified,
+        }
+    }
+
+    fn apply(&self, mut b: axum::http::response::Builder) -> axum::http::response::Builder {
+        for (k, v) in &self.headers {
             b = b.header(k.clone(), v.clone());
         }
         b
-    };
-    let empty = |code: StatusCode,
-                 headers: &[(axum::http::HeaderName, String)]|
-     -> axum::response::Response {
-        apply_preset(axum::response::Response::builder().status(code), headers)
-            .body(axum::body::Body::empty())
-            .expect("build error response")
-    };
-
-    // Conditional requests (fs.go checkPreconditions) run before the
-    // Content-Type probe — so 304/412 carry no Content-Type, exactly like
-    // upstream.
-    match preconditions::check_preconditions(
-        header_str(&headers, axum::http::header::IF_MATCH),
-        header_str(&headers, axum::http::header::IF_UNMODIFIED_SINCE),
-        header_str(&headers, axum::http::header::IF_NONE_MATCH),
-        header_str(&headers, axum::http::header::IF_MODIFIED_SINCE),
-        modtime,
-    ) {
-        preconditions::CondOutcome::NotModified => {
-            // fs.go writeNotModified: strips Content-Type/Content-Length/
-            // Content-Encoding (none set yet here) and keeps Last-Modified
-            // (no ETag).
-            return empty(StatusCode::NOT_MODIFIED, &preset);
-        }
-        preconditions::CondOutcome::PreconditionFailed => {
-            // fs.go: bare 412, no body, no Content-Type.
-            return empty(StatusCode::PRECONDITION_FAILED, &preset);
-        }
-        preconditions::CondOutcome::Serve => {}
     }
 
-    // Baseline serves downloads through Go's content sniffer; approximate it
-    // with a text/binary split, which covers what SDK users observe. The
-    // full DetectContentType table is a declared non-goal.
-    let content_type = match sniff_content_type(&mut file).await {
-        Ok(ct) => ct,
-        Err(_) => {
-            // Rewind failed (non-seekable special file): reopen so the body
-            // still starts at byte 0 instead of after the sniffed prefix.
-            match tokio::fs::File::open(&path).await {
-                Ok(f) => {
-                    file = f;
-                    "application/octet-stream"
-                }
-                Err(e) => {
-                    return RestError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("error opening file '{path}': {e}"),
-                    )
-                    .into_response();
-                }
-            }
+    fn apply_without_last_modified(
+        &self,
+        mut b: axum::http::response::Builder,
+    ) -> axum::http::response::Builder {
+        for (k, v) in &self.no_last_modified {
+            b = b.header(k.clone(), v.clone());
         }
-    };
+        b
+    }
 
-    let size = meta.len();
-    // Range (fs.go parseRange, then serveContent's dispatch): an If-Range
-    // that fails drops the Range header (full 200). Multi-range requests are
-    // served as a plain 200 (declared difference D3 — upstream's multipart
-    // path is unused by any SDK).
-    let range_hdr = header_str(&headers, axum::http::header::RANGE);
+    /// Stage 5 — fs.go checkPreconditions: 304 (writeNotModified header set)
+    /// or 412 (bare) when a condition fires, else the download continues.
+    fn condition_response(&self, headers: &HeaderMap) -> Option<axum::response::Response> {
+        use preconditions::CondOutcome;
+        match preconditions::check_preconditions(
+            header_str(headers, axum::http::header::IF_MATCH),
+            header_str(headers, axum::http::header::IF_UNMODIFIED_SINCE),
+            header_str(headers, axum::http::header::IF_NONE_MATCH),
+            header_str(headers, axum::http::header::IF_MODIFIED_SINCE),
+            self.modtime,
+        ) {
+            CondOutcome::NotModified => {
+                // fs.go writeNotModified: strips Content-Type/Content-Length/
+                // Content-Encoding (none set yet here) and keeps Last-Modified
+                // (no ETag).
+                Some(self.empty(StatusCode::NOT_MODIFIED))
+            }
+            CondOutcome::PreconditionFailed => {
+                // fs.go: bare 412, no body, no Content-Type.
+                Some(self.empty(StatusCode::PRECONDITION_FAILED))
+            }
+            CondOutcome::Serve => None,
+        }
+    }
+
+    /// Empty-bodied 304/412 answer carrying the preset headers.
+    fn empty(&self, code: StatusCode) -> axum::response::Response {
+        self.apply(axum::response::Response::builder().status(code))
+            .body(axum::body::Body::empty())
+            .expect("build error response")
+    }
+
+    /// fs.go serveError shape: text/plain + nosniff, optional Content-Range,
+    /// explicit Content-Length, Last-Modified stripped (416 and the 206 seek
+    /// failure both answer this way).
+    fn plain_error(
+        &self,
+        code: StatusCode,
+        content_range: Option<String>,
+        body: String,
+    ) -> axum::response::Response {
+        let mut b =
+            self.apply_without_last_modified(axum::response::Response::builder().status(code));
+        if let Some(cr) = content_range {
+            b = b.header(axum::http::header::CONTENT_RANGE, cr);
+        }
+        b.header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(axum::http::header::CONTENT_LENGTH, body.len())
+        .body(axum::body::Body::from(body))
+        .expect("build plain error response")
+    }
+}
+
+/// Stage 6 — approximate Go's DetectContentType with a text/binary split
+/// (the full table is a non-goal). A failed rewind means a non-seekable
+/// special file: reopen so the stream still starts at byte 0.
+#[allow(clippy::result_large_err)] // axum helpers propagate prebuilt responses, not an error type
+async fn sniff_content_type_or_reopen(
+    file: &mut tokio::fs::File,
+    path: &str,
+) -> Result<&'static str, axum::response::Response> {
+    match sniff_content_type(file).await {
+        Ok(ct) => Ok(ct),
+        Err(_) => match tokio::fs::File::open(path).await {
+            Ok(f) => {
+                *file = f;
+                Ok("application/octet-stream")
+            }
+            Err(e) => Err(RestError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("error opening file '{path}': {e}"),
+            )
+            .into_response()),
+        },
+    }
+}
+
+/// Stage 7 — fs.go serveContent Range dispatch: an If-Range that fails drops
+/// the Range header (full 200); a single range is seeked for the 206; any
+/// multi-range request is answered with the full file; the 416 shapes and the
+/// seek-error 416 are emitted here.
+#[allow(clippy::result_large_err)] // axum helpers propagate prebuilt responses, not an error type
+async fn plan_range(
+    file: &mut tokio::fs::File,
+    headers: &HeaderMap,
+    preset: &Preset,
+    size: u64,
+) -> Result<Option<ranges::ByteRange>, axum::response::Response> {
+    let range_hdr = header_str(headers, axum::http::header::RANGE);
     let range_kept = range_hdr.is_some_and(|_| {
         preconditions::if_range_keeps_range(
-            header_str(&headers, axum::http::header::IF_RANGE),
-            modtime,
+            header_str(headers, axum::http::header::IF_RANGE),
+            preset.modtime,
         )
     });
     let ranges = if range_kept {
@@ -295,7 +433,8 @@ pub async fn download(
     };
     let single = match ranges {
         Ok(ranges) => {
-            // Some(vec) with >1 entries → multi-range → ignored (D3).
+            // A single-range request is served as 206; any multi-range
+            // request is answered with the full file instead.
             if ranges.as_ref().is_some_and(|r| r.len() == 1) {
                 ranges.unwrap().pop()
             } else {
@@ -306,84 +445,22 @@ pub async fn download(
         // always send Range; answer 200 rather than 416).
         Err(ranges::RangeError::NoOverlap) if size == 0 => None,
         Err(e) => {
-            // fs.go serveError(416): strips Cache-Control/Content-Encoding/
-            // ETag/Last-Modified, then http.Error — text/plain body, nosniff.
             let cr = match e {
                 ranges::RangeError::NoOverlap => Some(format!("bytes */{size}")),
                 ranges::RangeError::Invalid => None,
             };
-            let mut b =
-                axum::response::Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE);
-            b = apply_preset(b, &preset_no_last_modified);
-            if let Some(cr) = cr {
-                b = b.header(axum::http::header::CONTENT_RANGE, cr);
-            }
             let body = format!("{}\n", e.message());
-            return b
-                .header(
-                    axum::http::header::CONTENT_TYPE,
-                    "text/plain; charset=utf-8",
-                )
-                .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-                .header(axum::http::header::CONTENT_LENGTH, body.len())
-                .body(axum::body::Body::from(body))
-                .expect("build 416 response");
+            return Err(preset.plain_error(StatusCode::RANGE_NOT_SATISFIABLE, cr, body));
         }
     };
-
-    // Seek for a single range, mirroring fs.go before it emits the 206.
-    let (code, stream_limit) = match single {
-        Some(r) => {
-            use tokio::io::AsyncSeekExt;
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(r.start as u64)).await {
-                // fs.go serveError with the seek error on a 416.
-                let body = format!("{e}\n");
-                return apply_preset(
-                    axum::response::Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE),
-                    &preset_no_last_modified,
-                )
-                .header(
-                    axum::http::header::CONTENT_TYPE,
-                    "text/plain; charset=utf-8",
-                )
-                .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-                .header(axum::http::header::CONTENT_LENGTH, body.len())
-                .body(axum::body::Body::from(body))
-                .expect("build seek-error response");
-            }
-            (StatusCode::PARTIAL_CONTENT, Some(r.length as u64))
-        }
-        None => (StatusCode::OK, None),
-    };
-
-    // Common success headers: Content-Type always; Content-Range only on
-    // 206; Accept-Ranges always; Content-Length for 206 and for 200 when the
-    // stat size is positive.
-    let mut b = axum::response::Response::builder().status(code);
-    b = apply_preset(b, &preset);
-    b = b.header(axum::http::header::CONTENT_TYPE, content_type);
     if let Some(r) = single {
-        b = b.header(
-            axum::http::header::CONTENT_RANGE,
-            r.content_range(size as i64),
-        );
+        use tokio::io::AsyncSeekExt;
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(r.start as u64)).await {
+            let body = format!("{e}\n");
+            return Err(preset.plain_error(StatusCode::RANGE_NOT_SATISFIABLE, None, body));
+        }
     }
-    b = b.header(axum::http::header::ACCEPT_RANGES, "bytes");
-    let body_len = match single {
-        Some(r) => Some(r.length as u64),
-        // stat-size-0 but readable files (/proc/*, some sysfs) would get a
-        // Content-Length: 0 header that truncates the real body — stream
-        // those chunked instead. Regular files keep the explicit length
-        // (baseline sends one).
-        None if size == 0 => None,
-        None => Some(size),
-    };
-    if let Some(len) = body_len {
-        b = b.header(axum::http::header::CONTENT_LENGTH, len);
-    }
-    let stream = reader_stream(file, stream_limit);
-    b.body(axum::body::Body::from_stream(stream))
-        .expect("build download response")
+    Ok(single)
 }
 
 fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> Option<&str> {
@@ -1077,8 +1154,7 @@ mod download_tests {
 
     #[tokio::test]
     async fn multi_range_served_as_full_200() {
-        // Declared difference D3: no multipart; a multi-range request gets
-        // the whole file.
+        // No multipart writer: a multi-range request gets the whole file.
         let (_d, p) = tmp_file("r.bin", b"0123456789");
         let resp = get(&p, &[("Range", "bytes=0-1, 5-6")]).await;
         let (status, _h, b) = body(resp).await;
