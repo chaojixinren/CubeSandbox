@@ -1,4 +1,4 @@
-# 验收测试记录 / Acceptance Test Results — 2026-08-07（最近一次更新：2026-09-02）
+# 验收测试记录 / Acceptance Test Results — 2026-08-07（最近一次更新：2026-09-06）
 
 环境：本地部署 CubeSandbox（dev-env QEMU 虚拟机，CubeAPI @127.0.0.1:13000），
 基线 Go envd 0.5.13（`ghcr.io/tencentcloud/cubesandbox-base:2026.16`），
@@ -258,6 +258,50 @@ stderr 与上游字节一致 ——
 场景数 90 是 1.6 合并时套件即有的规模（base 与本分支的 `capture.py` 完全相同，
 本分支未动）——§2c 记录的 88 是 1.6 开发中更早的时点。`conformance.py` 的
 `DECLARED_DIFFERENT` 现 9 条且全部命中，无孤儿条目；FAIL 恒 0。
+
+## 6. item 1.3 Range / 条件请求下载（2026-09-06，feat/cube-envd-fs-1.3）
+
+> 目标：GET /files 下载对齐上游 `download.go` + Go `net/http` `ServeContent`（identity 路径）：
+> Accept-Encoding 双 406 → Vary → Range/206/416 → Last-Modified → 304/412 → If-Range，顺序与
+> 头集合逐字节一致（决策：导师 2026-09-05「完全兼容做」）。实施见
+> `docs/cube-envd/item-1.3-implementation-plan.md`。
+
+### 单测
+
+`cargo test` → **230 passed / 1 ignored**（新增 55 个纯函数单测：encoding/ranges/httpdate/
+content_disposition/preconditions 五模块；15 个 handler 级集成测试直驱真实下载路径，覆盖
+206 字节精确、416 两型、304 头集合、IMS 回灌 round-trip、空值条件头、If-Range 等）。clippy
+`-D warnings` 与 fmt 干净。`time` crate 开启既有依赖的 `formatting` feature（无新依赖）。
+
+### 对拍（双端 fresh 容器全量重录）
+
+```
+PASS 104  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （112 场景）
+```
+
+allowlist 8 条全部命中、无孤儿条目（watch/compose/gzip/nested-selector×3/JSON 措辞/
+init 越界时间戳——均为既有登记差异）。新增内容：
+
+- **`capture.py` 新组 `cap_files_negotiation()`（15 场景）**：单/开区间/后缀 Range→206 +
+  `Content-Range: bytes a-b/N` 字节精确；越界 vs 语法错误 → 416 两型（`bytes */N` 有无、
+  body 文本 `invalid range…`）；空文件 Range→200；IMS 回灌 304（两段式取真实 Last-Modified）；
+  过期 IMS→200；INM `*`→304 / 具体 etag→200（并跳过 IMS）；If-Match→412；If-Range etag
+  失配丢 Range→200；AE 双 406（identity 门带 `Vary: Accept-Encoding`，parse 失败只带 CORS
+  的 `Vary: Origin`）。
+- **`conformance.py`**：`HEADERS_KEPT` +5（Vary/Accept-Ranges/Content-Range/
+  Content-Disposition/Last-Modified）；Last-Modified 值（RFC 1123，双端容器 mtime 必异）
+  归一 `<time>`——存在性比较、秒粒度由 httpdate.rs 单测覆盖。
+- **wire 抽查（两侧 normalize 后逐字节 identical）**：206 `bytes 2-11/20`；416 无
+  Last-Modified（serveError 在 setLastModified 后跑仍删之——与上游一致）；304 头集合
+  `{Vary, Content-Disposition, Last-Modified}` 无 CT/CL/CE；412 裸空 body 保留
+  Vary/CD/Last-Modified；406 消息文本逐字节一致。
+
+### 录制中发现并修复（capture 层）
+
+rust hyper 在 wire 上以小写发送 header 名（`last-modified:`），Go net/http 用 canonical
+（`Last-Modified:`）——两者均合法（RFC 7230 §3.2 字段名不区分大小写），conformance
+normalize 已 title-case 抹平，不构成对拍差异；但 capture.py 的 IMS 回灌按固定大小写取
+头会崩 → 新增 `header_get()` 大小写不敏感查找，已在重录中使用。
 
 ## 复现
 
