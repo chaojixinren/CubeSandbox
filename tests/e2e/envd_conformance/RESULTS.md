@@ -1,4 +1,4 @@
-# 验收测试记录 / Acceptance Test Results — 2026-08-07（最近一次更新：2026-09-06）
+# 验收测试记录 / Acceptance Test Results — 2026-08-07（最近一次更新：2026-09-07）
 
 环境：本地部署 CubeSandbox（dev-env QEMU 虚拟机，CubeAPI @127.0.0.1:13000），
 基线 Go envd 0.5.13（`ghcr.io/tencentcloud/cubesandbox-base:2026.16`），
@@ -302,6 +302,65 @@ rust hyper 在 wire 上以小写发送 header 名（`last-modified:`），Go net
 （`Last-Modified:`）——两者均合法（RFC 7230 §3.2 字段名不区分大小写），conformance
 normalize 已 title-case 抹平，不构成对拍差异；但 capture.py 的 IMS 回灌按固定大小写取
 头会崩 → 新增 `header_get()` 大小写不敏感查找，已在重录中使用。
+
+### 审查修复后回归（2026-09-07，四轮）
+
+PR #13 四轮评审整改（全部落地于单一整改提交）后全量回归：
+
+**第一轮整改（4 项发现）**：① `httpdate.rs` 手写实现对齐 Go `http.ParseTime`
+三格式（IMF-fixdate/RFC850/asctime，含大小写、空格 run、星期不校验、小数秒、
+RFC850 时区 token 等全部 quirk），`format_http_date` 去 panic（年 10000 文件
+曾 500）；② mtime 按 fs.go `isZeroTime` 先判精确 epoch 再截断，亚秒/负 mtime
+保留（floor 语义），checkIfRange 无零时间门；③ ETag 列表改 fs.go
+scan-and-resume 循环（`"a"garbage, *` → If-Match 412 / If-None-Match 200）；
+④ stat-then-open 经查上游 `download.go:82/:138/:172` 同构，保留。
+验证：`cargo test` **239 passed / 1 ignored**（+8：httpdate 边界金标准、
+mtime/If-Range 边界、畸形 ETag、modtime 单元测试）；另做 **719 例随机+变异
+差分 dump vs go1.26.5 `http.ParseTime`，零分歧**。
+
+**第二轮整改**：① [P2] obs-text 头（0x80-0xFF）曾被 `to_str()` 失败重分类为
+absent——改为 lossy UTF-8，坏字节→U+FFFD，在全部解析器中与 Go 原始字节行为
+同构（+4 handler 测试：Range`\xFF`→416、INM`\xFF`+新 IMS→200 非 304、
+If-Range`\xFF`→200 非 206、AE`identity;q=0,\xFF`→406）；② 上传上限与
+`connect::MAX_ENVELOPE_SIZE` 解耦为 `MAX_UPLOAD_SIZE = 256 MiB`（对齐 proxy
+层上限，覆盖原 64-256 MiB 功能回归区间）；③ lchown 失败告警、rename 后目录
+fsync、ranges 改 ASCII trim、httpdate 重复测试行清理。
+`cargo test` → **242 passed / 1 ignored**；clippy/fmt 干净。
+
+**第三轮整改（round-2 复审结论：其余全部确认通过）**：① 空文件 GET 补
+`Content-Length: 0`（Go ServeContent 按 Seek(End) 定长；此前真空文件发
+chunked，conformance normalize 抹平 framing 故不可见——按 sniff 首读是否
+0 字节区分真空文件与 /proc 伪文件，后者保持 chunked 为既有有意差异）；
+② 上传 Content-Type 改 lossy 读取（obs-text boundary 不再误路由 raw 路径）。
+`cargo test` → **244 passed / 1 ignored**（+2：空文件 CL:0、/proc 伪文件
+无 CL）；clippy/fmt 干净。
+
+**第四轮（round-3 复审通过后的实证新发现）**：go run 直接驱动 `ServeContent`
+实证：Go 的响应 size 一律来自打开句柄的 `Seek(End)`（sizeFunc），而非 path
+stat——`/dev/zero`/`/dev/urandom` SeekEnd=0 → **200 CL:0 空体**（此前
+chunked 无限流）；`/proc/*` SeekEnd 报 EINVAL → sizeFunc 失败 →
+**500 `"seeker can't seek\n"`**（fs.go errSeeker 路径；此前"200 chunked 流
+真实内容"建立在"Go 会截断"的错误假设上，从未对拍过）。改为统一 SeekEnd
+模型：sniff 后 `file.seek(End)`，size 取代 path-stat 用于
+Range/CL/Content-Range（顺带关闭 stat-vs-handle race 的 size 侧），失败走
+`plain_error(500)`（形状经 fs.go serveError + http.Error 核对一致：
+Vary/Disposition 保留、LM 删除、text/plain+nosniff、`"text\n"`）；200 流
+limit = size（Go CopyN(sendSize)）。此前 round-3 的 sniffed_empty 分支被
+该统一模型取代而删除。`capture.py` 新增 2 场景：
+`rest_files_proc_seeker`（500）与 `rest_files_devzero`（CL:0）。
+`cargo test` → **245 passed / 1 ignored**；clippy/fmt 干净。
+
+**对拍（各轮均全新容器双端全量重录）**：
+
+```
+前三轮 PASS 104  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （112 场景）
+第四轮（+2 Seek(End) 场景）PASS 106  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （114 场景）
+```
+
+存量场景零回归。已知残留（有意声明）：multipart 非 UTF-8 part filename 受
+multer str API 限制给 400（Go 会写文件）；Content-Disposition 非 UTF-8
+basename 回退 `download`（query 强制 UTF-8，实际不可达）。评审建议的
+obs-text fixture 待 capture 客户端支持非 ASCII 头后补录。
 
 ## 复现
 

@@ -8,6 +8,8 @@
 //! with). Pure functions; the handler owns the 206/416/200 decision that
 //! consumes them.
 
+use super::preconditions::trim_string;
+
 /// One satisfiable byte range (`httpRange`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -65,15 +67,17 @@ pub fn parse_range(header: Option<&str>, size: i64) -> Result<Option<Vec<ByteRan
     let mut ranges: Vec<ByteRange> = Vec::new();
     let mut no_overlap = false;
     for piece in s[PREFIX.len()..].split(',') {
-        let piece = piece.trim();
+        // Go parseRange trims OWS around pieces with textproto.TrimString
+        // semantics (ASCII space/tab; see preconditions::trim_string).
+        let piece = trim_string(piece);
         if piece.is_empty() {
             continue;
         }
         let Some((start_s, end_s)) = piece.split_once('-') else {
             return Err(RangeError::Invalid);
         };
-        let start_s = start_s.trim();
-        let end_s = end_s.trim();
+        let start_s = trim_string(start_s);
+        let end_s = trim_string(end_s);
         if start_s.is_empty() {
             // Suffix range: `-N` = last N bytes; N must be a non-negative
             // integer (RFC 7233 §2.1), clamped to size.

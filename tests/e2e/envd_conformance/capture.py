@@ -401,6 +401,17 @@ def cap_files_negotiation():
         "GET", f"/files?path={text}&username=user",
         headers={"Accept-Encoding": "*;q=0"}))
 
+    # --- Seek(End)-sized responses (round-4, both deterministic) ---
+    # /proc files report EINVAL on Seek(End): Go's sizeFunc fails →
+    # serveError 500 "seeker can't seek" (fs.go errSeeker path).
+    record("rest_files_proc_seeker", http_req(
+        "GET", f"/files?path=/proc/self/status&username=user"))
+    # Char devices with Seek(End) = 0: an explicit Content-Length: 0 with an
+    # empty body — never an unbounded stream. Last-Modified values differ
+    # between containers and are normalized to <time> by conformance.py.
+    record("rest_files_devzero", http_req(
+        "GET", f"/files?path=/dev/zero&username=user"))
+
 
 def cap_compose():
     record("rest_files_compose_probe", http_req(
