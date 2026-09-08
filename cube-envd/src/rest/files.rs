@@ -1288,6 +1288,38 @@ mod download_tests {
         assert!(h.contains_key(header::CONTENT_DISPOSITION));
     }
 
+    /// Round-5: an obs-text byte after a fractional second used to panic the
+    /// date parser (byte index inside U+FFFD) and answer 500 instead of
+    /// treating the unparseable date as "condition does not apply".
+    #[tokio::test]
+    async fn obs_text_after_fractional_second_does_not_500() {
+        let (_d, p) = tmp_file("c.bin", b"cache-me");
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::IF_MODIFIED_SINCE,
+            header::HeaderValue::from_bytes(b"Sun, 06 Sep 2026 07:00:00.5\xFF1 GMT").unwrap(),
+        );
+        let (status, _h, b) = body(get_headers(&p, h).await).await;
+        assert_eq!(status, 200);
+        assert_eq!(&b[..], b"cache-me");
+    }
+
+    /// Round-5: an asctime If-Modified-Since with a fractional second — the
+    /// digit run must not swallow the year (Go answers 304).
+    #[tokio::test]
+    async fn asctime_fractional_second_ims_304s() {
+        let t = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(1_788_678_000))
+            .unwrap();
+        let (_d, p, kept) = tmp_file_with_mtime("f.txt", b"cache-me", t);
+        if !kept {
+            return; // filesystem clamped the stamp: nothing to assert
+        }
+        let resp = get(&p, &[("If-Modified-Since", "Sun Sep  6 07:00:00.5 2026")]).await;
+        let (status, _h, _b) = body(resp).await;
+        assert_eq!(status, 304);
+    }
+
     /// Char devices with stat size 0 (Go Seek(End) = 0): the answer is an
     /// explicit CL: 0 with an empty body — never an unbounded chunked
     /// stream. (Round-4 hardening; verified against ServeContent directly.)

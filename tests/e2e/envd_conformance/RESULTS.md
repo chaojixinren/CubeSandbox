@@ -350,11 +350,24 @@ limit = size（Go CopyN(sendSize)）。此前 round-3 的 sniffed_empty 分支�
 `rest_files_proc_seeker`（500）与 `rest_files_devzero`（CL:0）。
 `cargo test` → **245 passed / 1 ignored**；clippy/fmt 干净。
 
+**第五轮（round-5，2026-09-08 复审 cd985b7e）**：仅一个真 bug——`skip_frac_second`
+用 `filter` 统计了小数点后**所有**数字而非紧邻的连续数字（Go 是 `for ;
+isDigit(value, n); n++`），导致 asctime 年份 / 数字时区被吞掉（`"07:00:00.5 2026"`
+解析失败 → IMS/IUS/If-Range 全部退化为 200；Go 分别是 304/412/206）；且按字节
+数 `&rest[n..]` 切片会落在 UTF-8 字符中间（obs-text 头 → panic → 请求级 500，
+虽被 CatchPanicLayer 捕获）。改为 `take_while` 只吃紧邻数字 + `rest.get(n..)`
+边界安全；新增 5 个用例（IMF/RFC850/asctime 小数秒、数字后跟年份/时区、obs-text
+边界、以及三布局 × 任意 obs-text 尾的**不 panic 组合扫描**）+ 2 个 handler 测试；
+`capture.py` 新增 `rest_files_cond_ims_fraction` /
+`rest_files_cond_ims_asctime_fraction`（双端均 304，抽查已确认非"都是 200"蒙混）。
+`cargo test` → **250 passed / 1 ignored**；clippy/fmt 干净。
+
 **对拍（各轮均全新容器双端全量重录）**：
 
 ```
 前三轮 PASS 104  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （112 场景）
 第四轮（+2 Seek(End) 场景）PASS 106  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （114 场景）
+第五轮（+2 小数秒场景）PASS 108  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （116 场景）
 ```
 
 存量场景零回归。已知残留（有意声明）：multipart 非 UTF-8 part filename 受

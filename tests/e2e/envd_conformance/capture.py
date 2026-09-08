@@ -52,6 +52,19 @@ def http_req(method, path, body=None, headers=None, timeout=10):
         }
 
 
+def asctime_fraction(imf_date):
+    """Turn an IMF-fixdate into asctime with a fractional second ("Sun Sep  6
+    07:00:00.5 2026"), so the year sits directly behind the digit run — the
+    case where a wrong fraction scan swallows it. None if unparseable."""
+    from email.utils import parsedate_to_datetime
+
+    try:
+        dt = parsedate_to_datetime(imf_date)
+        return dt.strftime("%a %b %d %H:%M:%S") + ".5 " + str(dt.year)
+    except Exception:
+        return None
+
+
 def header_get(headers, name):
     """Case-insensitive header lookup (rust hyper serializes header names in
     lowercase on the wire; go uses canonical Title-Case)."""
@@ -400,6 +413,19 @@ def cap_files_negotiation():
     record("rest_files_406_parse", http_req(
         "GET", f"/files?path={text}&username=user",
         headers={"Accept-Encoding": "*;q=0"}))
+
+    # --- fractional seconds in the revalidation date (round-5) ---
+    # The digit run after "." must not swallow the following field: Go answers
+    # 304 for both the IMF and the asctime form (asctime puts the year right
+    # after the fraction).
+    record("rest_files_cond_ims_fraction", http_req(
+        "GET", f"/files?path={text}&username=user",
+        headers={"If-Modified-Since": last_modified.replace(" GMT", ".5 GMT")}))
+    asctime_frac = asctime_fraction(last_modified)
+    if asctime_frac:
+        record("rest_files_cond_ims_asctime_fraction", http_req(
+            "GET", f"/files?path={text}&username=user",
+            headers={"If-Modified-Since": asctime_frac}))
 
     # --- Seek(End)-sized responses (round-4, both deterministic) ---
     # /proc files report EINVAL on Seek(End): Go's sizeFunc fails →

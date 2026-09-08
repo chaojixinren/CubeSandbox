@@ -220,8 +220,16 @@ fn skip_space_run(value: &str) -> Option<&str> {
 fn skip_frac_second(rest: &str) -> &str {
     let b = rest.as_bytes();
     if b.len() >= 2 && (b[0] == b'.' || b[0] == b',') && b[1].is_ascii_digit() {
-        let n = 2 + b[2..].iter().filter(|c| c.is_ascii_digit()).count();
-        return &rest[n..];
+        // Go scans the digit run with `for ; n < len(value) &&
+        // isDigit(value, n); n++` — only the digits immediately after the
+        // separator. Counting every digit in the remainder would swallow
+        // the following field (the asctime year, a numeric zone) and turn
+        // e.g. "07:00:00.5 2026" into "2026" leftover → parse failure.
+        let n = 2 + b[2..].iter().take_while(|c| c.is_ascii_digit()).count();
+        // n counts ASCII bytes only, so it always lands on a char boundary;
+        // `get` keeps that invariant explicit (a mid-character index used to
+        // panic on obs-text bytes surviving as U+FFFD).
+        return rest.get(n..).unwrap_or(rest);
     }
     rest
 }
@@ -424,6 +432,70 @@ mod tests {
             ("Sun, 06 Sep 0000 07:00:00 GMT", -62_145_680_400),
         ] {
             assert_eq!(parse_http_date(input), Some(want), "input {input:?}");
+        }
+    }
+
+    /// Round-5 review: the fractional-second scan must stop at the first
+    /// non-digit, not consume every digit in the remainder — otherwise the
+    /// asctime year or a numeric zone gets swallowed.
+    #[test]
+    fn fractional_second_consumes_only_the_adjacent_digit_run() {
+        let ts = 1_788_678_000; // Sun, 06 Sep 2026 07:00:00 GMT
+        for input in [
+            "Sun, 06 Sep 2026 07:00:00.5 GMT",    // IMF-fixdate
+            "Sunday, 06-Sep-26 07:00:00.5 GMT",   // RFC 850
+            "Sunday, 06-Sep-26 07:00:00.5 GMT+0", // …followed by a zone
+            "Sun Sep  6 07:00:00.5 2026",         // asctime, year follows
+            "Sun Sep 6 07:00:00,5 2026",          // comma separator
+            "Sunday, 06-Sep-26 07:00:00.123456789 GMT",
+        ] {
+            assert_eq!(parse_http_date(input), Some(ts), "input {input:?}");
+        }
+        // A non-digit right after the run ends it; the rest must still parse.
+        assert_eq!(parse_http_date("Sun, 06 Sep 2026 07:00:00.5x GMT"), None);
+        // Separator without a following digit is not a fraction.
+        assert_eq!(parse_http_date("Sun, 06 Sep 2026 07:00:00. GMT"), None);
+    }
+
+    /// Obs-text bytes survive lossy header conversion as U+FFFD; the old
+    /// byte-count slicing landed inside that character and panicked (HTTP
+    /// 500 through CatchPanicLayer).
+    #[test]
+    fn fractional_second_with_obs_text_is_boundary_safe() {
+        for bad in [
+            "Sun, 06 Sep 2026 07:00:00.5\u{FFFD}1 GMT",
+            "Sun, 06 Sep 2026 07:00:00.5\u{FFFD} GMT",
+            "Sun, 06 Sep 2026 07:00:00\u{FFFD}.5 GMT",
+            "Sun, 06 Sep 2026 07:00:00.\u{FFFD}5 GMT",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    /// Panic regression: every byte-index slice in the parsers must land on a
+    /// char boundary, for all three layouts and arbitrary obs-text tails.
+    #[test]
+    fn parse_never_panics_on_arbitrary_bytes() {
+        let pieces: [&str; 7] = [".", ",", "5", "x", "\u{FFFD}", " GMT", "2026"];
+        let heads = [
+            "Sun, 06 Sep 2026 07:00:00",
+            "Sunday, 06-Sep-26 07:00:00",
+            "Sun Sep  6 07:00:00",
+        ];
+        let mut buf = String::new();
+        for head in heads {
+            for a in pieces {
+                for b in pieces {
+                    for c in pieces {
+                        buf.clear();
+                        buf.push_str(head);
+                        buf.push_str(a);
+                        buf.push_str(b);
+                        buf.push_str(c);
+                        let _ = parse_http_date(&buf);
+                    }
+                }
+            }
         }
     }
 
