@@ -13,6 +13,8 @@
 //! run as root.
 
 use base64::Engine;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct User {
@@ -46,8 +48,55 @@ pub fn lookup_user(name: &str) -> Result<User, String> {
     lookup_user_in(name, "/etc/passwd", "/etc/group")
 }
 
+struct CachedTable {
+    dev: u64,
+    ino: u64,
+    mtime_secs: i64,
+    mtime_nsecs: i64,
+    content: Arc<String>,
+}
+
+impl CachedTable {
+    fn stamp(&self) -> (u64, u64, i64, i64) {
+        (self.dev, self.ino, self.mtime_secs, self.mtime_nsecs)
+    }
+}
+
+/// Read a user/group table through a (dev, ino, mtime) cache.
+///
+/// Upstream re-reads these files per request (`permissions.GetUser`,
+/// authenticate.go:22,38) and **per entry** in entryInfo (`utils.go:78-91`
+/// does a LookupId/LookupGroupId each) — a deep ListDir re-reads the whole
+/// file 2N times. The re-validation `stat` stays, so edits to the tables
+/// are picked up on the next call; only the contents are cached.
+pub(crate) fn read_user_table(path: &str) -> Result<Arc<String>, std::io::Error> {
+    static TABLES: OnceLock<Mutex<HashMap<String, CachedTable>>> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    let stamp = (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec());
+    let mut guard = tables.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cached) = guard.get(path) {
+        if cached.stamp() == stamp {
+            return Ok(cached.content.clone());
+        }
+    }
+    let content = Arc::new(std::fs::read_to_string(path)?);
+    guard.insert(
+        path.to_string(),
+        CachedTable {
+            dev: stamp.0,
+            ino: stamp.1,
+            mtime_secs: stamp.2,
+            mtime_nsecs: stamp.3,
+            content: content.clone(),
+        },
+    );
+    Ok(content)
+}
+
 fn lookup_user_in(name: &str, passwd_path: &str, group_path: &str) -> Result<User, String> {
-    let passwd = std::fs::read_to_string(passwd_path)
+    let passwd = read_user_table(passwd_path)
         .map_err(|e| format!("error looking up user '{name}': reading {passwd_path}: {e}"))?;
     for line in passwd.lines() {
         let fields: Vec<&str> = line.split(':').collect();
@@ -75,7 +124,7 @@ fn lookup_user_in(name: &str, passwd_path: &str, group_path: &str) -> Result<Use
 
 fn supplementary_groups(name: &str, primary_gid: u32, group_path: &str) -> Vec<u32> {
     let mut groups = vec![primary_gid];
-    if let Ok(content) = std::fs::read_to_string(group_path) {
+    if let Ok(content) = read_user_table(group_path) {
         for line in content.lines() {
             let fields: Vec<&str> = line.split(':').collect();
             // group:passwd:gid:member1,member2
