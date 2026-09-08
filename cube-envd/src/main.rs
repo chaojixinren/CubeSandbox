@@ -17,6 +17,7 @@ mod connect;
 mod cors;
 mod error;
 mod exec;
+mod go_compat;
 mod legacy;
 mod msg;
 mod rest;
