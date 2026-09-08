@@ -69,30 +69,66 @@ impl CachedTable {
 /// does a LookupId/LookupGroupId each) — a deep ListDir re-reads the whole
 /// file 2N times. The re-validation `stat` stays, so edits to the tables
 /// are picked up on the next call; only the contents are cached.
+///
+/// Consistency: the stamp is taken before the read and re-taken after it
+/// (file I/O happens outside the lock); the content is cached only if both
+/// stamps agree, so the cached stamp always describes the cached bytes.
+/// Residual limitation: an in-place edit preserving (dev, ino, mtime) is
+/// invisible to any stamp-based scheme — accepted because passwd/group
+/// editors (useradd/usermod) rewrite the file with a fresh mtime, and a
+/// restore that also restores mtime would equally fool any stat-based
+/// invalidation.
 pub(crate) fn read_user_table(path: &str) -> Result<Arc<String>, std::io::Error> {
     static TABLES: OnceLock<Mutex<HashMap<String, CachedTable>>> = OnceLock::new();
     let tables = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let stamp = (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec());
-    let mut guard = tables.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cached) = guard.get(path) {
-        if cached.stamp() == stamp {
-            return Ok(cached.content.clone());
-        }
+
+    fn stamp_of(m: &std::fs::Metadata) -> (u64, u64, i64, i64) {
+        (m.dev(), m.ino(), m.mtime(), m.mtime_nsec())
     }
-    let content = Arc::new(std::fs::read_to_string(path)?);
-    guard.insert(
-        path.to_string(),
-        CachedTable {
-            dev: stamp.0,
-            ino: stamp.1,
-            mtime_secs: stamp.2,
-            mtime_nsecs: stamp.3,
-            content: content.clone(),
-        },
-    );
-    Ok(content)
+
+    // Bounded: a table churning on every read (pathological) is served
+    // uncached on the last attempt rather than spun on forever.
+    for attempt in 0..4 {
+        let pre = std::fs::metadata(path)?;
+        let stamp = stamp_of(&pre);
+        {
+            let guard = tables.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(cached) = guard.get(path) {
+                if cached.stamp() == stamp {
+                    return Ok(cached.content.clone());
+                }
+            }
+        } // the file read below happens OUTSIDE the lock
+        let bytes = std::fs::read_to_string(path)?;
+        if stamp_of(&std::fs::metadata(path)?) != stamp {
+            if attempt < 3 {
+                continue; // edited mid-read; retry against the new state
+            }
+            return Ok(Arc::new(bytes));
+        }
+        let content = Arc::new(bytes);
+        let mut guard = tables.lock().unwrap_or_else(|p| p.into_inner());
+        // A concurrent fill under the same stamp holds equally-valid bytes;
+        // keep it instead of churning the map.
+        if let Some(cached) = guard.get(path) {
+            if cached.stamp() == stamp {
+                return Ok(cached.content.clone());
+            }
+        }
+        guard.insert(
+            path.to_string(),
+            CachedTable {
+                dev: stamp.0,
+                ino: stamp.1,
+                mtime_secs: stamp.2,
+                mtime_nsecs: stamp.3,
+                content: content.clone(),
+            },
+        );
+        return Ok(content);
+    }
+    unreachable!("retry loop always returns within 4 attempts")
 }
 
 fn lookup_user_in(name: &str, passwd_path: &str, group_path: &str) -> Result<User, String> {
@@ -157,7 +193,7 @@ pub fn resolve_path(path: &str, user: &User) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, Write};
 
     fn fixture_files() -> (tempfile::NamedTempFile, tempfile::NamedTempFile) {
         let mut passwd = tempfile::NamedTempFile::new().unwrap();
@@ -229,5 +265,39 @@ mod tests {
         assert_eq!(resolve_path("a.txt", &u), "/home/user/a.txt");
         assert_eq!(resolve_path("~/a.txt", &u), "/home/user/a.txt");
         assert_eq!(resolve_path("~", &u), "/home/user");
+    }
+
+    #[test]
+    fn table_cache_invalidates_on_mtime_change() {
+        let mut table = tempfile::NamedTempFile::new().unwrap();
+        writeln!(table, "user:x:1000:1000::/home/user:/bin/bash").unwrap();
+        let path = table.path().to_str().unwrap().to_string();
+
+        let first = read_user_table(&path).unwrap();
+        assert!(first.contains("1000"));
+        // Unchanged file: the same Arc comes back from the cache.
+        assert!(Arc::ptr_eq(&first, &read_user_table(&path).unwrap()));
+
+        // In-place edit: rewrite content and bump mtime via set_times
+        // (writing alone can land within the same timestamp granularity).
+        table
+            .as_file_mut()
+            .seek(std::io::SeekFrom::Start(0))
+            .unwrap();
+        table
+            .as_file_mut()
+            .write_all(b"user:x:1001:1001::/home/user:/bin/bash\n")
+            .unwrap();
+        table
+            .as_file_mut()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(10),
+                ),
+            )
+            .unwrap();
+        let second = read_user_table(&path).unwrap();
+        assert!(second.contains("1001"), "stale cache served: {second}");
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 }

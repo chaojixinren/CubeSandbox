@@ -66,26 +66,43 @@ impl Drop for DecGuard {
 }
 
 /// Run `f` on tokio's blocking pool — exactly one crossing for the whole
-/// request body. Dispatch is immediate; concurrency comes from the pool
-/// (`max_blocking_threads`, capped at 64 in main.rs).
+/// request body. Concurrency comes from the pool (`max_blocking_threads`,
+/// capped at 64 in main.rs).
+///
+/// The in-flight counter increments when the closure *starts executing*
+/// (inside the closure), so a task cancelled while still queued — possible
+/// only on runtime shutdown — never inflates or leaks the count, and
+/// `in_flight()` means "currently executing", matching its doc. A closure
+/// panic is re-thrown with its original payload via `resume_unwind`.
 pub async fn run<F, R>(_label: &'static str, f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    enter();
-    let fut = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
+        enter();
         let _guard = DecGuard;
         f()
-    });
-    fut.await
-        .expect("blocking task panicked — this is a bug in the closure")
+    })
+    .await
+    .unwrap_or_else(|e| match e.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(cancelled) => {
+            panic!("blocking task was cancelled before running (runtime shutdown): {cancelled}")
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    /// IN_FLIGHT/PEAK are process-global and libtest runs #[test]s on
+    /// parallel threads — both tests hold this lock so their counter
+    /// assertions never observe each other's tasks.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     /// The guardrail from plan §5: while blocking tasks occupy the pool,
     /// the async workers must keep ticking. A regression that runs blocking
@@ -93,6 +110,7 @@ mod tests {
     /// CI-safe: the bound is an order of magnitude above the expected tick.
     #[test]
     fn workers_keep_ticking_during_blocking_calls() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -130,6 +148,7 @@ mod tests {
     /// A panicking closure must not leak the in-flight count.
     #[test]
     fn panic_in_closure_still_decrements() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -137,7 +156,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let before = in_flight();
-            // `run` re-panics via `expect` when the closure panics; hosting
+            // `run` re-throws the original payload via resume_unwind; hosting
             // the await in a nested task keeps the test alive to observe
             // that the guard still decremented.
             let jh = tokio::spawn(async {
