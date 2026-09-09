@@ -456,6 +456,28 @@ Rust+Go 对照，3 项发现全部修复）**：
 keepalive 沿用进程流的 30s 默认（上游文件 watch 为 90s，同 LB 空闲超时理由），
 `Keepalive-Ping-Interval` 头覆盖语义一致。**注意**：`watch` 组须在未跑
 `init_token` 的实例上采集（令牌闸门设置后所有无令牌请求 401，两侧措辞不同）。
+## 9. PR-C 数据面（2026-09-09，feat/cube-envd-dataplane）
+
+上传**原地流式写**（对齐上游 `upload.go:68` 的 `O_WRONLY|O_CREATE|O_TRUNC`，
+放弃 MVP 期自加的 temp+rename 原子性——三仓 issue 考古零需求、HA failover
+重启模型使原子性保护窗口失去意义）。单测 263 passed（+4：chunk 边界与无临时
+文件/O_TRUNC 自动保留 mode/413 中停部分内容留存/body 错误部分内容留存与传播）；
+clippy `-D warnings` 与 fmt 干净。
+
+**RSS 门（实测）**：256MiB 流式上传（1MiB 客户端分块）0.2-0.5s 完成，
+daemon RSS 峰值增量 **0-6 MiB**——修复前为 +256MiB 级整包缓冲。
+
+**吞吐门（实测，100MiB 下载 loopback）**：本分支 848-895 MiB/s，与改前基线
+（worktree 构建 02e9f7e9 实测 866-899 MiB/s）持平——"下载单任务化"尝试
+（通道+专用读任务，256KiB 块）实测仅 535-670 MiB/s，**被测量否决并回退**，
+回退理由记录于 `reader_stream` 注释；Go 对照 6333-6969 MiB/s（loopback 上限，
+非实现间可比瓶颈）。`all` 全量双录（#16 合入后的 base）**118 PASS / 0 FAIL /
+DIFF 4**，上传/下载/条件请求场景零回归。注意：对拍须在**全新容器**上采集——
+同容器重复跑 `all` 时，上一轮 `init_token` 的令牌闸门会让下一轮全 401，
+perf 制品文件也会污染 ListDir。
+
+落位语义变更（README 已知差异表同步）：上传中并发读可见部分内容、失败留
+截断文件、不再 fsync、符号链接跟随（写穿至目标）——全部为上游既有行为。
 
 ## 复现
 
