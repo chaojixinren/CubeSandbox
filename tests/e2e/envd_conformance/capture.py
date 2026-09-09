@@ -1109,6 +1109,11 @@ def cap_watch():
 
     sweep()
     connect_unary("filesystem.Filesystem/MakeDir", {"path": W})
+    # RW must exist BEFORE the recursive watch opens: the server checks the
+    # path first, and a missing directory would make both sides record an
+    # identical not_found — a false-positive PASS that never exercises
+    # recursion (caught in PR #16 review).
+    connect_unary("filesystem.Filesystem/MakeDir", {"path": RW})
     # Seed file for the write/chmod/rename scenarios; created before any
     # watch opens so no CREATE event for it leaks into those sequences.
     http_req("POST", f"/files?path={W}/seed.txt&username=user", b"seed\n",

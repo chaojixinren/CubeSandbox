@@ -529,14 +529,22 @@ impl WatchState {
 
         // IN_MOVE_SELF: the watched directory itself was renamed/moved.
         if raw.mask & libc::IN_MOVE_SELF != 0 {
-            self.dirs.remove(&raw.wd);
-            rm_watch_raw(self.fd, raw.wd);
-            // A recursion-added child is re-registered from its parent's
-            // MOVED_FROM/MOVED_TO pair, so only the user-added root reports
-            // the move (`backend_inotify.go:467-484`).
+            // A recursion-added child KEEPS its watch and stays silent: the
+            // inode moved but an inotify watch follows the inode, so it is
+            // still valid at the new location — the parent's MOVED_TO has
+            // already (or will) rewrite the stored path via rename_children.
+            // Removing it here would silently drop every later event inside
+            // the moved directory. fsnotify returns early for recurse-added
+            // children too (`backend_inotify.go:467-472`).
             if self.recursive && raw.wd != self.root_wd {
                 return Ok(Vec::new());
             }
+            // The user-added root (or a non-recursive watch): the move is
+            // reported as Rename and the watch state is dropped — the parent
+            // directory of `dir` is outside the tree, so nothing re-registers
+            // it (`backend_inotify.go:474-484`).
+            self.dirs.remove(&raw.wd);
+            rm_watch_raw(self.fd, raw.wd);
             return Ok(vec![rel_event(&dir, &self.root, EventType::Rename)?]);
         }
 
@@ -696,6 +704,7 @@ async fn run_stream(
     ino: Inotify,
     mut st: WatchState,
     keepalive: Duration,
+    deadline: Option<Duration>,
     tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
 ) {
     // Start frame first (watch.go:66-73). A failed send means the client is
@@ -716,11 +725,29 @@ async fn run_stream(
     };
     // First tick after the interval, like time.NewTicker (not immediately).
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+    // Connect-Timeout-Ms bounds the whole stream: on expiry upstream returns
+    // ctx.Err() (`watch.go:89-90`), which connect renders as
+    // deadline_exceeded "context deadline exceeded" — an EndStream error
+    // frame that also releases the inotify fd.
+    let has_deadline = deadline.is_some();
+    let inner: futures::future::OptionFuture<tokio::time::Sleep> =
+        deadline.map(tokio::time::sleep).into();
+    let mut deadline_fut = Box::pin(inner);
     loop {
         tokio::select! {
             // Client disconnect → immediate teardown; dropping `afd` closes
             // the inotify fd (the `defer w.Close()` + ctx.Done() pair).
             _ = tx.closed() => break,
+            _ = deadline_fut.as_mut(), if has_deadline => {
+                fail_stream(
+                    &tx,
+                    &ConnectError::new(
+                        ConnectCode::DeadlineExceeded,
+                        "context deadline exceeded",
+                    ),
+                );
+                break;
+            }
             _ = interval.tick() => {
                 if tx
                     .send(frame_of(&WatchDirResponse::KeepAlive(Default::default())))
@@ -936,7 +963,8 @@ pub fn watch_dir(
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
     let keepalive = connect::keepalive_interval_from_headers(headers);
-    tokio::spawn(run_stream(ino, state, keepalive, tx));
+    let deadline = connect::timeout_from_headers(headers);
+    tokio::spawn(run_stream(ino, state, keepalive, deadline, tx));
     frame_stream_response(ReceiverStream::new(rx))
 }
 
@@ -1410,7 +1438,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ino, st) = WatchState::new(dir.path().to_path_buf(), false).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
-        let jh = tokio::spawn(run_stream(ino, st, Duration::from_millis(50), tx.clone()));
+        let jh = tokio::spawn(run_stream(
+            ino,
+            st,
+            Duration::from_millis(50),
+            None,
+            tx.clone(),
+        ));
         // First frame must be the Start event.
         let first = rx.recv().await.unwrap();
         let text = std::str::from_utf8(&first[5..]).unwrap(); // skip 1+4 header
@@ -1472,7 +1506,7 @@ mod tests {
         let (ino, st) = WatchState::new(dir.path().to_path_buf(), false).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
         let period = Duration::from_millis(400);
-        let jh = tokio::spawn(run_stream(ino, st, period, tx));
+        let jh = tokio::spawn(run_stream(ino, st, period, None, tx));
 
         // Start frame; record the mutation moment.
         let _start = rx.recv().await.unwrap();
@@ -1599,5 +1633,79 @@ mod tests {
                 ConnectCode::NotFound
             );
         }
+    }
+    // ---- PR #16 review P1: MOVE_SELF on a recursion-added child must keep
+    // the watch (the parent's MOVED_TO rewrites its stored path), otherwise
+    // events inside the moved directory silently stop ----
+
+    #[test]
+    fn in_tree_dir_rename_keeps_child_watch_reporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_ino, mut st) = WatchState::new(dir.path().to_path_buf(), true).unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        st.handle_raw(&raw(st.root_wd, libc::IN_CREATE | libc::IN_ISDIR, "a"))
+            .unwrap();
+        let a_wd = *st
+            .dirs
+            .iter()
+            .find(|(_, p)| p.as_path() == dir.path().join("a"))
+            .unwrap()
+            .0;
+
+        // rename a → b: parent MOVED_FROM/MOVED_TO pair, then the child's
+        // own MOVE_SELF.
+        let mut from = raw(st.root_wd, libc::IN_MOVED_FROM | libc::IN_ISDIR, "a");
+        from.cookie = 5;
+        st.handle_raw(&from).unwrap();
+        let mut to = raw(st.root_wd, libc::IN_MOVED_TO | libc::IN_ISDIR, "b");
+        to.cookie = 5;
+        st.handle_raw(&to).unwrap();
+        // The events above mirror a real rename — perform it on disk too, so
+        // later writes land inside the moved directory.
+        std::fs::rename(dir.path().join("a"), dir.path().join("b")).unwrap();
+        assert!(st
+            .handle_raw(&raw(a_wd, libc::IN_MOVE_SELF, ""))
+            .unwrap()
+            .is_empty());
+
+        // The child watch SURVIVES and points at the new path…
+        assert!(st.dirs.contains_key(&a_wd));
+        assert!(st.dirs[&a_wd].ends_with("b"));
+        // …and events inside the moved directory keep flowing, named
+        // relative to the watch root.
+        std::fs::write(dir.path().join("b/f"), b"").unwrap();
+        let evs = st.handle_raw(&raw(a_wd, libc::IN_CREATE, "f")).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].name, "b/f");
+    }
+
+    // ---- PR #16 review P2: Connect-Timeout-Ms bounds the stream ----
+
+    #[tokio::test]
+    async fn connect_timeout_ends_the_watch_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ino, st) = WatchState::new(dir.path().to_path_buf(), false).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        let jh = tokio::spawn(run_stream(
+            ino,
+            st,
+            Duration::from_secs(30),
+            Some(Duration::from_millis(150)),
+            tx,
+        ));
+        let _start = rx.recv().await.unwrap();
+        // On expiry upstream returns ctx.Err(): deadline_exceeded
+        // "context deadline exceeded" as an EndStream error frame.
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("no deadline frame within 1s")
+            .unwrap();
+        let payload = std::str::from_utf8(&frame[5..]).unwrap_or("");
+        assert!(payload.contains("deadline_exceeded"), "{payload}");
+        assert!(payload.contains("context deadline exceeded"), "{payload}");
+        assert_ne!(frame[0] & 0x02, 0, "EndStream flag must be set");
+        // The stream is over.
+        assert!(rx.recv().await.is_none());
+        jh.await.unwrap();
     }
 }

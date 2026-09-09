@@ -432,6 +432,26 @@ all 全量（同容器序）        PASS 118 FAIL 0  DECLARED-DIFF 4   （122 �
 4. pull 缓冲上界同样无法低成本 fixture（上游会返回两万条事件的巨型 body），
    声明载体同为 README 已知差异表。
 
+**PR #16 live 评审轮（2026-09-09，chaojixinren 于 QEMU/OpenCloudOS 真沙箱
+Rust+Go 对照，3 项发现全部修复）**：
+1. **[P1] 递归目录改名后直属文件事件静默丢失**——`IN_MOVE_SELF` 分支在递归
+   子目录判断之前就删除 wd 映射并 `inotify_rm_watch`；树内目录 a→b 改名时
+   MOVED_TO 已重写路径，MOVE_SELF 又把该目录的 watch 拆掉，后续事件全部丢失
+   而两侧仍返回成功。fsnotify 对递归子目录是提前返回、**保留 watch**（inode
+   跟随，父目录 MOVED_TO 重写路径）。恢复该顺序；回归测试重放改名并断言
+   `b/f` 事件以根相对名继续上报。
+2. **[P2] WatchDir 忽略 `Connect-Timeout-Ms`**——泵未消费请求 deadline，超时
+   后仍持续发 keepalive。deadline 现在纳入泵 select 生命周期，到期发送
+   `deadline_exceeded "context deadline exceeded"` EndStream 错误帧并释放
+   inotify fd（单测断言帧形状与流终止）。
+3. **[P2] `watch_recursive` 假阳性**——sweep 删 RW 后只重建 W，递归 watch
+   对不存在的目录 404，两侧同样失败仍被差分判 PASS，递归验收从未真正执行。
+   RW 现于开 watch 前创建，fixture 携带真实序列（start + CREATE/CHMOD a +
+   CREATE/CHMOD a/b）。
+
+修复后 fresh 容器复采：watch 组 **9/9 PASS**（含真实递归与断言序列），
+289 单测 / clippy `-D warnings` / fmt 全绿。
+
 已知有意偏离（PR 描述同步）：pull watcher 事件缓冲设上界（上游无界累积）；
 keepalive 沿用进程流的 30s 默认（上游文件 watch 为 90s，同 LB 空闲超时理由），
 `Keepalive-Ping-Interval` 头覆盖语义一致。**注意**：`watch` 组须在未跑
