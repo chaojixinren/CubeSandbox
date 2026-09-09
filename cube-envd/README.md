@@ -68,10 +68,11 @@ load-bearing ones, and why cube-envd differs:
   zero-length body, trailing bytes or multiple stream envelopes — cube-envd
   decodes the first envelope and ignores trailing bytes); cube-envd
   accepts the common shapes and executes. It never *executes a side effect* on
-  a shape Go refuses — the cases that did (nested `SendSignal`/`Connect`
-  selectors) are rejected during decoding with `invalid_argument` without
-  signalling or attaching to any process (#1227). An empty flat selector `{}`
-  returns `unimplemented`, matching the upstream service default branch.
+  a shape Go refuses. Selector decoding matches upstream exactly: unknown
+  fields are discarded (connect-go's `DiscardUnknown`), so the legacy nested
+  `{"selector":{...}}` shape decodes to an empty selector that fails with the
+  same `unimplemented` as the upstream service default branch — nothing is
+  signalled, attached to, or otherwise side-effected (#1227).
 - **Uploads buffer in memory (bounded).** Both upload paths hold the payload
   (≤ 256 MiB) in memory before the atomic temp-file write; Go streams to disk.
   Worst case is bounded and rejected cleanly with 413 above the cap, but very
