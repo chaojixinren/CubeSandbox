@@ -29,7 +29,7 @@ Implemented (behavior matched fixture-by-fixture against the baseline):
 |---|---|
 | REST | `GET /health` (204), `POST /init` (envVars merge + optional accessToken), `GET /envs`, `GET /metrics`, `GET/POST /files` (octet-stream + multipart, relative paths, ownership, error vocabulary) |
 | `process.Process` | `Start` (Connect JSON streaming: start/data/end events; optional pipe stdin defaults on; `pty` allocates a real pty with merged `data.pty` output, CRLF line discipline and initial window size; `cwd` validation and privilege drop; whole-group deadline cleanup; a client disconnect leaves the child running), `Connect` (attach by pid/tag from the current output head), `List`, `SendSignal`, `SendInput`, `StreamInput`, `CloseStdin` and `Update` |
-| `filesystem.Filesystem` | `Stat`, `ListDir` (BFS depth), `MakeDir` (ownership on every created component), `Move`, `Remove` (idempotent) |
+| `filesystem.Filesystem` | `Stat`, `ListDir` (BFS depth), `MakeDir` (ownership on every created component), `Move`, `Remove` (idempotent), `WatchDir` (Connect server streaming: `start`/`keepalive`/`filesystem` events; fsnotify-faithful op mapping with the fixed expansion order; per-directory inotify watches with optional full recursion incl. synthetic creates for pre-existing subtrees and cookie-paired rename path rewrites), `CreateWatcher` / `GetWatcherEvents` / `RemoveWatcher` (pull watchers with id lifecycle) |
 | CLI | Go `flag` compatible: `-port` (u16, `-port N` or `-port=N`), `-isnotfc` (accepted and ignored; `-isnotfc=false` is **rejected** — only the non-FC mode is implemented), `-version`/`--version`, `-commit`, `-h`/`-help` (usage, exit 0); `-cmd`/`-cgroup-root` are recognized but not implemented yet (warned and skipped); **any other flag or positional argument is a usage error — Go's message + usage on stderr + exit 2** |
 | Auth | `Authorization: Basic base64("<user>:")` / `username` query, `/etc/passwd` resolution, default user `root`, privilege drop per operation, `X-Access-Token` enforced only after /init provides one |
 
@@ -37,8 +37,6 @@ Out of MVP scope — these return stable, protocol-correct `unimplemented`
 errors (HTTP 501 on unary surfaces, EndStream error frames on streaming
 surfaces), never panics or silent success:
 
-- watch family (`WatchDir`, `CreateWatcher`, `GetWatcherEvents`,
-  `RemoveWatcher`)
 - `/files/compose`, gzip download encoding, `/files` signature verification
 - Connect binary-protobuf codec — every known client (the repo Python/Node/Go
   SDKs and the official e2b Python/JS SDKs) uses the JSON codec
@@ -56,6 +54,15 @@ load-bearing ones, and why cube-envd differs:
   deliberate divergence: a sandbox data-plane should not leak processes. The
   exit codes and `deadline_exceeded` trailer are preserved; cube-envd also
   publishes a terminal EndEvent carrying the actual signal before that trailer.
+- **Watch-family deviations (documented).** The pull-watch event buffer is
+  capped at 10 000 events — upstream accumulates without bound
+  (`watch_sync.go:107`), so a client that never polls grows the daemon's
+  memory forever. At the cap cube-envd fails the watcher with an error
+  surfaced through `GetWatcherEvents` (the same channel upstream uses for
+  watcher errors) instead of silently dropping or silently growing. The
+  keepalive cadence defaults to 30 s rather than the filesystem watch's 90 s
+  (same rationale as the process stream below); the
+  `Keepalive-Ping-Interval` header tunes it identically.
 - **Stricter-input handling is more lenient (documented).** For malformed
   unary requests Go rejects with 415/400 (missing/`text/plain` content-type,
   zero-length body, trailing bytes or multiple stream envelopes — cube-envd
@@ -144,9 +151,10 @@ documented in [tests/e2e/envd_conformance](../tests/e2e/envd_conformance/).
   header (integer seconds); an absent, non-numeric, non-positive, or
   oversized value falls back to 30 s (see "Known behavioral differences").
 - Reported version: `0.1.0`. The control plane has no minimum-version
-  rejection (verified across CubeAPI and the SDKs — only feature gates), and
-  0.1.0 keeps e2b SDK watch-related feature gates safely disabled, matching
-  the MVP surface.
+  rejection (verified across CubeAPI and the SDKs — only feature gates). The
+  daemon surface now implements the watch family; 0.1.0 keeps the e2b SDK
+  watch-related feature gates safely disabled — enabling them is an SDK-side
+  change outside the daemon's scope.
 
 ## Design
 
