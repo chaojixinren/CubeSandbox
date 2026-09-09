@@ -32,12 +32,13 @@ use crate::state::AppState;
 /// Upstream envd's upload handler is unbounded (it streams to disk); in
 /// production the cap is enforced by the proxy layer, which rejects bodies
 /// over 256 MiB. Mirroring that external cap keeps the 64 MiB - 256 MiB
-/// range functional (a proxy-passed 100 MiB upload must succeed here too)
-/// while still bounding memory: unlike upstream, the body is buffered
-/// before the atomic temp-file write, so the cap is also the memory
-/// ceiling. (Streaming to disk would remove that trade-off — future work.)
-/// Deliberately NOT `connect::MAX_ENVELOPE_SIZE` (64 MiB): that constant
-/// bounds Connect envelopes, not file uploads.
+/// range functional (a proxy-passed 100 MiB upload must succeed here too).
+/// Both upload paths stream straight to disk, so the cap is enforced by
+/// counting bytes mid-stream — crossing it stops the write with 413 and the
+/// partial content stays in the target, like an interrupted upstream upload;
+/// the payload never sits in memory. Deliberately NOT
+/// `connect::MAX_ENVELOPE_SIZE` (64 MiB): that constant bounds Connect
+/// envelopes, not file uploads.
 const MAX_UPLOAD_SIZE: usize = 256 * 1024 * 1024;
 
 fn resolve_request_user(
@@ -802,9 +803,30 @@ async fn upload_multipart(
         // part loop.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, RestError>>(16);
         let writer = spawn_upload_writer(path.clone(), user.clone(), rx);
-        while let Some(chunk) = field.chunk().await.map_err(map_multipart_error)? {
-            if tx.send(Ok(chunk)).await.is_err() {
-                break; // writer finished early (413/write error) — its result wins
+        // Stream the part chunk-by-chunk into the in-place writer; multer's
+        // whole-stream/per-field limits keep counting as data flows
+        // (StreamSizeExceeded still maps to 413). Fields are handled
+        // serially — each writer finishes before the next field starts — to
+        // preserve the entries order and error propagation, like upstream's
+        // part loop.
+        //
+        // A part read error is forwarded as the writer's terminal error
+        // (like the raw path) instead of returning early: the writer is
+        // ALWAYS awaited below, so its result — a mid-stream write error,
+        // ENOSPC, or this parser error, whichever lands first — is never
+        // discarded and the file is finalized before the response goes out.
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        break; // writer finished early (413/write error) — its result wins
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(map_multipart_error(e))).await;
+                    break;
+                }
             }
         }
         drop(tx);
@@ -931,15 +953,19 @@ fn create_dirs_owned(dir: &std::path::Path, user: &User) -> Result<(), RestError
 fn chown(path: &std::path::Path, user: &User) {
     if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
         unsafe {
-            // lchown, not chown: never follow a symlink when setting ownership,
-            // so a planted symlink at `path` cannot redirect the chown onto an
-            // arbitrary target the caller shouldn't be able to take over.
-            let rc = libc::lchown(c_path.as_ptr(), user.uid, user.gid);
+            // chown (FOLLOWS symlinks), not lchown — matching upstream's
+            // `os.Chown(path, uid, gid)` (upload.go:56/:84): an upload through
+            // a symlink writes the link's destination, and ownership lands on
+            // that same destination. lchown would leave a daemon-owned target
+            // behind while chowning the link itself (caught by the PR-C
+            // symlink probe). Following adds no takeover risk beyond the
+            // write, which already followed the same link.
+            let rc = libc::chown(c_path.as_ptr(), user.uid, user.gid);
             if rc != 0 {
                 // Silent failure would break the ownership contract: the
                 // upload "succeeds" while the file stays daemon-owned.
                 tracing::warn!(
-                    "upload: lchown({}) to uid={} gid={} failed: {}",
+                    "upload: chown({}) to uid={} gid={} failed: {}",
                     path.display(),
                     user.uid,
                     user.gid,
@@ -1067,6 +1093,87 @@ mod tests {
         let content = std::fs::read(&target).unwrap();
         assert_eq!(content.len(), half);
         assert!(content.iter().all(|&b| b == b'a'));
+    }
+
+    #[tokio::test]
+    async fn multipart_read_error_awaits_writer_and_propagates() {
+        // PR-C review, High: a body read failure while a field's writer is
+        // ACTIVE must be forwarded as that writer's terminal error — the
+        // writer is awaited before the handler returns, so its result is
+        // never discarded and the partial content is finalized before the
+        // error response goes out.
+        //
+        // The stream paces its items with sleeps: a ready in-memory stream
+        // would be drained eagerly by multer's next_field (the error would
+        // surface before any writer exists), while the sleeps make each
+        // stage surface separately — head → next_field returns the field →
+        // data chunk (writer writes) → read error (forwarded to the writer).
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("part.bin");
+        let head = format!(
+            "--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n",
+            target.to_str().unwrap()
+        );
+        let stream = futures::stream::unfold((0u8, Some(head)), |(step, head)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            match step {
+                0 => Some((
+                    Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(head.unwrap())),
+                    (1u8, None),
+                )),
+                1 => Some((Ok(bytes::Bytes::from_static(b"more")), (2u8, None))),
+                _ => Some((Err(std::io::Error::other("body died")), (3u8, None))),
+            }
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "multipart/form-data; boundary=X".parse().unwrap(),
+        );
+        let resp = upload(
+            State(std::sync::Arc::new(AppState::new())),
+            Query(HashMap::new()),
+            headers,
+            axum::body::Body::from_stream(stream),
+        )
+        .await;
+        let (parts, body) = resp.into_parts();
+        let db = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&db).contains("error reading multipart"));
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        // The partial content written before the failure is finalized — the
+        // writer completed before the error response went out.
+        assert_eq!(std::fs::read(&target).unwrap(), b"more");
+    }
+
+    #[tokio::test]
+    async fn upload_through_symlink_writes_target_and_leaves_link() {
+        // In-place write follows a symlink (like upstream os.OpenFile), and
+        // chown follows too (like upstream os.Chown): content lands on the
+        // link's destination and the link itself survives. The ownership
+        // differential (daemon-owned target without the fix) needs a
+        // root-owned pre-existing target to observe — covered by the
+        // container probe recorded in RESULTS.md.
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user(dir.path().to_str().unwrap());
+        let real = dir.path().join("real.bin");
+        std::fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("lnk.bin")).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let jh = spawn_upload_writer(
+            dir.path().join("lnk.bin").to_str().unwrap().to_string(),
+            user.clone(),
+            rx,
+        );
+        tx.send(Ok(bytes::Bytes::from_static(b"new")))
+            .await
+            .unwrap();
+        drop(tx);
+        jh.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        let link_meta = std::fs::symlink_metadata(dir.path().join("lnk.bin")).unwrap();
+        assert!(link_meta.file_type().is_symlink());
     }
 
     #[tokio::test]

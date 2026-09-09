@@ -460,9 +460,9 @@ keepalive 沿用进程流的 30s 默认（上游文件 watch 为 90s，同 LB �
 
 上传**原地流式写**（对齐上游 `upload.go:68` 的 `O_WRONLY|O_CREATE|O_TRUNC`，
 放弃 MVP 期自加的 temp+rename 原子性——三仓 issue 考古零需求、HA failover
-重启模型使原子性保护窗口失去意义）。单测 263 passed（+4：chunk 边界与无临时
-文件/O_TRUNC 自动保留 mode/413 中停部分内容留存/body 错误部分内容留存与传播）；
-clippy `-D warnings` 与 fmt 干净。
+重启模型使原子性保护窗口失去意义）。单测 293 passed（基线 9aa30f49 为 289：
++4 数据面测试，−2 旧 write_file 测试改造；复审轮 +2 回归测试。初稿的 263 是
+变基前基线 02e9f7e9 的口径）；clippy `-D warnings` 与 fmt 干净。
 
 **RSS 门（实测）**：256MiB 流式上传（1MiB 客户端分块）0.2-0.5s 完成，
 daemon RSS 峰值增量 **0-6 MiB**——修复前为 +256MiB 级整包缓冲。
@@ -478,6 +478,22 @@ perf 制品文件也会污染 ListDir。
 
 落位语义变更（README 已知差异表同步）：上传中并发读可见部分内容、失败留
 截断文件、不再 fsync、符号链接跟随（写穿至目标）——全部为上游既有行为。
+
+**复审轮（2026-09-09，chaojixinren 4 项发现全部处置）**：
+1. **[High] multipart 写任务未等待**——part 读错误经 `?` 提前返回，写任务
+   脱管、结果被丢弃。修复：读错误转发为 writer 终态（与 raw 路径同构），
+   writer 必等待；回归测试 = field 1 完整上传 + field 2 数据中途流错误，
+   断言 400 + 两个文件的落盘终态。
+2. **[Medium] 符号链接属主**——容器探针证实（target=root:root、link 被摸成
+   user:user，Go 侧 target=user:user）：lchown 是 temp+rename 时代的产物。
+   修复：chown 跟随（对齐上游 `os.Chown`），探针复测双侧一致
+   （target=user:user、link=user:user）；单测锁定"内容跟随 + 链接存活"。
+3. **[Low] MAX_UPLOAD_SIZE 注释过时**——已改写为流式口径。
+4. **[Low] 测试数口径**——见本节开头（263 = 变基前基线，293 = PR head）。
+
+另：harness 修复一处固有 flaky——`VOLATILE_KEYS` 原按 JSON 类型名归一
+（Go 整数渲染 vs Rust 浮点），rest_metrics 在宿主负载凑整时必挂；改为
+值无关的 `<volatile>`。
 
 ## 复现
 
