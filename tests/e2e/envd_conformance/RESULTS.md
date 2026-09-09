@@ -216,10 +216,10 @@ CubeProxy 访问。**19 passed, 0 failed**。
 
 ## 5. item 1.8 cgroup 真机验证（2026-09-02，feat/cube-envd-cgroup-1.8）
 
-cgroup 行为不经 envd RPC 暴露，conformance 套件无法对拍（计划 §5），故以真机实测
+cgroup 行为不经 envd RPC 暴露，conformance 套件无法对拍，故以真机实测
 覆盖 init() 正向路径与 spawn 落位。
 
-### 环境矩阵落点（计划 §6）
+### 环境矩阵落点
 
 | 环境 | 矩阵行 | 实测结果 |
 |---|---|---|
@@ -227,7 +227,7 @@ cgroup 行为不经 envd RPC 暴露，conformance 套件无法对拍（计划 §
 | 普通 docker 容器（私有 cgroupns，ns root 承载容器进程） | 第 3 行（同结局 → Noop） | subtree_control enable 失败（cgroup v2 no-internal-process 规则，EIO）→ Err → Noop；1.8 对拍全程 Noop 下运行 |
 | `--privileged` 容器 + PID1 自移子 cgroup（构造"容器节点空"拓扑） | 嵌套可写根（第 2 行效果） | init() 非 Noop：subtree_control = "cpu memory"；start 的 sleep 进程落在 `user/`（`cgroup.procs` 含 pid，`/proc/<pid>/cgroup = 0::/user`）——验收标准① |
 
-### A1 探针（exec.rs `#[ignore]`，计划 §5）
+### A1 探针（exec.rs `#[ignore]`）
 
 `sudo cargo test -- --ignored spawn_lands_child_in_its_cgroup`（宿主真根）→ ok：真实
 cgroup dir fd 经 pre_exec `openat` 写入 `cgroup.procs`，子进程 `/proc/<pid>/cgroup`
@@ -374,6 +374,51 @@ isDigit(value, n); n++`），导致 asctime 年份 / 数字时区被吞掉（`"0
 multer str API 限制给 400（Go 会写文件）；Content-Disposition 非 UTF-8
 basename 回退 `download`（query 强制 UTF-8，实际不可达）。评审建议的
 obs-text fixture 待 capture 客户端支持非 ASCII 头后补录。
+
+## 7. PR-A 错误面对齐 + 阻塞池（2026-09-08，feat/cube-envd-fs-errno，#14 已合并）
+
+新增 6 个非 ENOENT 错误路径场景（`fs_stat_enotdir` / `fs_stat_enametoolong` /
+`fs_makedir_through_file` / `fs_move_into_newdir` / `fs_listdir_eloop` /
+`fs_listdir_on_file`），错误文案与 code 全部按 go1.26 实测对齐（`go_compat/errno`
+逐字表）。EACCES/EROFS 系列有意未加：harness 双侧 root（CAP_DAC_OVERRIDE）分支
+不可达，由单测覆盖。全新容器全量重录：
+
+```
+PASS 114  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （122 场景）
+```
+
+较第五轮基线（116 场景 PASS 108）+6 场景全 PASS，DECLARED-DIFF 8 条不变。
+
+## 8. PR-B WatchDir 家族（2026-09-08，feat/cube-envd-fs-errno）
+
+流式 `WatchDir`（含真递归：合成 Create 事件、cookie 配对改名、子 watch 路径前缀
+替换）+ pull watcher 三兄弟（CreateWatcher/GetWatcherEvents/RemoveWatcher）。
+事件映射按 e2b fsnotify 源码逐条核对——关键：`IN_MOVED_TO` 是 **CREATE** 而非
+RENAME，目录内一次改名产生 RENAME(old)+CREATE(new) 两条。单测 287 passed
+（+25：解析含匿名事件不截断批次/展开次序/递归含符号链接不注册/go_rel/断连回收/
+缓冲上限/Q_OVERFLOW fatal/keepalive 事件后重置/三兄弟并发竞态）；clippy `-D warnings` 与
+fmt 干净。`capture.py` 新增独立组 `--which watch`（8 场景，**不混入 `all`**，
+独立灰度，单独统计）：create / write / remove / rename（两帧断言）/
+chmod（经沙箱内进程触发 IN_ATTRIB）/ recursive（mkdir -p 两级合成事件）/
+disconnect（Start 帧后断连）/ trio（按上游 watcher_test 全流程）。watcherId
+随机值与 not-found 消息内嵌 id 均已归一化。
+
+```
+watch 组（双端 fresh 容器） PASS 8  FAIL 0  DECLARED-DIFF 0   （8 场景）
+all 全量（同容器序）        PASS 115 FAIL 0  DECLARED-DIFF 7   （122 场景）
+```
+
+`fs_watch_unary_probe` 由 DECLARED-DIFF 转 PASS（三兄弟已实现，allowlist 同 PR
+移除孤儿条目，现 7 条全部命中）；`connect_stream` 的帧读取抽取为
+`_read_stream_frames` 供 watch 复用，`all` 存量场景零回归。资源泄漏门：
+同一容器连跑 3 遍 watch 组（24 个 watcher 建断，含断连场景）后
+`/proc/<pid>/fd` 计数回到基线 10、inotify watch 数 0；`max_user_watches` 触顶
+路径显式报错（单测覆盖）。
+
+已知有意偏离（PR 描述同步）：pull watcher 事件缓冲设上界（上游无界累积）；
+keepalive 沿用进程流的 30s 默认（上游文件 watch 为 90s，同 LB 空闲超时理由），
+`Keepalive-Ping-Interval` 头覆盖语义一致。**注意**：`watch` 组须在未跑
+`init_token` 的实例上采集（令牌闸门设置后所有无令牌请求 401，两侧措辞不同）。
 
 ## 复现
 
