@@ -1161,6 +1161,14 @@ def cap_watch():
         {"path": W, "recursive": False},
         close_after_frames=1, read_deadline=5.0))
 
+    # keepalive: the cadence is header-tunable on both sides. A quiet watch
+    # with a 1s interval yields exactly two keepalive frames inside the 2.5s
+    # window (ticks at ~1s and ~2s; the next would be ~3s) — this makes the
+    # mechanism explicit; the 30s default itself is not fixtureable.
+    record("watch_keepalive", watch_stream(
+        {"path": W, "recursive": False},
+        read_deadline=2.5, extra_headers={"Keepalive-Ping-Interval": "1"}))
+
     # pull-watcher trio, following upstream's watcher_test flow:
     # create → get (empty) → mutate → get (events) → get (drained) →
     # remove → get (not found).

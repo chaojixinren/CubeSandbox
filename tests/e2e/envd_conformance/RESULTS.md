@@ -397,23 +397,40 @@ PASS 114  FAIL 0  DECLARED-DIFF 8  SKIP 0  MISSING 0   （122 场景）
 RENAME，目录内一次改名产生 RENAME(old)+CREATE(new) 两条。单测 287 passed
 （+25：解析含匿名事件不截断批次/展开次序/递归含符号链接不注册/go_rel/断连回收/
 缓冲上限/Q_OVERFLOW fatal/keepalive 事件后重置/三兄弟并发竞态）；clippy `-D warnings` 与
-fmt 干净。`capture.py` 新增独立组 `--which watch`（8 场景，**不混入 `all`**，
+fmt 干净。`capture.py` 新增独立组 `--which watch`（9 场景，**不混入 `all`**，
 独立灰度，单独统计）：create / write / remove / rename（两帧断言）/
 chmod（经沙箱内进程触发 IN_ATTRIB）/ recursive（mkdir -p 两级合成事件）/
-disconnect（Start 帧后断连）/ trio（按上游 watcher_test 全流程）。watcherId
+disconnect（Start 帧后断连）/ keepalive（`Keepalive-Ping-Interval: 1` 头，
+静默窗口恰两帧，节奏机制显式化）/ trio（按上游 watcher_test 全流程）。watcherId
 随机值与 not-found 消息内嵌 id 均已归一化。
 
 ```
-watch 组（双端 fresh 容器） PASS 8  FAIL 0  DECLARED-DIFF 0   （8 场景）
-all 全量（同容器序）        PASS 115 FAIL 0  DECLARED-DIFF 7   （122 场景）
+watch 组（双端 fresh 容器） PASS 9  FAIL 0  DECLARED-DIFF 0   （9 场景）
+all 全量（同容器序）        PASS 118 FAIL 0  DECLARED-DIFF 4   （122 场景）
 ```
 
 `fs_watch_unary_probe` 由 DECLARED-DIFF 转 PASS（三兄弟已实现，allowlist 同 PR
-移除孤儿条目，现 7 条全部命中）；`connect_stream` 的帧读取抽取为
+移除孤儿条目）；`connect_stream` 的帧读取抽取为
 `_read_stream_frames` 供 watch 复用，`all` 存量场景零回归。资源泄漏门：
 同一容器连跑 3 遍 watch 组（24 个 watcher 建断，含断连场景）后
 `/proc/<pid>/fd` 计数回到基线 10、inotify watch 数 0；`max_user_watches` 触顶
 路径显式报错（单测覆盖）。
+
+**复审轮（2026-09-09，4 项发现全部处置）**：
+1. `ProcessSelector` 的 `deny_unknown_fields` 删除——注释声称"上游直接拒绝该
+   形状"被自家 fixture 证伪：connect-go JSON 解码 `DiscardUnknown` 丢弃未知
+   `selector` 键，空 selector 走上游 default 分支。删除后我方
+   `validated_selector` 的 (None,None) 分支产出**逐字节相同**的
+   `unimplemented` 文案，`proc_sendinput_probe` / `proc_connect_missing` /
+   `proc_sendsignal_nested_probe` 三条转 PASS，allowlist 7 → 4（无孤儿）；
+   混合形状 `{"selector":…,"pid":8}` 与上游一样按 flat pid 生效（单测锁定）。
+2. watch.rs 拆分触发条件命中（非测试代码 >800 行）：按 §10 归合作者重构，
+   时序在 PR-B 之后，本 PR 不拆。
+3. keepalive 节奏由不可观测变为显式：新增 `watch_keepalive` 场景（1s 头，
+   双端各两帧，逐字节一致）；30s 默认与 90s 的差异无法低成本 fixture
+   （需静默 30s+），以 README 已知差异条目为声明载体。
+4. pull 缓冲上界同样无法低成本 fixture（上游会返回两万条事件的巨型 body），
+   声明载体同为 README 已知差异表。
 
 已知有意偏离（PR 描述同步）：pull watcher 事件缓冲设上界（上游无界累积）；
 keepalive 沿用进程流的 30s 默认（上游文件 watch 为 90s，同 LB 空闲超时理由），
