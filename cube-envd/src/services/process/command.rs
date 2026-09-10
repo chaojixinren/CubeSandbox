@@ -17,7 +17,6 @@ use super::metadata;
 use super::stream::drive_stream;
 use super::supervisor::{kill_process_tree, supervise_process};
 use super::{frame_stream_response, stream_error_response};
-use crate::auth::User;
 use crate::cgroup::{self, ProcType};
 use crate::exec;
 use crate::msg::process::{
@@ -25,6 +24,7 @@ use crate::msg::process::{
     ProcessSelector, SendInputRequest, SendSignalRequest, StartRequest, StreamInputRequest,
     UpdateRequest,
 };
+use crate::platform::identity::User;
 use crate::protocol::stream::response_channel;
 #[cfg(test)]
 use crate::protocol::stream::RESPONSE_QUEUE_CAPACITY;

@@ -46,13 +46,13 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::auth::{resolve_path, User};
 use crate::compat::vocab::{errno_text, go_path_error};
 use crate::msg::filesystem::{
     CreateWatcherRequest, CreateWatcherResponse, EventType, FilesystemEvent,
     GetWatcherEventsRequest, GetWatcherEventsResponse, RemoveWatcherRequest, RemoveWatcherResponse,
     StartEvent, WatchDirRequest, WatchDirResponse,
 };
+use crate::platform::identity::{resolve_path, User};
 use crate::protocol;
 use crate::protocol::{ConnectCode, ConnectError};
 
@@ -1028,7 +1028,7 @@ use crate::services::process::frame_stream_response;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::User;
+    use crate::platform::identity::User;
 
     fn user() -> User {
         User {

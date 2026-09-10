@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::auth::User;
+use crate::platform::identity::User;
 use std::os::unix::fs::PermissionsExt;
 
 use super::errors::MAX_UPLOAD_SIZE;

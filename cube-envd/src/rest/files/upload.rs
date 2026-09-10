@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user, MAX_UPLOAD_SIZE};
-use crate::auth::{self, User};
+use crate::platform::identity::{self, User};
 use crate::protocol::RestError;
 use crate::state::AppState;
 
@@ -84,7 +84,7 @@ async fn upload_raw(
             "the 'path' query parameter is required for application/octet-stream uploads",
         ));
     };
-    let path = auth::resolve_path(raw_path, user);
+    let path = identity::resolve_path(raw_path, user);
     // Typed fast path for the common case: a declared Content-Length over
     // the cap is rejected without reading the body. (axum 0.7's to_bytes
     // error has no public typed accessor, so chunked bodies still rely on
@@ -174,7 +174,7 @@ async fn upload_multipart(
         let Some(target) = field.file_name().map(|s| s.to_string()) else {
             continue;
         };
-        let path = auth::resolve_path(&target, user);
+        let path = identity::resolve_path(&target, user);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, RestError>>(16);
         let writer = spawn_upload_writer(path.clone(), user.clone(), rx);
         loop {

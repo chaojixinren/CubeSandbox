@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{broadcast, oneshot, Notify};
 
-use crate::auth::User;
+use crate::platform::identity::User;
 
 use super::io::{
     decorate_terminal, pump_pty, terminal_after_output, terminal_after_wait, OUTPUT_DRAIN_GRACE,

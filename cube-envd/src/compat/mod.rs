@@ -1,10 +1,13 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! 【L1 Go 基线词汇】与 Go envd 0.5.13 对齐的纯数据 + 纯函数。
+//! Go baseline vocabulary: byte-exact reproductions of the strings the Go envd
+//! baseline puts on the wire.
 //!
-//! 回答：为什么错误文案/形状长这样（Go 对照）。
-//! 不变量：本目录只放数据表与纯函数——无 I/O、无状态、无决策。
-//! 来源：承接 go_compat/（原样迁入）。
+//! Invariant: this directory holds data tables and pure functions only — no
+//! I/O, no state, no decisions. That is what makes the fidelity layer
+//! auditable on its own.
+//!
+//! Source: `go_compat/`.
 
 pub mod vocab;

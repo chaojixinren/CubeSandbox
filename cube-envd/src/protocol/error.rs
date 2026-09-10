@@ -88,8 +88,8 @@ impl ConnectError {
     ///
     /// `op` is the Go syscall name (`stat`/`lstat`/`mkdir`/`readdirent`/…)
     /// so the message renders exactly like Go's `*os.PathError`
-    /// (`stat /x: not a directory`) via `go_compat::errno`. Before the
-    /// go_compat table this rendered `strerror` text (capitalized) with no
+    /// (`stat /x: not a directory`) via `compat::vocab`. Before the
+    /// compat::vocab table this rendered `strerror` text (capitalized) with no
     /// op prefix — a systematic divergence invisible to the conformance
     /// harness, which only covered the ENOENT branch.
     ///

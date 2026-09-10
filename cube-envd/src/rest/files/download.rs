@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user};
-use crate::auth;
+use crate::platform::identity;
 use crate::protocol::RestError;
 use crate::rest::{content_disposition, encoding, httpdate, preconditions, ranges};
 use crate::state::AppState;
@@ -175,7 +175,7 @@ async fn resolve_download(
         .cloned()
         .or_else(|| state.default_workdir())
         .unwrap_or_else(|| user.home.clone());
-    let path = auth::resolve_path(&raw_path, &user);
+    let path = identity::resolve_path(&raw_path, &user);
 
     let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,

@@ -16,9 +16,9 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use futures::StreamExt;
 
-use crate::auth::{self, User};
 use crate::cors;
 use crate::legacy;
+use crate::platform::identity::{self, User};
 use crate::protocol;
 use crate::protocol::{ConnectCode, ConnectError};
 use crate::rest;
@@ -112,13 +112,13 @@ fn panic_handler(
 /// configured through `/init` (`root` until then, like upstream's
 /// `defaults.User`).
 fn rpc_user(state: &AppState, headers: &HeaderMap) -> Result<User, ConnectError> {
-    let name = auth::user_from_basic_auth(
+    let name = identity::user_from_basic_auth(
         headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
     )
     .unwrap_or_else(|| state.default_user());
-    auth::lookup_user(&name).map_err(|_| {
+    identity::lookup_user(&name).map_err(|_| {
         ConnectError::new(
             ConnectCode::Unauthenticated,
             format!("invalid username: '{name}'"),

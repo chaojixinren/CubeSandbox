@@ -11,7 +11,6 @@
 //! (`e2b-dev/infra`, pinned 0.5.13 / base image 2026.16) that this crate is
 //! compatibility-tested against — see tests/e2e/envd_conformance.
 
-mod auth;
 mod blocking;
 mod cgroup;
 mod compat;
@@ -19,6 +18,7 @@ mod cors;
 mod exec;
 mod legacy;
 mod msg;
+mod platform;
 mod protocol;
 mod rest;
 mod server;

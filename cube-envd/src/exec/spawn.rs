@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, oneshot, Notify};
 
-use crate::auth::User;
+use crate::platform::identity::User;
 use crate::state::AppState;
 
 use super::cleanup::kill_process_group;
@@ -130,7 +130,7 @@ pub fn merged_env(
 pub fn resolve_cwd(cwd: Option<&str>, user: &User) -> Result<String, String> {
     match cwd {
         Some(c) => {
-            let dir = crate::auth::resolve_path(c, user);
+            let dir = crate::platform::identity::resolve_path(c, user);
             let p = std::path::Path::new(&dir);
             if p.is_dir() {
                 Ok(dir)

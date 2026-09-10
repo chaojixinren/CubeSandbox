@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderMap, StatusCode};
 
-use crate::auth::{self, User};
+use crate::platform::identity::{self, User};
 use crate::protocol::RestError;
 use crate::state::AppState;
 
@@ -33,14 +33,14 @@ pub(crate) fn resolve_request_user(
         .get("username")
         .cloned()
         .or_else(|| {
-            auth::user_from_basic_auth(
+            identity::user_from_basic_auth(
                 headers
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok()),
             )
         })
         .unwrap_or_else(|| state.default_user());
-    auth::lookup_user(&name).map_err(|msg| RestError::new(StatusCode::UNAUTHORIZED, msg))
+    identity::lookup_user(&name).map_err(|msg| RestError::new(StatusCode::UNAUTHORIZED, msg))
 }
 
 pub(crate) fn check_token_rest(state: &AppState, headers: &HeaderMap) -> Result<(), RestError> {

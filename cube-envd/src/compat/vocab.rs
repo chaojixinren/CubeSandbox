@@ -56,7 +56,7 @@ pub fn errno_text(err: &std::io::Error) -> String {
         None => {
             #[cfg(debug_assertions)]
             eprintln!(
-                "go_compat::errno: no Go text for errno {:?} ({}), falling back to strerror",
+                "compat::vocab: no Go text for errno {:?} ({}), falling back to strerror",
                 err.raw_os_error(),
                 err
             );

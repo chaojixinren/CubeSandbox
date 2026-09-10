@@ -6,7 +6,7 @@
 //! Error vocabulary is aligned with the Go envd 0.5.13 baseline, including
 //! the Go-syscall-flavored messages SDK users may match on. Every (context,
 //! op) pair below is derived from the upstream call site listed next to it;
-//! errno texts come from `go_compat::errno` (go1.26 table, lowercase).
+//! errno texts come from `compat::vocab` (go1.26 table, lowercase).
 //! Verified shapes:
 //! - Stat missing:    404 not_found  "file not found: lstat <p>: no such file or directory"
 //! - Stat other:      500 internal   "error getting file info: lstat <p>: <errno>"   (utils.go:49)
@@ -17,18 +17,18 @@
 //! - MakeDir levels:  500 internal   "failed to create directory: mkdir <p>: <errno>" / "path is a file: <p>" (path.go:77-94)
 //! - Move missing:    404 not_found  "source file not found: rename <s> <d>: no such file or directory"
 //! - Move other:      500 internal   "error renaming: rename <s> <d>: <errno>"       (move.go:47)
-//! - Watch family:    not implemented by cube-envd (MVP scope, issue #1227)
+//! - Watch family:    implemented in `services/watch.rs` (streaming + pull watchers)
 
-use crate::auth::User;
 use crate::compat::vocab::{go_link_error, go_path_error};
 use crate::msg::filesystem::{
     entry_info, EntryInfo, EntryResponse, ListDirRequest, ListDirResponse, MoveRequest, PathRequest,
 };
+use crate::platform::identity::User;
 use crate::protocol::{ConnectCode, ConnectError};
 use std::os::unix::fs::DirBuilderExt;
 
 pub fn stat(req: &PathRequest, user: &User) -> Result<serde_json::Value, ConnectError> {
-    let path = crate::auth::resolve_path(&req.path, user);
+    let path = crate::platform::identity::resolve_path(&req.path, user);
     let meta = std::fs::symlink_metadata(&path).map_err(|e| entry_error(&path, &e))?;
     to_json(EntryResponse {
         entry: entry_info(&path, &meta),
@@ -36,7 +36,7 @@ pub fn stat(req: &PathRequest, user: &User) -> Result<serde_json::Value, Connect
 }
 
 pub fn make_dir(req: &PathRequest, user: &User) -> Result<serde_json::Value, ConnectError> {
-    let path = crate::auth::resolve_path(&req.path, user);
+    let path = crate::platform::identity::resolve_path(&req.path, user);
     // Follow like upstream's os.Stat (dir.go MakeDir :69-85): an existing
     // path is AlreadyExists only when it IS a directory; an existing file
     // (or a link to one) is a caller bug -> InvalidArgument.
@@ -74,8 +74,8 @@ pub fn make_dir(req: &PathRequest, user: &User) -> Result<serde_json::Value, Con
 }
 
 pub fn move_entry(req: &MoveRequest, user: &User) -> Result<serde_json::Value, ConnectError> {
-    let source = crate::auth::resolve_path(&req.source, user);
-    let destination = crate::auth::resolve_path(&req.destination, user);
+    let source = crate::platform::identity::resolve_path(&req.source, user);
+    let destination = crate::platform::identity::resolve_path(&req.destination, user);
     // move.go:36 — the destination's parent chain is created (and chowned)
     // before the rename, so moving into a not-yet-existing directory
     // succeeds upstream. Skipping this made us fail with `internal` where
@@ -111,7 +111,7 @@ pub fn move_entry(req: &MoveRequest, user: &User) -> Result<serde_json::Value, C
 
 /// Baseline: removing a missing path succeeds (200 {}).
 pub fn remove(req: &PathRequest, user: &User) -> Result<serde_json::Value, ConnectError> {
-    let path = crate::auth::resolve_path(&req.path, user);
+    let path = crate::platform::identity::resolve_path(&req.path, user);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(serde_json::json!({}));
@@ -204,7 +204,7 @@ fn walk_dir(
 
 /// DFS listing with the proto `depth` semantics (0/absent behaves as 1).
 pub fn list_dir(req: &ListDirRequest, user: &User) -> Result<serde_json::Value, ConnectError> {
-    let root = crate::auth::resolve_path(&req.path, user);
+    let root = crate::platform::identity::resolve_path(&req.path, user);
     // Upstream ListDir resolves the root through EvalSymlinks (dir.go:36),
     // stats the resolved path (checkIfDirectory, dir.go:41-56) and walks it
     // (dir.go:46) while naming entries after the *requested* path
@@ -654,7 +654,7 @@ mod tests {
         );
     }
 
-    /// Non-ENOENT errno texts come from the go_compat table (go1.26), not
+    /// Non-ENOENT errno texts come from the compat::vocab table (go1.26), not
     /// from strerror — this is the exact divergence the conformance harness
     /// never covered.
     #[test]

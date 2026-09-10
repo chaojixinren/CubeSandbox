@@ -71,7 +71,7 @@ pub struct SpawnedProcess {
 
 #[cfg(test)]
 mod tests {
-    use crate::auth::User;
+    use crate::platform::identity::User;
 
     pub(super) fn current_user() -> User {
         // Run exec tests as the invoking user so they work unprivileged.

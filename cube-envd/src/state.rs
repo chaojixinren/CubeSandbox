@@ -142,7 +142,7 @@ impl AppState {
         Self {
             env_vars: RwLock::new(env_vars),
             access_token: RwLock::new(None),
-            default_user: RwLock::new(crate::auth::DEFAULT_USER.to_string()),
+            default_user: RwLock::new(crate::platform::identity::DEFAULT_USER.to_string()),
             default_workdir: RwLock::new(None),
             last_set_time: Mutex::new(0),
             initialized: AtomicBool::new(false),

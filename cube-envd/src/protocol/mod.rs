@@ -1,15 +1,18 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! 【L1 wire 字节层】与传输无关的 Connect 协议机制。
+//! Connect wire layer: byte-exact framing and stream delivery, the timeout and
+//! keepalive request headers, and the error envelope each surface answers with.
 //!
-//! 回答：客户端↔服务端的字节契约怎么编解码、流式响应怎么投递、
-//! 心跳与期限怎么解析、错误响应体长什么样。
-//! 依赖：仅向下依赖 compat（error.rs 借用 Go 文案表）。
-//! 来源：承接 connect.rs（帧/投递/心跳/期限）与 error.rs（错误类型与映射）。
+//! Transport-agnostic: nothing here knows about a service or a domain. The
+//! only downward dependency is `compat`, from which `error` borrows the Go
+//! error-text table.
 //!
-//! 一个文件一个问题：`frames` 帧编解码 / `stream` 流式投递 /
-//! `keepalive` 心跳 / `timeout` 期限 / `error` 错误类型与 HTTP 映射。
+//! One file, one question: `frames` codec, `stream` delivery, `keepalive`
+//! cadence, `timeout` deadline, `error` error types and HTTP mapping.
+//!
+//! Source: `connect.rs` (frames/keepalive/timeout), `connect/stream.rs`,
+//! `error.rs`.
 
 pub mod error;
 pub mod frames;
