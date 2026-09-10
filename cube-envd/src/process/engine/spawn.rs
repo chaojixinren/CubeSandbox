@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, oneshot, Notify};
 
-use crate::app::state::AppState;
+use crate::platform::config::Config;
 use crate::platform::identity::User;
 
 use super::cleanup::kill_process_group;
@@ -97,7 +97,7 @@ pub(super) const DEFAULT_PATH: &str =
 
 /// Merge order (later wins): built-in defaults < /init env vars < request envs.
 pub fn merged_env(
-    state: &AppState,
+    config: &Config,
     user: &User,
     request_envs: &HashMap<String, String>,
 ) -> HashMap<String, String> {
@@ -107,7 +107,7 @@ pub fn merged_env(
     env.insert("USER".to_string(), user.name.clone());
     env.insert("LOGNAME".to_string(), user.name.clone());
     env.insert("TERM".to_string(), "xterm".to_string());
-    env.extend(state.env_vars());
+    env.extend(config.env_vars());
     env.extend(request_envs.clone());
     env
 }
@@ -538,14 +538,14 @@ mod tests {
 
     #[test]
     fn env_merge_order() {
-        let state = AppState::new();
-        state.merge_env_vars(HashMap::from([
+        let config = Config::new();
+        config.merge_env_vars(HashMap::from([
             ("FROM_INIT".to_string(), "1".to_string()),
             ("PATH".to_string(), "/init-path".to_string()),
         ]));
         let user = current_user();
         let req = HashMap::from([("PATH".to_string(), "/req-path".to_string())]);
-        let env = merged_env(&state, &user, &req);
+        let env = merged_env(&config, &user, &req);
         assert_eq!(env["PATH"], "/req-path"); // request wins over init
         assert_eq!(env["FROM_INIT"], "1");
         assert_eq!(env["E2B_SANDBOX"], "false");

@@ -13,4 +13,6 @@
 //!
 //! Source: `auth.rs` (identity) and the config/token part of `state.rs`.
 
+pub mod config;
 pub mod identity;
+pub mod lock;

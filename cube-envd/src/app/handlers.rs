@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use axum::Extension;
@@ -16,6 +16,7 @@ use futures::StreamExt;
 use crate::app::state::AppState;
 use crate::filesystem as fs_svc;
 use crate::filesystem::watch as watch_svc;
+use crate::platform::config::Config;
 use crate::platform::identity::{self, User};
 use crate::process as proc_svc;
 use crate::protocol;
@@ -28,13 +29,13 @@ pub(crate) const MAX_UNARY_BODY: usize = 4 * 1024 * 1024;
 /// RPC-surface user resolution: Basic auth, falling back to the default user
 /// configured through `/init` (`root` until then, like upstream's
 /// `defaults.User`).
-pub(crate) fn rpc_user(state: &AppState, headers: &HeaderMap) -> Result<User, ConnectError> {
+pub(crate) fn rpc_user(config: &Config, headers: &HeaderMap) -> Result<User, ConnectError> {
     let name = identity::user_from_basic_auth(
         headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
     )
-    .unwrap_or_else(|| state.default_user());
+    .unwrap_or_else(|| config.default_user());
     identity::lookup_user(&name).map_err(|_| {
         ConnectError::new(
             ConnectCode::Unauthenticated,
@@ -43,8 +44,8 @@ pub(crate) fn rpc_user(state: &AppState, headers: &HeaderMap) -> Result<User, Co
     })
 }
 
-pub(crate) fn rpc_token_check(state: &AppState, headers: &HeaderMap) -> Result<(), ConnectError> {
-    crate::app::lifecycle::check_token(state, headers)
+pub(crate) fn rpc_token_check(config: &Config, headers: &HeaderMap) -> Result<(), ConnectError> {
+    crate::app::lifecycle::check_token(config, headers)
         .map_err(|_| ConnectError::new(ConnectCode::Unauthenticated, "invalid access token"))
 }
 
@@ -101,7 +102,7 @@ pub(crate) async fn process_start(
     if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return proc_svc::stream_error_response(e);
     }
     let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
@@ -126,7 +127,7 @@ pub(crate) async fn process_start(
             ))
         }
     };
-    let user = match rpc_user(&state, &headers) {
+    let user = match rpc_user(&state.config, &headers) {
         Ok(u) => u,
         Err(e) => return proc_svc::stream_error_response(e),
     };
@@ -141,7 +142,14 @@ pub(crate) async fn process_start(
         deadline,
         keepalive
     );
-    proc_svc::start(state, req, user, deadline, keepalive)
+    proc_svc::start(
+        state.config.clone(),
+        state.processes.clone(),
+        req,
+        user,
+        deadline,
+        keepalive,
+    )
 }
 
 pub(crate) async fn process_connect(
@@ -153,7 +161,7 @@ pub(crate) async fn process_connect(
     if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return proc_svc::stream_error_response(e);
     }
     let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
@@ -182,7 +190,7 @@ pub(crate) async fn process_connect(
     // Connect is an attachment, not a command owner. The Start request owns
     // the process deadline; applying Connect-Timeout-Ms here would terminate
     // long-lived PTY attachments after an absolute wall-clock interval.
-    proc_svc::connect(state, req, keepalive, None)
+    proc_svc::connect(state.processes.clone(), req, keepalive, None)
 }
 
 pub(crate) async fn process_list(
@@ -192,14 +200,14 @@ pub(crate) async fn process_list(
 ) -> axum::response::Response {
     // Token gate first, like every other handler: an unauthenticated caller
     // learns nothing about the body parser.
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let parsed: Result<serde_json::Value, _> = read_unary_request(&headers, body).await;
     if let Err(e) = parsed {
         return e.into_response();
     }
-    unary_json(proc_svc::list(&state))
+    unary_json(proc_svc::list(&state.processes))
 }
 
 pub(crate) async fn process_send_signal(
@@ -207,7 +215,7 @@ pub(crate) async fn process_send_signal(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let req: crate::process::wire::SendSignalRequest =
@@ -215,7 +223,7 @@ pub(crate) async fn process_send_signal(
             Ok(r) => r,
             Err(e) => return e.into_response(),
         };
-    unary_result(proc_svc::send_signal(&state, &req))
+    unary_result(proc_svc::send_signal(&state.processes, &req))
 }
 
 pub(crate) async fn process_send_input(
@@ -223,7 +231,7 @@ pub(crate) async fn process_send_input(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let req: crate::process::wire::SendInputRequest = match read_unary_request(&headers, body).await
@@ -231,7 +239,7 @@ pub(crate) async fn process_send_input(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    unary_result(proc_svc::send_input(&state, &req).await)
+    unary_result(proc_svc::send_input(&state.processes, &req).await)
 }
 
 pub(crate) async fn process_close_stdin(
@@ -239,7 +247,7 @@ pub(crate) async fn process_close_stdin(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let req: crate::process::wire::CloseStdinRequest =
@@ -247,7 +255,7 @@ pub(crate) async fn process_close_stdin(
             Ok(r) => r,
             Err(e) => return e.into_response(),
         };
-    unary_result(proc_svc::close_stdin(&state, &req).await)
+    unary_result(proc_svc::close_stdin(&state.processes, &req).await)
 }
 
 pub(crate) async fn process_stream_input(
@@ -260,7 +268,7 @@ pub(crate) async fn process_stream_input(
     if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return proc_svc::stream_error_response(e);
     }
 
@@ -294,7 +302,8 @@ pub(crate) async fn process_stream_input(
                         ))
                     }
                 };
-            if let Err(e) = proc_svc::stream_input_event(&state, &mut selected, req).await {
+            if let Err(e) = proc_svc::stream_input_event(&state.processes, &mut selected, req).await
+            {
                 return proc_svc::stream_error_response(e);
             }
         }
@@ -310,14 +319,14 @@ pub(crate) async fn process_update(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let req: crate::process::wire::UpdateRequest = match read_unary_request(&headers, body).await {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    unary_result(proc_svc::update(&state, &req))
+    unary_result(proc_svc::update(&state.processes, &req))
 }
 
 // ---------- filesystem handlers ----------
@@ -337,14 +346,14 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(&T, &User) -> Result<serde_json::Value, ConnectError> + Send + 'static,
 {
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let req: T = match read_unary_request(&headers, body).await {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    let user = match rpc_user(&state, &headers) {
+    let user = match rpc_user(&state.config, &headers) {
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
@@ -430,7 +439,7 @@ pub(crate) async fn fs_watch_dir(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state, &headers) {
+    if let Err(e) = rpc_token_check(&state.config, &headers) {
         return e.into_response();
     }
     let req: crate::filesystem::wire::WatchDirRequest =
@@ -438,7 +447,7 @@ pub(crate) async fn fs_watch_dir(
             Ok(r) => r,
             Err(e) => return e.into_response(),
         };
-    let user = match rpc_user(&state, &headers) {
+    let user = match rpc_user(&state.config, &headers) {
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
@@ -456,14 +465,14 @@ macro_rules! watch_unary {
             headers: HeaderMap,
             body: axum::body::Body,
         ) -> axum::response::Response {
-            if let Err(e) = rpc_token_check(&state, &headers) {
+            if let Err(e) = rpc_token_check(&state.config, &headers) {
                 return e.into_response();
             }
             let req: $req = match read_unary_request(&headers, body).await {
                 Ok(r) => r,
                 Err(e) => return e.into_response(),
             };
-            let user = match rpc_user(&state, &headers) {
+            let user = match rpc_user(&state.config, &headers) {
                 Ok(u) => u,
                 Err(e) => return e.into_response(),
             };
@@ -492,3 +501,23 @@ watch_unary!(
     crate::filesystem::wire::RemoveWatcherRequest,
     watch_svc::remove_watcher
 );
+
+/// Adapter for `GET /files`: the domain handler takes the config it needs, so
+/// the data plane never sees the composition root.
+pub(crate) async fn files_download(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    fs_svc::download(&state.config, params, headers).await
+}
+
+/// Adapter for `POST /files`.
+pub(crate) async fn files_upload(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    fs_svc::upload(&state.config, params, headers, body).await
+}

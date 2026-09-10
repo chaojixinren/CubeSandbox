@@ -182,9 +182,10 @@ async fn multipart_read_error_awaits_writer_and_propagates() {
         axum::http::header::CONTENT_TYPE,
         "multipart/form-data; boundary=X".parse().unwrap(),
     );
+    let config = crate::platform::config::Config::new();
     let response = super::upload(
-        axum::extract::State(std::sync::Arc::new(crate::app::state::AppState::new())),
-        axum::extract::Query(std::collections::HashMap::new()),
+        &config,
+        std::collections::HashMap::new(),
         headers,
         axum::body::Body::from_stream(stream),
     )
@@ -226,26 +227,25 @@ fn upload_entry_shape() {
 #[cfg(test)]
 mod download_tests {
     use super::*;
-    use crate::app::state::AppState;
+    use crate::platform::config::Config;
     use axum::body::to_bytes;
-    use axum::extract::{Query, State};
     use axum::http::header;
     use axum::http::HeaderMap;
     use std::collections::HashMap;
 
     /// Drive the real GET /files handler against a tempdir file. The default
     /// user is root (present in /etc/passwd everywhere this suite runs); an
-    /// absolute `path` query bypasses home anchoring. AppState has no access
+    /// absolute `path` query bypasses home anchoring. The config has no access
     /// token set, so the token gate passes.
     async fn get(path: &str, extra: &[(&str, &str)]) -> axum::response::Response {
-        let state = State(std::sync::Arc::new(AppState::new()));
+        let config = Config::new();
         let mut params = HashMap::new();
         params.insert("path".to_string(), path.to_string());
         let mut headers = HeaderMap::new();
         for (k, v) in extra {
             headers.insert(k.parse::<header::HeaderName>().unwrap(), v.parse().unwrap());
         }
-        download(state, Query(params), headers).await
+        download(&config, params, headers).await
     }
 
     async fn body(
@@ -754,10 +754,10 @@ mod download_tests {
     /// Drive GET /files with a pre-built header map (obs-text values need
     /// HeaderValue::from_bytes; `from_str` rejects non-ASCII).
     async fn get_headers(path: &str, headers: HeaderMap) -> axum::response::Response {
-        let state = State(std::sync::Arc::new(AppState::new()));
+        let config = Config::new();
         let mut params = HashMap::new();
         params.insert("path".to_string(), path.to_string());
-        download(state, Query(params), headers).await
+        download(&config, params, headers).await
     }
 
     // ---- obs-text header bytes: garbage, not absent (review finding #1) ----

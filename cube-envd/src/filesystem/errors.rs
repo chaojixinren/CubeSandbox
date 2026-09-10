@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderMap, StatusCode};
 
-use crate::app::state::AppState;
+use crate::platform::config::Config;
 use crate::platform::identity::{self, User};
 use crate::protocol::RestError;
 
@@ -25,7 +25,7 @@ use crate::protocol::RestError;
 pub(crate) const MAX_UPLOAD_SIZE: usize = 256 * 1024 * 1024;
 
 pub(crate) fn resolve_request_user(
-    state: &AppState,
+    config: &Config,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Result<User, RestError> {
@@ -39,11 +39,13 @@ pub(crate) fn resolve_request_user(
                     .and_then(|v| v.to_str().ok()),
             )
         })
-        .unwrap_or_else(|| state.default_user());
+        .unwrap_or_else(|| config.default_user());
     identity::lookup_user(&name).map_err(|msg| RestError::new(StatusCode::UNAUTHORIZED, msg))
 }
 
-pub(crate) fn check_token_rest(state: &AppState, headers: &HeaderMap) -> Result<(), RestError> {
-    crate::app::lifecycle::check_token(state, headers)
+pub(crate) fn check_token_rest(config: &Config, headers: &HeaderMap) -> Result<(), RestError> {
+    let token = headers.get("x-access-token").and_then(|v| v.to_str().ok());
+    config
+        .check_access_token(token)
         .map_err(|_| RestError::new(StatusCode::UNAUTHORIZED, "invalid access token".to_string()))
 }

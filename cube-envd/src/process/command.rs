@@ -17,10 +17,11 @@ use super::metadata;
 use super::pump::drive_stream;
 use super::supervisor::{kill_process_tree, supervise_process};
 use super::{frame_stream_response, stream_error_response};
-use crate::app::state::{AppState, ProcEntry, PtyResizeError};
+use crate::platform::config::Config;
 use crate::platform::identity::User;
 use crate::process::cgroup::{self, ProcType};
 use crate::process::engine;
+use crate::process::table::{ProcEntry, ProcessTable, PtyResizeError};
 use crate::process::wire::{
     parse_signal, CloseStdinRequest, ConnectRequest, ListResponse, ProcessInfo, ProcessInput,
     ProcessSelector, SendInputRequest, SendSignalRequest, StartRequest, StreamInputRequest,
@@ -94,7 +95,8 @@ pub(crate) fn get_proc_type(req: &StartRequest) -> ProcType {
 
 /// Handle `process.Process/Start`.
 pub fn start(
-    state: Arc<AppState>,
+    config: Arc<Config>,
+    table: Arc<ProcessTable>,
     req: StartRequest,
     user: User,
     deadline: Option<std::time::Duration>,
@@ -107,7 +109,7 @@ pub fn start(
         ));
     }
 
-    let env = engine::merged_env(&state, &user, &req.process.envs);
+    let env = engine::merged_env(&config, &user, &req.process.envs);
     let cwd = match engine::resolve_cwd(req.process.cwd.as_deref(), &user) {
         Ok(c) => c,
         Err(msg) => {
@@ -121,7 +123,7 @@ pub fn start(
     // the wrapper also makes a "missing binary" a wrapper-level failure with
     // /usr/bin/nice's own wording (exit 127 event flow), not a spawn error.
     let (wrapper_cmd, wrapper_args) = oom_nice_wrapper(&req.process.cmd, &req.process.args);
-    let process_cgroup = match state.create_process_cgroup(get_proc_type(&req)) {
+    let process_cgroup = match table.create_process_cgroup(get_proc_type(&req)) {
         Ok(cgroup) => cgroup,
         Err(e) => {
             return stream_error_response(ConnectError::new(
@@ -212,7 +214,7 @@ pub fn start(
     let supervisor_sender = sender.clone();
     let supervisor_cgroup = process_cgroup.clone();
     let supervisor_reaped = reaped.clone();
-    let handle = state.insert_process(ProcEntry {
+    let handle = table.insert_process(ProcEntry {
         pid,
         tag: req.tag.clone(),
         config: req.process.clone(),
@@ -223,7 +225,7 @@ pub fn start(
         termination: termination.clone(),
         terminal,
     });
-    let supervisor_state = state.clone();
+    let supervisor_state = table.clone();
     tokio::spawn(async move {
         supervise_process(
             supervisor_state,
@@ -259,7 +261,7 @@ pub fn start(
 /// owns the process. The independent supervisor handles deadline and table
 /// cleanup, so disconnecting either stream only releases that subscription.
 pub fn connect(
-    state: Arc<AppState>,
+    table: Arc<ProcessTable>,
     req: ConnectRequest,
     keepalive_interval: std::time::Duration,
     stream_deadline: Option<std::time::Duration>,
@@ -268,7 +270,7 @@ pub fn connect(
         Ok(selector) => selector,
         Err(e) => return stream_error_response(e),
     };
-    let Some((pid, events)) = state.subscribe(pid, tag.as_deref()) else {
+    let Some((pid, events)) = table.subscribe(pid, tag.as_deref()) else {
         // Match Go envd's wording for a selector resolving to no live process
         // (the same helper SendSignal/List use).
         return stream_error_response(not_found(pid, tag.as_deref()));
@@ -285,8 +287,8 @@ pub fn connect(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn list(state: &AppState) -> serde_json::Value {
-    let processes = state
+pub fn list(table: &ProcessTable) -> serde_json::Value {
+    let processes = table
         .list_processes()
         .into_iter()
         .map(|(pid, tag, config)| ProcessInfo {
@@ -300,12 +302,12 @@ pub fn list(state: &AppState) -> serde_json::Value {
 
 /// Handle `process.Process/SendSignal` (unary).
 pub fn send_signal(
-    state: &AppState,
+    table: &ProcessTable,
     req: &SendSignalRequest,
 ) -> Result<serde_json::Value, ConnectError> {
     let (pid, tag) = validated_selector(&req.process)?;
     let (target, process_cgroup, termination) =
-        state.process_control(pid, tag.as_deref()).ok_or_else(|| {
+        table.process_control(pid, tag.as_deref()).ok_or_else(|| {
             // Match Go envd's specific wording so a client logging the message
             // sees the same text: "process with pid N not found" / "... tag X ...".
             not_found(pid, tag.as_deref())
@@ -356,11 +358,11 @@ pub fn send_signal(
 /// and mutex-protected, so concurrent unary calls and StreamInput messages are
 /// written in a deterministic order without serializing unrelated processes.
 pub async fn send_input(
-    state: &AppState,
+    table: &ProcessTable,
     req: &SendInputRequest,
 ) -> Result<serde_json::Value, ConnectError> {
     let (pid, tag) = validated_selector(&req.process)?;
-    let input = state
+    let input = table
         .input_handle(pid, tag.as_deref())
         .ok_or_else(|| not_found(pid, tag.as_deref()))?;
     write_process_input(pid, &input, &req.input).await?;
@@ -371,7 +373,7 @@ pub async fn send_input(
 /// reselects) the target process; data before selection is rejected rather than
 /// dereferencing an absent writer, and keepalive is intentionally a no-op.
 pub async fn stream_input_event(
-    state: &AppState,
+    table: &ProcessTable,
     selected: &mut Option<engine::InputHandle>,
     req: StreamInputRequest,
 ) -> Result<(), ConnectError> {
@@ -388,7 +390,7 @@ pub async fn stream_input_event(
     if let Some(start) = req.start {
         let (pid, tag) = validated_selector(&start.process)?;
         *selected = Some(
-            state
+            table
                 .input_handle(pid, tag.as_deref())
                 .ok_or_else(|| not_found(pid, tag.as_deref()))?,
         );
@@ -408,11 +410,11 @@ pub async fn stream_input_event(
 /// child. A PTY has no separate closeable stdin stream; callers must send
 /// Ctrl-D through SendInput instead.
 pub async fn close_stdin(
-    state: &AppState,
+    table: &ProcessTable,
     req: &CloseStdinRequest,
 ) -> Result<serde_json::Value, ConnectError> {
     let (pid, tag) = validated_selector(&req.process)?;
-    let input = state
+    let input = table
         .input_handle(pid, tag.as_deref())
         .ok_or_else(|| not_found(pid, tag.as_deref()))?;
     let mut writer = input.lock().await;
@@ -538,18 +540,21 @@ fn validated_selector(
 ///   not a caller bug;
 /// - a live process without a pty answers `internal` with Go's exact
 ///   "error resizing tty: ..." wording.
-pub fn update(state: &AppState, req: &UpdateRequest) -> Result<serde_json::Value, ConnectError> {
+pub fn update(
+    table: &ProcessTable,
+    req: &UpdateRequest,
+) -> Result<serde_json::Value, ConnectError> {
     let (pid, tag) = validated_selector(&req.process)?;
     let Some(size) = req.pty.as_ref().and_then(|p| p.size.as_ref()) else {
         // Nothing to resize: resolve to keep the not_found contract, then no-op.
-        state
+        table
             .find_pid(pid, tag.as_deref())
             .ok_or_else(|| not_found(pid, tag.as_deref()))?;
         return Ok(serde_json::json!({}));
     };
     let cols = size.cols as u16;
     let rows = size.rows as u16;
-    match state.resize_pty(pid, tag.as_deref(), cols, rows) {
+    match table.resize_pty(pid, tag.as_deref(), cols, rows) {
         Ok(()) => Ok(serde_json::json!({})),
         Err(PtyResizeError::NotFound) => Err(not_found(pid, tag.as_deref())),
         Err(PtyResizeError::NotAPty) => Err(ConnectError::new(
@@ -596,14 +601,15 @@ mod tests {
             (None, "resource_exhausted"),
             (Some(invalid_group), "invalid_argument"),
         ] {
-            let state = Arc::new(AppState::new().with_cgroup(Arc::new(FailingManager(group))));
+            let table = Arc::new(ProcessTable::new(Arc::new(FailingManager(group))));
             for _ in 0..2 {
                 let request: StartRequest = serde_json::from_value(serde_json::json!({
                     "process": {"cmd": "/usr/bin/touch", "args": [marker.to_str().unwrap()]},
                 }))
                 .unwrap();
                 let response = start(
-                    state.clone(),
+                    Arc::new(Config::new()),
+                    table.clone(),
                     request,
                     current_user(),
                     None,
@@ -638,11 +644,11 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn insert_spawned(
-        state: &AppState,
+        table: &ProcessTable,
         spawned: engine::SpawnedProcess,
     ) -> (
         u32,
-        crate::app::state::ProcHandle,
+        crate::process::table::ProcHandle,
         broadcast::Receiver<engine::PumpEvent>,
         tokio::sync::oneshot::Receiver<()>,
         broadcast::Sender<engine::PumpEvent>,
@@ -662,7 +668,7 @@ mod tests {
             cgroup,
         } = spawned;
         let supervisor_sender = sender.clone();
-        let handle = state.insert_process(ProcEntry {
+        let handle = table.insert_process(ProcEntry {
             pid,
             tag: None,
             config: crate::process::wire::ProcessConfig::default(),
@@ -689,10 +695,10 @@ mod tests {
 
     #[test]
     fn list_shape() {
-        let state = AppState::new();
-        assert_eq!(list(&state), serde_json::json!({}));
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
+        assert_eq!(list(&table), serde_json::json!({}));
         let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
-        state.insert_process(ProcEntry {
+        table.insert_process(ProcEntry {
             pid: 7,
             tag: Some("t".into()),
             config: crate::process::wire::ProcessConfig {
@@ -707,7 +713,7 @@ mod tests {
             termination: Arc::new(std::sync::Mutex::new(None)),
             terminal: Arc::new(std::sync::Mutex::new(None)),
         });
-        let v = list(&state);
+        let v = list(&table);
         assert_eq!(v["processes"][0]["pid"], 7);
         assert_eq!(v["processes"][0]["tag"], "t");
         assert_eq!(v["processes"][0]["config"]["cmd"], "/bin/bash");
@@ -715,11 +721,11 @@ mod tests {
 
     #[test]
     fn send_signal_unknown_process() {
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let req: SendSignalRequest =
             serde_json::from_str(r#"{"process":{"tag":"nope"},"signal":"SIGNAL_SIGKILL"}"#)
                 .unwrap();
-        let err = send_signal(&state, &req).unwrap_err();
+        let err = send_signal(&table, &req).unwrap_err();
         assert_eq!(err.code, ConnectCode::NotFound);
     }
 
@@ -821,16 +827,16 @@ mod tests {
 
     #[test]
     fn update_missing_pty_resolves_then_noops() {
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         // Missing pty on an unknown process is still not_found (resolve first).
         let req: UpdateRequest = serde_json::from_str(r#"{"process":{"pid":1}}"#).unwrap();
         assert_eq!(
-            update(&state, &req).unwrap_err().code,
+            update(&table, &req).unwrap_err().code,
             ConnectCode::NotFound
         );
         // Missing pty on a live process is a silent no-op success, not an error.
         let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
-        state.insert_process(ProcEntry {
+        table.insert_process(ProcEntry {
             pid: 7,
             tag: Some("t".into()),
             config: crate::process::wire::ProcessConfig::default(),
@@ -842,25 +848,25 @@ mod tests {
             terminal: Arc::new(std::sync::Mutex::new(None)),
         });
         let req: UpdateRequest = serde_json::from_str(r#"{"process":{"pid":7}}"#).unwrap();
-        assert_eq!(update(&state, &req).unwrap(), serde_json::json!({}));
+        assert_eq!(update(&table, &req).unwrap(), serde_json::json!({}));
     }
 
     #[test]
     fn update_unknown_process() {
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let req: UpdateRequest = serde_json::from_str(
             r#"{"process":{"tag":"nope"},"pty":{"size":{"cols":80,"rows":24}}}"#,
         )
         .unwrap();
-        let err = update(&state, &req).unwrap_err();
+        let err = update(&table, &req).unwrap_err();
         assert_eq!(err.code, ConnectCode::NotFound);
     }
 
     #[test]
     fn update_non_pty_process_is_internal() {
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
-        state.insert_process(ProcEntry {
+        table.insert_process(ProcEntry {
             pid: 7,
             tag: None,
             config: crate::process::wire::ProcessConfig::default(),
@@ -874,7 +880,7 @@ mod tests {
         let req: UpdateRequest =
             serde_json::from_str(r#"{"process":{"pid":7},"pty":{"size":{"cols":80,"rows":24}}}"#)
                 .unwrap();
-        let err = update(&state, &req).unwrap_err();
+        let err = update(&table, &req).unwrap_err();
         assert_eq!(err.code, ConnectCode::Internal);
         assert_eq!(
             err.message,
@@ -886,7 +892,7 @@ mod tests {
     async fn pipe_input_and_close_stdin_reach_the_child() {
         use base64::Engine;
 
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let spawned = engine::spawn(
             "/bin/cat",
             &[],
@@ -898,7 +904,7 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, mut events, _completion, _sender, _reaped, _termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let data = base64::engine::general_purpose::STANDARD.encode(b"pipe-input\n");
         let req: SendInputRequest = serde_json::from_value(serde_json::json!({
             "process": {"pid": pid},
@@ -906,18 +912,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            send_input(&state, &req).await.unwrap(),
+            send_input(&table, &req).await.unwrap(),
             serde_json::json!({})
         );
 
         let close: CloseStdinRequest =
             serde_json::from_value(serde_json::json!({"process": {"pid": pid}})).unwrap();
         assert_eq!(
-            close_stdin(&state, &close).await.unwrap(),
+            close_stdin(&table, &close).await.unwrap(),
             serde_json::json!({})
         );
         // Closing an already-closed pipe is intentionally idempotent.
-        close_stdin(&state, &close).await.unwrap();
+        close_stdin(&table, &close).await.unwrap();
 
         let mut stdout = Vec::new();
         loop {
@@ -944,14 +950,14 @@ mod tests {
             }
         }
         assert_eq!(stdout, b"pipe-input\n");
-        state.remove_process(handle);
+        table.remove_process(handle);
     }
 
     #[tokio::test]
     async fn pty_input_uses_master_and_close_stdin_is_rejected() {
         use base64::Engine;
 
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let spawned = engine::spawn_pty(
             "/bin/sh",
             &[
@@ -966,27 +972,27 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, mut events, _completion, _sender, _reaped, _termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let req: SendInputRequest = serde_json::from_value(serde_json::json!({
             "process": {"pid": pid},
             "input": {"pty": base64::engine::general_purpose::STANDARD.encode(b"hello\n")}
         }))
         .unwrap();
-        send_input(&state, &req).await.unwrap();
+        send_input(&table, &req).await.unwrap();
 
         let wrong: SendInputRequest = serde_json::from_value(serde_json::json!({
             "process": {"pid": pid},
             "input": {"stdin": base64::engine::general_purpose::STANDARD.encode(b"x")}
         }))
         .unwrap();
-        assert!(send_input(&state, &wrong)
+        assert!(send_input(&table, &wrong)
             .await
             .unwrap_err()
             .message
             .contains("tty assigned to process"));
         let close: CloseStdinRequest =
             serde_json::from_value(serde_json::json!({"process": {"pid": pid}})).unwrap();
-        let error = close_stdin(&state, &close).await.unwrap_err();
+        let error = close_stdin(&table, &close).await.unwrap_err();
         assert_eq!(error.code, ConnectCode::Unknown);
         assert!(error.message.contains("cannot close stdin for PTY process"));
 
@@ -1016,7 +1022,7 @@ mod tests {
             "input": {"pty": base64::engine::general_purpose::STANDARD.encode([0x04])}
         }))
         .unwrap();
-        send_input(&state, &eof).await.unwrap();
+        send_input(&table, &eof).await.unwrap();
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(3), events.recv())
                 .await
@@ -1028,7 +1034,7 @@ mod tests {
                 event => panic!("unexpected terminal event: {event:?}"),
             }
         }
-        state.remove_process(handle);
+        table.remove_process(handle);
     }
 
     #[tokio::test]
@@ -1052,7 +1058,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_timeout_ends_only_the_attachment() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let spawned = engine::spawn(
             "/bin/sh",
             &["-c".into(), "sleep 1".into()],
@@ -1064,9 +1072,9 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let supervisor = tokio::spawn(supervise_process(
-            state.clone(),
+            table.clone(),
             handle,
             pid,
             sender,
@@ -1089,16 +1097,18 @@ mod tests {
         assert_eq!(terminal[0], crate::protocol::frames::END_STREAM_FLAG);
         let payload: serde_json::Value = serde_json::from_slice(&terminal[5..]).unwrap();
         assert_eq!(payload["error"]["code"], "deadline_exceeded");
-        assert!(state.find_pid(Some(pid), None).is_some());
+        assert!(table.find_pid(Some(pid), None).is_some());
         driver.await.unwrap();
         engine::kill_process_group(pid, libc::SIGKILL).unwrap();
         supervisor.await.unwrap();
-        assert!(state.find_pid(Some(pid), None).is_none());
+        assert!(table.find_pid(Some(pid), None).is_none());
     }
 
     #[tokio::test]
     async fn connect_without_server_deadline_survives_timeout_header_semantics() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let spawned = engine::spawn(
             "/bin/sh",
             &["-c".into(), "sleep 1".into()],
@@ -1110,9 +1120,9 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let supervisor = tokio::spawn(supervise_process(
-            state.clone(),
+            table.clone(),
             handle,
             pid,
             sender,
@@ -1165,7 +1175,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_supervisor_cleans_up_after_start_response_disconnects() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let spawned = engine::spawn(
             "/bin/sh",
             &["-c".into(), "sleep 1".into()],
@@ -1177,9 +1189,9 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let supervisor = tokio::spawn(supervise_process(
-            state.clone(),
+            table.clone(),
             handle,
             pid,
             sender,
@@ -1204,19 +1216,21 @@ mod tests {
             .expect("Start response task did not exit after disconnect")
             .unwrap();
         assert!(
-            state.find_pid(Some(pid), None).is_some(),
+            table.find_pid(Some(pid), None).is_some(),
             "disconnect must not remove a still-running process"
         );
         tokio::time::timeout(std::time::Duration::from_secs(3), supervisor)
             .await
             .expect("supervisor did not reap the disconnected process")
             .unwrap();
-        assert!(state.find_pid(Some(pid), None).is_none());
+        assert!(table.find_pid(Some(pid), None).is_none());
     }
 
     #[tokio::test]
     async fn process_supervisor_deadline_is_delivered_without_http_backpressure() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let spawned = engine::spawn(
             "/bin/sh",
             &["-c".into(), "sleep 30".into()],
@@ -1228,9 +1242,9 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let supervisor = tokio::spawn(supervise_process(
-            state.clone(),
+            table.clone(),
             handle,
             pid,
             sender,
@@ -1261,7 +1275,7 @@ mod tests {
         assert_eq!(trailer[0], crate::protocol::frames::END_STREAM_FLAG);
         let payload: serde_json::Value = serde_json::from_slice(&trailer[5..]).unwrap();
         assert_eq!(payload["error"]["code"], "deadline_exceeded");
-        assert!(state.find_pid(Some(pid), None).is_none());
+        assert!(table.find_pid(Some(pid), None).is_none());
         driver.await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), supervisor)
             .await
@@ -1271,7 +1285,9 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_does_not_misclassify_child_reaped_during_output_drain() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let spawned = engine::spawn(
             "/bin/sh",
             &["-c".into(), "sleep 1 & exit 0".into()],
@@ -1283,9 +1299,9 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let supervisor = tokio::spawn(supervise_process(
-            state.clone(),
+            table.clone(),
             handle,
             pid,
             sender,
@@ -1328,12 +1344,14 @@ mod tests {
         );
         driver.await.unwrap();
         supervisor.await.unwrap();
-        assert!(state.find_pid(Some(pid), None).is_none());
+        assert!(table.find_pid(Some(pid), None).is_none());
     }
 
     #[tokio::test]
     async fn unread_full_response_does_not_block_deadline_or_reaping() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let spawned = engine::spawn(
             "/bin/sh",
             &["-c".into(), "while :; do printf 1234567890; done".into()],
@@ -1345,9 +1363,9 @@ mod tests {
         )
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
-            insert_spawned(&state, spawned);
+            insert_spawned(&table, spawned);
         let supervisor = tokio::spawn(supervise_process(
-            state.clone(),
+            table.clone(),
             handle,
             pid,
             sender,
@@ -1372,7 +1390,7 @@ mod tests {
             .expect("full HTTP response queue blocked deadline/reaping")
             .unwrap();
         driver.await.unwrap();
-        assert!(state.find_pid(Some(pid), None).is_none());
+        assert!(table.find_pid(Some(pid), None).is_none());
         let mut frames = Vec::new();
         while let Some(frame) = rx.recv().await {
             frames.push(frame);
@@ -1403,9 +1421,11 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_closes_only_the_response_task() {
-        let state = Arc::new(AppState::new());
+        let table = Arc::new(ProcessTable::new(Arc::new(
+            crate::process::cgroup::NoopManager,
+        )));
         let (pub_tx, events) = broadcast::channel::<engine::PumpEvent>(4);
-        let _handle = state.insert_process(ProcEntry {
+        let _handle = table.insert_process(ProcEntry {
             pid: 42,
             tag: None,
             config: crate::process::wire::ProcessConfig::default(),
@@ -1447,12 +1467,12 @@ mod tests {
                 .is_none()
         );
         assert!(
-            state.find_pid(Some(42), None).is_some(),
+            table.find_pid(Some(42), None).is_some(),
             "closing the response must not reap a still-running Start process"
         );
 
         driver.await.unwrap();
-        assert!(state.find_pid(Some(42), None).is_some());
+        assert!(table.find_pid(Some(42), None).is_some());
     }
 
     #[tokio::test]
@@ -1497,9 +1517,9 @@ mod tests {
 
     #[tokio::test]
     async fn stream_input_requires_start_and_reuses_selected_writer() {
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let (sender, _events) = broadcast::channel::<engine::PumpEvent>(1);
-        state.insert_process(ProcEntry {
+        table.insert_process(ProcEntry {
             pid: 7,
             tag: Some("shell".into()),
             config: crate::process::wire::ProcessConfig::default(),
@@ -1516,7 +1536,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            stream_input_event(&state, &mut selected, data.clone())
+            stream_input_event(&table, &mut selected, data.clone())
                 .await
                 .unwrap_err()
                 .code,
@@ -1526,27 +1546,27 @@ mod tests {
             "start": {"process": {"tag": "shell"}}
         }))
         .unwrap();
-        stream_input_event(&state, &mut selected, start)
+        stream_input_event(&table, &mut selected, start)
             .await
             .unwrap();
         assert!(selected.is_some());
-        assert!(stream_input_event(&state, &mut selected, data)
+        assert!(stream_input_event(&table, &mut selected, data)
             .await
             .unwrap_err()
             .message
             .contains("stdin not enabled or closed"));
         let keepalive: StreamInputRequest =
             serde_json::from_value(serde_json::json!({"keepalive": {}})).unwrap();
-        stream_input_event(&state, &mut selected, keepalive)
+        stream_input_event(&table, &mut selected, keepalive)
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn input_oneof_validation_reports_unimplemented() {
-        let state = AppState::new();
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         let (sender, _events) = broadcast::channel::<engine::PumpEvent>(1);
-        let pid = state.insert_process(ProcEntry {
+        let pid = table.insert_process(ProcEntry {
             pid: 8,
             tag: None,
             config: crate::process::wire::ProcessConfig::default(),
@@ -1565,18 +1585,18 @@ mod tests {
             },
             input: ProcessInput::default(),
         };
-        let error = send_input(&state, &send).await.unwrap_err();
+        let error = send_input(&table, &send).await.unwrap_err();
         assert_eq!(error.code, ConnectCode::Unimplemented);
         assert_eq!(error.message, "invalid input type <nil>");
 
         let mut selected = None;
         let malformed = StreamInputRequest::default();
-        let error = stream_input_event(&state, &mut selected, malformed)
+        let error = stream_input_event(&table, &mut selected, malformed)
             .await
             .unwrap_err();
         assert_eq!(error.code, ConnectCode::Unimplemented);
         assert_eq!(error.message, "invalid event type <nil>");
-        state.remove_process(pid);
+        table.remove_process(pid);
     }
 
     #[tokio::test]

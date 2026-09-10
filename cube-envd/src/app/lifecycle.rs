@@ -15,7 +15,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
-use crate::app::state::{constant_time_eq, AppState};
+use crate::app::state::AppState;
+use crate::platform::config::{constant_time_eq, Config};
 
 /// `/init` token rejection messages, byte-for-byte the upstream errors
 /// (`internal/api/init.go`: ErrAccessTokenMismatch /
@@ -123,12 +124,12 @@ pub async fn init(
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
     };
-    if !state.claim_timestamp(timestamp_nanos) {
+    if !state.config.claim_timestamp(timestamp_nanos) {
         tracing::info!("init: dropping request older than the last applied timestamp");
         return no_store(StatusCode::NO_CONTENT).into_response();
     }
     let action = {
-        let stored = state.access_token();
+        let stored = state.config.access_token();
         init_token_action(stored.as_deref(), req.access_token.as_deref())
     };
     match action {
@@ -139,20 +140,23 @@ pub async fn init(
         Ok(InitTokenAction::Set) => {
             if let Some(token) = req.access_token.as_deref() {
                 tracing::info!("init: access token configured");
-                state.set_access_token(token.to_string());
+                state.config.set_access_token(token.to_string());
             }
         }
         Ok(InitTokenAction::Keep) => {}
     }
     if let Some(vars) = req.env_vars {
         tracing::info!("init: merging {} env vars", vars.len());
-        state.merge_env_vars(vars);
+        state.config.merge_env_vars(vars);
     } else {
         state
+            .config
             .initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    state.apply_init_defaults(req.default_user.as_deref(), req.default_workdir.as_deref());
+    state
+        .config
+        .apply_init_defaults(req.default_user.as_deref(), req.default_workdir.as_deref());
     for (field, present) in [
         ("volumeMounts", req.volume_mounts.is_some()),
         ("hyperloopIP", req.hyperloop_ip.is_some()),
@@ -222,12 +226,12 @@ pub(crate) fn parse_rfc3339_nanos(raw: &str) -> Option<i64> {
 
 /// GET /envs — the accumulated env-var store (includes E2B_SANDBOX).
 pub async fn envs(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    if check_token(&state, &headers).is_err() {
+    if check_token(&state.config, &headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        axum::Json(state.env_vars()),
+        axum::Json(state.config.env_vars()),
     )
         .into_response()
 }
@@ -237,9 +241,9 @@ pub(crate) fn no_store(status: StatusCode) -> impl IntoResponse {
     (status, [(axum::http::header::CACHE_CONTROL, "no-store")])
 }
 
-pub(crate) fn check_token(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
+pub(crate) fn check_token(config: &Config, headers: &HeaderMap) -> Result<(), ()> {
     let token = headers.get("x-access-token").and_then(|v| v.to_str().ok());
-    state.check_access_token(token)
+    config.check_access_token(token)
 }
 
 #[cfg(test)]

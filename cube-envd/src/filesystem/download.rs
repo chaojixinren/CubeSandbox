@@ -4,15 +4,13 @@
 //! GET `/files`: download, Range and conditional request handling.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user};
-use crate::app::state::AppState;
 use crate::filesystem::http::{content_disposition, encoding, httpdate, preconditions, ranges};
+use crate::platform::config::Config;
 use crate::platform::identity;
 use crate::protocol::RestError;
 
@@ -24,12 +22,12 @@ use crate::protocol::RestError;
 /// below are extracted as helpers so each mirrors one upstream step; the
 /// order of the calls *is* the pipeline order.
 pub async fn download(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
+    config: &Config,
+    params: HashMap<String, String>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     // Stage 1: token → user → path → stat/isdir (error order unchanged).
-    let ResolvedFile { path, meta } = match resolve_download(&state, &params, &headers).await {
+    let ResolvedFile { path, meta } = match resolve_download(config, &params, &headers).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -153,14 +151,14 @@ pub(crate) struct ResolvedFile {
 /// error exit keeps its baseline status and message.
 #[allow(clippy::result_large_err)] // axum helpers propagate prebuilt responses, not an error type
 async fn resolve_download(
-    state: &Arc<AppState>,
+    config: &Config,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Result<ResolvedFile, axum::response::Response> {
-    if let Err(e) = check_token_rest(state, headers) {
+    if let Err(e) = check_token_rest(config, headers) {
         return Err(e.into_response());
     }
-    let user = match resolve_request_user(state, params, headers) {
+    let user = match resolve_request_user(config, params, headers) {
         Ok(u) => u,
         Err(e) => return Err(e.into_response()),
     };
@@ -173,7 +171,7 @@ async fn resolve_download(
         .get("path")
         .filter(|p| !p.is_empty())
         .cloned()
-        .or_else(|| state.default_workdir())
+        .or_else(|| config.default_workdir())
         .unwrap_or_else(|| user.home.clone());
     let path = identity::resolve_path(&raw_path, &user);
 

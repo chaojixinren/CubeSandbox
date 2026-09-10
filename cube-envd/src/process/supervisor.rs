@@ -8,16 +8,16 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::metadata;
-use crate::app::state::AppState;
 use crate::process::cgroup;
 use crate::process::engine;
+use crate::process::table::ProcessTable;
 
 pub(crate) const PROCESS_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn supervise_process(
-    state: Arc<AppState>,
-    handle: crate::app::state::ProcHandle,
+    table: Arc<ProcessTable>,
+    handle: crate::process::table::ProcHandle,
     pid: u32,
     sender: broadcast::Sender<engine::PumpEvent>,
     mut completion: tokio::sync::oneshot::Receiver<()>,
@@ -42,11 +42,11 @@ pub(crate) async fn supervise_process(
                     let error = engine::PumpEvent::SpawnError(
                         "process monitor stopped before reporting exit".into(),
                     );
-                    state.mark_terminal(handle, error.clone());
-                    state.remove_process(handle);
+                    table.mark_terminal(handle, error.clone());
+                    table.remove_process(handle);
                     let _ = sender.send(error);
                 } else {
-                    state.remove_process(handle);
+                    table.remove_process(handle);
                 }
                 if monitor_ok {
                     kill_descendants_and_cleanup(pid, cgroup).await;
@@ -57,7 +57,7 @@ pub(crate) async fn supervise_process(
             _ = tokio::time::sleep(deadline) => {
                 // Remove first so a concurrent Connect/Input/Update cannot
                 // attach to a command whose deadline has already expired.
-                state.remove_process(handle);
+                table.remove_process(handle);
                 // Publish the deadline marker before signalling the child.
                 // cgroup.kill can make the pump race to publish End on another
                 // runtime worker; ordering this event first guarantees every
@@ -96,11 +96,11 @@ pub(crate) async fn supervise_process(
             let error = engine::PumpEvent::SpawnError(
                 "process monitor stopped before reporting exit".into(),
             );
-            state.mark_terminal(handle, error.clone());
-            state.remove_process(handle);
+            table.mark_terminal(handle, error.clone());
+            table.remove_process(handle);
             let _ = sender.send(error);
         } else {
-            state.remove_process(handle);
+            table.remove_process(handle);
         }
         if monitor_ok {
             kill_descendants_and_cleanup(pid, cgroup).await;

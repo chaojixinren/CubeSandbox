@@ -12,14 +12,14 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 
 use crate::app::handlers::{
-    fs_create_watcher, fs_get_watcher_events, fs_list_dir, fs_make_dir, fs_move, fs_remove,
-    fs_remove_watcher, fs_stat, fs_watch_dir, process_close_stdin, process_connect, process_list,
-    process_send_input, process_send_signal, process_start, process_stream_input, process_update,
+    files_download, files_upload, fs_create_watcher, fs_get_watcher_events, fs_list_dir,
+    fs_make_dir, fs_move, fs_remove, fs_remove_watcher, fs_stat, fs_watch_dir, process_close_stdin,
+    process_connect, process_list, process_send_input, process_send_signal, process_start,
+    process_stream_input, process_update,
 };
 use crate::app::middleware::cors;
 use crate::app::state::AppState;
 use crate::app::{lifecycle, metrics};
-use crate::filesystem as fs_svc;
 use crate::filesystem::watch as watch_svc;
 use crate::protocol::{ConnectCode, ConnectError};
 
@@ -35,7 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/init", post(lifecycle::init))
         .route("/envs", get(lifecycle::envs))
         .route("/metrics", get(metrics::metrics))
-        .route("/files", get(fs_svc::download).post(fs_svc::upload))
+        .route("/files", get(files_download).post(files_upload))
         .route("/files/compose", post(compose_unimplemented))
         // process.Process
         .route("/process.Process/Start", post(process_start))

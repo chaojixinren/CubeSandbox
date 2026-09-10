@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use crate::app::state::AppState;
 
 pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    if crate::app::lifecycle::check_token(&state, &headers).is_err() {
+    if crate::app::lifecycle::check_token(&state.config, &headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     // One blocking-pool crossing for the whole sample (proc reads + the

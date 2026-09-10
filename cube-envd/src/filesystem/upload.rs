@@ -5,28 +5,26 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 
-use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user, MAX_UPLOAD_SIZE};
-use crate::app::state::AppState;
+use crate::platform::config::Config;
 use crate::platform::identity::{self, User};
 use crate::protocol::RestError;
 
 /// POST /files — multipart or raw octet-stream upload.
 pub async fn upload(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
+    config: &Config,
+    params: HashMap<String, String>,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = check_token_rest(&state, &headers) {
+    if let Err(e) = check_token_rest(config, &headers) {
         return e.into_response();
     }
-    let user = match resolve_request_user(&state, &params, &headers) {
+    let user = match resolve_request_user(config, &params, &headers) {
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
