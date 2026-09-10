@@ -20,10 +20,16 @@ const DEFAULT_PORT: u16 = 49983;
 /// recognized — so a trailing bare value is never mistaken for a positional
 /// argument — then warned about and ignored.
 ///
-/// -cgroup-root is a deliberate non-feature: upstream's
-/// root override only matters when the daemon runs nested under another
-/// cgroup root; add it if a nested conformance comparison ever needs it.
-/// TODO: implement -cmd (command to run on daemon start).
+/// -cgroup-root is a deliberate non-feature: upstream's root override only
+/// matters when the daemon runs nested under another cgroup root, and there is
+/// no such consumer today. Add it if a nested conformance comparison ever needs
+/// it; `Cgroup2Manager::new` already takes the root it would pass.
+///
+/// -cmd is upstream's "run this command at daemon start" hook for template
+/// builds (`main.go:206-226`, `InitializeStartProcess`). Upstream itself marks
+/// it `TODO: Not used anymore in template build`, and the CubeSandbox template
+/// path never passes it. It stays unimplemented; see the "known gaps" section
+/// of the tree-refactor PR description for where that is recorded.
 const UNIMPLEMENTED: &[&str] = &["cmd", "cgroup-root"];
 
 pub(crate) struct Cli {
