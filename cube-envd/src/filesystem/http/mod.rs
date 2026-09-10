@@ -6,4 +6,9 @@
 //! `rest/{preconditions,ranges,encoding,httpdate,content_disposition}.rs`;
 //! their semantics track upstream `http.ServeContent` and `net/http`, and this
 //! file only aggregates them. Pure functions: no I/O, no state.
-//! （PR-1 骨架：实现待 PR-2 搬运迁入）
+
+pub mod content_disposition;
+pub mod encoding;
+pub mod httpdate;
+pub mod preconditions;
+pub mod ranges;

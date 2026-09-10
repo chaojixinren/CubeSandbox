@@ -122,7 +122,7 @@ pub struct StartEvent {}
 /// ⚠️ The declaration order here is the proto numbering (CREATE=1, WRITE=2,
 /// REMOVE=3, RENAME=4, CHMOD=5) and is NOT the emission order. Upstream
 /// expands one kernel event in the fixed order Create → Rename → Chmod →
-/// Write → Remove (`watch.go:105-123`); see `services/watch.rs`.
+/// Write → Remove (`watch.go:105-123`); see `filesystem/watch/tree.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EventType {
     #[serde(rename = "EVENT_TYPE_CREATE")]

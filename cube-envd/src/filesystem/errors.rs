@@ -44,6 +44,6 @@ pub(crate) fn resolve_request_user(
 }
 
 pub(crate) fn check_token_rest(state: &AppState, headers: &HeaderMap) -> Result<(), RestError> {
-    super::super::check_token(state, headers)
+    crate::rest::check_token(state, headers)
         .map_err(|_| RestError::new(StatusCode::UNAUTHORIZED, "invalid access token".to_string()))
 }

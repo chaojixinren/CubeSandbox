@@ -17,7 +17,7 @@
 //! - MakeDir levels:  500 internal   "failed to create directory: mkdir <p>: <errno>" / "path is a file: <p>" (path.go:77-94)
 //! - Move missing:    404 not_found  "source file not found: rename <s> <d>: no such file or directory"
 //! - Move other:      500 internal   "error renaming: rename <s> <d>: <errno>"       (move.go:47)
-//! - Watch family:    implemented in `services/watch.rs` (streaming + pull watchers)
+//! - Watch family:    implemented in `filesystem/watch/` (streaming + pull watchers)
 
 use crate::compat::vocab::{go_link_error, go_path_error};
 use crate::filesystem::wire::{
@@ -27,8 +27,22 @@ use crate::platform::identity::User;
 use crate::protocol::{ConnectCode, ConnectError};
 use std::os::unix::fs::DirBuilderExt;
 
+#[cfg(test)]
+mod data_plane_tests;
+pub mod download;
+pub mod errors;
+pub mod http;
+pub mod upload;
 pub mod watch;
 pub mod wire;
+
+pub use download::download;
+pub use upload::upload;
+
+#[cfg(test)]
+pub(crate) use download::modtime_of;
+#[cfg(test)]
+pub(crate) use upload::{entry_for, parse_boundary, spawn_upload_writer};
 
 pub fn stat(req: &PathRequest, user: &User) -> Result<serde_json::Value, ConnectError> {
     let path = crate::platform::identity::resolve_path(&req.path, user);

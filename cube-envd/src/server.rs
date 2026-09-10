@@ -32,7 +32,7 @@ pub(crate) const MAX_UNARY_BODY: usize = 4 * 1024 * 1024;
 pub fn router(state: Arc<AppState>) -> Router {
     // Pull-watcher registry: constructed here and shared via Extension,
     // mirroring upstream's `Service.watchers` (`service.go:15-19`). It lives
-    // with its only users in `services/watch.rs` instead of `AppState`, so
+    // with its only users in `filesystem/watch/mod.rs` instead of `AppState`, so
     // the shared state layer carries no watch-specific entries.
     let watchers = Arc::new(watch_svc::WatchRegistry::new());
     Router::new()
@@ -41,10 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/init", post(rest::init))
         .route("/envs", get(rest::envs))
         .route("/metrics", get(rest::metrics::metrics))
-        .route(
-            "/files",
-            get(rest::files::download).post(rest::files::upload),
-        )
+        .route("/files", get(fs_svc::download).post(fs_svc::upload))
         .route("/files/compose", post(compose_unimplemented))
         // process.Process
         .route("/process.Process/Start", post(process_start))
