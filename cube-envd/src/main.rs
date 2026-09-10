@@ -14,14 +14,13 @@
 mod blocking;
 mod compat;
 mod cors;
+mod filesystem;
 mod legacy;
-mod msg;
 mod platform;
 mod process;
 mod protocol;
 mod rest;
 mod server;
-mod services;
 mod state;
 
 use std::sync::Arc;
