@@ -8,7 +8,7 @@
 //! rather than the filesystem watch's 90s (the LB in front of CubeProxy has an
 //! unknown idle timeout, so 30s stays under any LB ≥ 30s).
 //!
-//! 来源：承接 connect.rs 的 keepalive 部分（原样迁入）。
+//! Source: `connect.rs` (keepalive half).
 
 /// Default keepalive ping cadence for a quiet Start stream. cube-envd keeps
 /// 30s rather than upstream's 90s: the LB in front of CubeProxy has an unknown

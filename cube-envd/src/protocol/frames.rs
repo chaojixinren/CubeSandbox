@@ -10,7 +10,7 @@
 //! (`application/proto`, `application/connect+proto`) are rejected with
 //! `unimplemented` — a declared MVP difference.
 //!
-//! 来源：承接 connect.rs 的帧编解码部分（原样迁入 + 按职责拆分）。
+//! Source: `connect.rs` (framing half; split out by responsibility).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -20,6 +20,14 @@ pub const END_STREAM_FLAG: u8 = 0x02;
 pub const COMPRESSED_FLAG: u8 = 0x01;
 /// Same cap the SDKs enforce on their side.
 pub const MAX_ENVELOPE_SIZE: usize = 64 * 1024 * 1024;
+/// Cap on a unary (non-streaming) request body. The streaming counterpart of
+/// [`MAX_ENVELOPE_SIZE`]; both exist so a malformed or hostile client cannot
+/// make the daemon buffer without bound.
+///
+/// It lives here rather than next to either reader so the two `app` modules
+/// that enforce it (`handlers` unary RPCs, `lifecycle` `/init`) share it
+/// without depending on each other.
+pub const MAX_UNARY_BODY: usize = 4 * 1024 * 1024;
 pub const STREAM_CONTENT_TYPE: &str = "application/connect+json";
 
 /// Encode one Connect streaming envelope.

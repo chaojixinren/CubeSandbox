@@ -91,7 +91,7 @@ pub async fn init(
     // relying on axum's default 2 MiB extractor limit: an /init carrying a
     // large caBundle (accepted-and-ignored fields) must not bounce with a
     // framework-shaped 413.
-    let body = match axum::body::to_bytes(body, crate::app::handlers::MAX_UNARY_BODY).await {
+    let body = match axum::body::to_bytes(body, crate::protocol::MAX_UNARY_BODY).await {
         Ok(b) => b,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response();

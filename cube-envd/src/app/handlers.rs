@@ -22,8 +22,6 @@ use crate::process as proc_svc;
 use crate::protocol;
 use crate::protocol::{ConnectCode, ConnectError};
 
-pub(crate) const MAX_UNARY_BODY: usize = 4 * 1024 * 1024;
-
 // ---------- shared helpers ----------
 
 /// RPC-surface user resolution: Basic auth, falling back to the default user
@@ -63,7 +61,7 @@ pub(crate) async fn read_unary_request<T: serde::de::DeserializeOwned>(
     body: axum::body::Body,
 ) -> Result<T, ConnectError> {
     protocol::check_json_codec(headers)?;
-    let bytes = axum::body::to_bytes(body, MAX_UNARY_BODY)
+    let bytes = axum::body::to_bytes(body, protocol::MAX_UNARY_BODY)
         .await
         .map_err(|e| ConnectError::new(ConnectCode::InvalidArgument, format!("read body: {e}")))?;
     // Unary requests normally arrive as bare JSON; a few hand-rolled clients

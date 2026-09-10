@@ -3,7 +3,7 @@
 
 //! `Connect-Timeout-Ms` request-header parsing.
 //!
-//! 来源：承接 connect.rs 的 timeout 部分（原样迁入）。
+//! Source: `connect.rs` (timeout half).
 
 /// Parse the `Connect-Timeout-Ms` request header.
 pub fn timeout_from_headers(headers: &axum::http::HeaderMap) -> Option<std::time::Duration> {
