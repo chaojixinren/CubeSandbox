@@ -8,16 +8,16 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::metadata;
+use crate::app::state::AppState;
 use crate::process::cgroup;
 use crate::process::engine;
-use crate::state::AppState;
 
 pub(crate) const PROCESS_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn supervise_process(
     state: Arc<AppState>,
-    handle: crate::state::ProcHandle,
+    handle: crate::app::state::ProcHandle,
     pid: u32,
     sender: broadcast::Sender<engine::PumpEvent>,
     mut completion: tokio::sync::oneshot::Receiver<()>,

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, oneshot, Notify};
 
+use crate::app::state::AppState;
 use crate::platform::identity::User;
-use crate::state::AppState;
 
 use super::cleanup::kill_process_group;
 use super::io::{

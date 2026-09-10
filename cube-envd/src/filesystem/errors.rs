@@ -7,9 +7,9 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderMap, StatusCode};
 
+use crate::app::state::AppState;
 use crate::platform::identity::{self, User};
 use crate::protocol::RestError;
-use crate::state::AppState;
 
 /// Upload size cap for both upload paths (raw octet-stream and multipart).
 ///
@@ -44,6 +44,6 @@ pub(crate) fn resolve_request_user(
 }
 
 pub(crate) fn check_token_rest(state: &AppState, headers: &HeaderMap) -> Result<(), RestError> {
-    crate::rest::check_token(state, headers)
+    crate::app::lifecycle::check_token(state, headers)
         .map_err(|_| RestError::new(StatusCode::UNAUTHORIZED, "invalid access token".to_string()))
 }

@@ -183,7 +183,7 @@ async fn multipart_read_error_awaits_writer_and_propagates() {
         "multipart/form-data; boundary=X".parse().unwrap(),
     );
     let response = super::upload(
-        axum::extract::State(std::sync::Arc::new(crate::state::AppState::new())),
+        axum::extract::State(std::sync::Arc::new(crate::app::state::AppState::new())),
         axum::extract::Query(std::collections::HashMap::new()),
         headers,
         axum::body::Body::from_stream(stream),
@@ -226,7 +226,7 @@ fn upload_entry_shape() {
 #[cfg(test)]
 mod download_tests {
     use super::*;
-    use crate::state::AppState;
+    use crate::app::state::AppState;
     use axum::body::to_bytes;
     use axum::extract::{Query, State};
     use axum::http::header;

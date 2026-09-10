@@ -11,10 +11,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user};
+use crate::app::state::AppState;
 use crate::filesystem::http::{content_disposition, encoding, httpdate, preconditions, ranges};
 use crate::platform::identity;
 use crate::protocol::RestError;
-use crate::state::AppState;
 
 /// GET /files — stream a file back with upstream `http.ServeContent`
 /// semantics: Last-Modified, conditional requests (If-Match / If-Unmodified-

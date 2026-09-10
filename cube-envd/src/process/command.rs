@@ -17,6 +17,7 @@ use super::metadata;
 use super::pump::drive_stream;
 use super::supervisor::{kill_process_tree, supervise_process};
 use super::{frame_stream_response, stream_error_response};
+use crate::app::state::{AppState, ProcEntry, PtyResizeError};
 use crate::platform::identity::User;
 use crate::process::cgroup::{self, ProcType};
 use crate::process::engine;
@@ -29,7 +30,6 @@ use crate::protocol::stream::response_channel;
 #[cfg(test)]
 use crate::protocol::stream::RESPONSE_QUEUE_CAPACITY;
 use crate::protocol::{ConnectCode, ConnectError};
-use crate::state::{AppState, ProcEntry, PtyResizeError};
 
 const DEFAULT_OOM_SCORE: i32 = 100;
 const DEFAULT_NICE: i32 = 0;
@@ -642,7 +642,7 @@ mod tests {
         spawned: engine::SpawnedProcess,
     ) -> (
         u32,
-        crate::state::ProcHandle,
+        crate::app::state::ProcHandle,
         broadcast::Receiver<engine::PumpEvent>,
         tokio::sync::oneshot::Receiver<()>,
         broadcast::Sender<engine::PumpEvent>,
