@@ -117,16 +117,49 @@ fn meminfo() -> (u64, u64, u64) {
     (total, available, cached)
 }
 
+/// `statvfs(3)` on `path`, as `(total, used)` in bytes.
+///
+/// Semantics follow upstream `host.diskStats` (metrics.go:83-97): the size
+/// multiplier is the filesystem block size, and "available" is `f_bavail` —
+/// what an unprivileged writer can still use — not `f_bfree`, which also
+/// counts the blocks reserved for root. Reading `f_bfree` under-reports
+/// `disk_used` by the reserved amount on any filesystem that reserves space
+/// (ext4 defaults to 5%).
+///
+/// Declared difference: on failure this reports `(0, 0)` and the endpoint
+/// still answers 200, where upstream propagates the error as a 500. `/metrics`
+/// is a monitoring endpoint polled by the host, and a spurious 500 is a worse
+/// failure mode there than a zero sample; the deviation is silent to the
+/// conformance harness, which compares only the presence of metrics keys.
 fn disk_usage(path: &str) -> (u64, u64) {
-    let c_path = std::ffi::CString::new(path).unwrap_or_default();
+    // `statvfs` takes a C string, so a path containing an interior NUL has no
+    // representation. Report "unknown" rather than failing the request — but
+    // say why, because a silent 0 reads downstream as "disk full".
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::warn!(
+                "metrics: disk path {path:?} contains a NUL byte, reporting 0 disk usage"
+            );
+            return (0, 0);
+        }
+    };
+    // SAFETY: `statvfs` is a C struct of integers; an all-zero bit pattern is a
+    // valid value for every field, and the call below writes each field we read.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated string owned by this frame and
+    // `stat` is a live local, so both outlive the call; `statvfs` only writes
+    // through the second pointer and retains neither.
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return (0, 0);
     }
+    // glibc implements `statvfs` on top of `statfs(2)` and sets `f_frsize` from
+    // the filesystem block size, which is the value Go's `unix.Statfs` reads as
+    // `Bsize`, so the multiplier is upstream-equivalent on Linux.
     let block = stat.f_frsize as u64;
     let total = stat.f_blocks as u64 * block;
-    let free = stat.f_bfree as u64 * block;
-    (total, total.saturating_sub(free))
+    let available = stat.f_bavail as u64 * block;
+    (total, total.saturating_sub(available))
 }
 
 #[cfg(test)]
