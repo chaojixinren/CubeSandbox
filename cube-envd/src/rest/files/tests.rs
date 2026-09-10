@@ -118,7 +118,7 @@ async fn body_read_error_keeps_partial_content_and_propagates() {
     tx.send(Ok(bytes::Bytes::from_static(b"partial")))
         .await
         .unwrap();
-    tx.send(Err(crate::error::RestError::new(
+    tx.send(Err(crate::protocol::RestError::new(
         axum::http::StatusCode::BAD_REQUEST,
         "error reading body: boom",
     )))

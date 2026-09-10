@@ -20,11 +20,11 @@
 //! - Watch family:    not implemented by cube-envd (MVP scope, issue #1227)
 
 use crate::auth::User;
-use crate::error::{ConnectCode, ConnectError};
-use crate::go_compat::errno::{go_link_error, go_path_error};
+use crate::compat::vocab::{go_link_error, go_path_error};
 use crate::msg::filesystem::{
     entry_info, EntryInfo, EntryResponse, ListDirRequest, ListDirResponse, MoveRequest, PathRequest,
 };
+use crate::protocol::{ConnectCode, ConnectError};
 use std::os::unix::fs::DirBuilderExt;
 
 pub fn stat(req: &PathRequest, user: &User) -> Result<serde_json::Value, ConnectError> {

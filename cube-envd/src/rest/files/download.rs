@@ -12,7 +12,7 @@ use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user};
 use crate::auth;
-use crate::error::RestError;
+use crate::protocol::RestError;
 use crate::rest::{content_disposition, encoding, httpdate, preconditions, ranges};
 use crate::state::AppState;
 

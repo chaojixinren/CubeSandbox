@@ -19,18 +19,16 @@ use super::supervisor::{kill_process_tree, supervise_process};
 use super::{frame_stream_response, stream_error_response};
 use crate::auth::User;
 use crate::cgroup::{self, ProcType};
-#[cfg(test)]
-use crate::connect;
-use crate::connect::stream::response_channel;
-#[cfg(test)]
-use crate::connect::stream::RESPONSE_QUEUE_CAPACITY;
-use crate::error::{ConnectCode, ConnectError};
 use crate::exec;
 use crate::msg::process::{
     parse_signal, CloseStdinRequest, ConnectRequest, ListResponse, ProcessInfo, ProcessInput,
     ProcessSelector, SendInputRequest, SendSignalRequest, StartRequest, StreamInputRequest,
     UpdateRequest,
 };
+use crate::protocol::stream::response_channel;
+#[cfg(test)]
+use crate::protocol::stream::RESPONSE_QUEUE_CAPACITY;
+use crate::protocol::{ConnectCode, ConnectError};
 use crate::state::{AppState, ProcEntry, PtyResizeError};
 
 const DEFAULT_OOM_SCORE: i32 = 100;
@@ -614,7 +612,7 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), 4096)
                     .await
                     .unwrap();
-                assert_eq!(body[0], connect::END_STREAM_FLAG);
+                assert_eq!(body[0], crate::protocol::frames::END_STREAM_FLAG);
                 let payload: serde_json::Value = serde_json::from_slice(&body[5..]).unwrap();
                 assert_eq!(payload["error"]["code"], code);
                 assert!(!marker.exists());
@@ -1088,7 +1086,7 @@ mod tests {
         ));
         assert_eq!(rx.recv().await.unwrap()[0], 0);
         let terminal = rx.recv().await.expect("Connect timeout frame");
-        assert_eq!(terminal[0], connect::END_STREAM_FLAG);
+        assert_eq!(terminal[0], crate::protocol::frames::END_STREAM_FLAG);
         let payload: serde_json::Value = serde_json::from_slice(&terminal[5..]).unwrap();
         assert_eq!(payload["error"]["code"], "deadline_exceeded");
         assert!(state.find_pid(Some(pid), None).is_some());
@@ -1158,7 +1156,7 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap()[0], 0);
         drop(pub_tx);
         let terminal = rx.recv().await.expect("unexpected closed-bus frame");
-        assert_eq!(terminal[0], connect::END_STREAM_FLAG);
+        assert_eq!(terminal[0], crate::protocol::frames::END_STREAM_FLAG);
         let payload: serde_json::Value = serde_json::from_slice(&terminal[5..]).unwrap();
         assert_eq!(payload["error"]["code"], "internal");
         assert!(rx.recv().await.is_none());
@@ -1260,7 +1258,7 @@ mod tests {
         assert_eq!(end["event"]["end"]["signal"], libc::SIGKILL);
         assert_eq!(end["event"]["end"]["killedBy"], "timeout");
         let trailer = &terminal[5 + size..];
-        assert_eq!(trailer[0], connect::END_STREAM_FLAG);
+        assert_eq!(trailer[0], crate::protocol::frames::END_STREAM_FLAG);
         let payload: serde_json::Value = serde_json::from_slice(&trailer[5..]).unwrap();
         assert_eq!(payload["error"]["code"], "deadline_exceeded");
         assert!(state.find_pid(Some(pid), None).is_none());
@@ -1320,7 +1318,10 @@ mod tests {
             serde_json::from_slice(&terminal[5..5 + payload_size]).unwrap();
         assert_eq!(payload["event"]["end"]["status"], "exit status 0");
         let trailer_offset = 5 + payload_size;
-        assert_eq!(terminal[trailer_offset], connect::END_STREAM_FLAG);
+        assert_eq!(
+            terminal[trailer_offset],
+            crate::protocol::frames::END_STREAM_FLAG
+        );
         assert!(
             rx.recv().await.is_none(),
             "response remained open after EndStream"
@@ -1393,7 +1394,7 @@ mod tests {
             remaining = &remaining[5 + length..];
         }
         let (flags, payload) = last.expect("missing terminal envelope");
-        assert_eq!(flags, connect::END_STREAM_FLAG);
+        assert_eq!(flags, crate::protocol::frames::END_STREAM_FLAG);
         assert!(matches!(
             payload["error"]["code"].as_str(),
             Some("resource_exhausted" | "deadline_exceeded")
@@ -1436,7 +1437,7 @@ mod tests {
 
         assert!(rx.recv().await.is_some(), "Start frame missing");
         let terminal = rx.recv().await.expect("backpressure error missing");
-        assert_eq!(terminal[0], connect::END_STREAM_FLAG);
+        assert_eq!(terminal[0], crate::protocol::frames::END_STREAM_FLAG);
         let payload: serde_json::Value = serde_json::from_slice(&terminal[5..]).unwrap();
         assert_eq!(payload["error"]["code"], "resource_exhausted");
         assert!(
@@ -1486,7 +1487,10 @@ mod tests {
             u32::from_be_bytes([terminal[1], terminal[2], terminal[3], terminal[4]]) as usize;
         let trailer_offset = 5 + event_size;
         assert_eq!(terminal[0], 0);
-        assert_eq!(terminal[trailer_offset], connect::END_STREAM_FLAG);
+        assert_eq!(
+            terminal[trailer_offset],
+            crate::protocol::frames::END_STREAM_FLAG
+        );
         assert_eq!(&terminal[trailer_offset + 5..], b"{}");
         assert!(rx.recv().await.is_none());
     }
@@ -1607,7 +1611,7 @@ mod tests {
         assert_eq!(frames.len(), 2);
         let start: serde_json::Value = serde_json::from_slice(&frames[0][5..]).unwrap();
         assert_eq!(start["event"]["start"]["pid"], 42);
-        assert_eq!(frames[1][0], connect::END_STREAM_FLAG);
+        assert_eq!(frames[1][0], crate::protocol::frames::END_STREAM_FLAG);
         let err: serde_json::Value = serde_json::from_slice(&frames[1][5..]).unwrap();
         assert_eq!(err["error"]["code"], "resource_exhausted");
     }

@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 
 use super::errors::{check_token_rest, resolve_request_user, MAX_UPLOAD_SIZE};
 use crate::auth::{self, User};
-use crate::error::RestError;
+use crate::protocol::RestError;
 use crate::state::AppState;
 
 /// POST /files — multipart or raw octet-stream upload.

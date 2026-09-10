@@ -17,10 +17,10 @@ use axum::{Extension, Router};
 use futures::StreamExt;
 
 use crate::auth::{self, User};
-use crate::connect;
 use crate::cors;
-use crate::error::{ConnectCode, ConnectError};
 use crate::legacy;
+use crate::protocol;
+use crate::protocol::{ConnectCode, ConnectError};
 use crate::rest;
 use crate::services::watch as watch_svc;
 use crate::services::{filesystem as fs_svc, process as proc_svc};
@@ -144,7 +144,7 @@ async fn read_unary_request<T: serde::de::DeserializeOwned>(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<T, ConnectError> {
-    connect::check_json_codec(headers)?;
+    protocol::check_json_codec(headers)?;
     let bytes = axum::body::to_bytes(body, MAX_UNARY_BODY)
         .await
         .map_err(|e| ConnectError::new(ConnectCode::InvalidArgument, format!("read body: {e}")))?;
@@ -179,13 +179,13 @@ async fn process_start(
     body: axum::body::Body,
 ) -> axum::response::Response {
     // Streaming surface: every failure is an EndStream error frame on 200.
-    if let Err(e) = connect::check_json_codec(&headers) {
+    if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
     if let Err(e) = rpc_token_check(&state, &headers) {
         return proc_svc::stream_error_response(e);
     }
-    let bytes = match axum::body::to_bytes(body, connect::MAX_ENVELOPE_SIZE + 5).await {
+    let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
         Ok(b) => b,
         Err(e) => {
             return proc_svc::stream_error_response(ConnectError::new(
@@ -194,7 +194,7 @@ async fn process_start(
             ))
         }
     };
-    let payload = match connect::decode_single_envelope(&bytes) {
+    let payload = match protocol::decode_single_envelope(&bytes) {
         Ok(p) => p,
         Err(e) => return proc_svc::stream_error_response(e),
     };
@@ -211,8 +211,8 @@ async fn process_start(
         Ok(u) => u,
         Err(e) => return proc_svc::stream_error_response(e),
     };
-    let deadline = connect::timeout_from_headers(&headers);
-    let keepalive = connect::keepalive_interval_from_headers(&headers);
+    let deadline = protocol::timeout_from_headers(&headers);
+    let keepalive = protocol::keepalive_interval_from_headers(&headers);
     tracing::info!(
         "Start: cmd={:?} args={:?} user={} tag={:?} timeout={:?} keepalive={:?}",
         req.process.cmd,
@@ -231,13 +231,13 @@ async fn process_connect(
     body: axum::body::Body,
 ) -> axum::response::Response {
     // Streaming surface: every failure is an EndStream error frame on 200.
-    if let Err(e) = connect::check_json_codec(&headers) {
+    if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
     if let Err(e) = rpc_token_check(&state, &headers) {
         return proc_svc::stream_error_response(e);
     }
-    let bytes = match axum::body::to_bytes(body, connect::MAX_ENVELOPE_SIZE + 5).await {
+    let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
         Ok(b) => b,
         Err(e) => {
             return proc_svc::stream_error_response(ConnectError::new(
@@ -246,7 +246,7 @@ async fn process_connect(
             ))
         }
     };
-    let payload = match connect::decode_single_envelope(&bytes) {
+    let payload = match protocol::decode_single_envelope(&bytes) {
         Ok(p) => p,
         Err(e) => return proc_svc::stream_error_response(e),
     };
@@ -259,7 +259,7 @@ async fn process_connect(
             ))
         }
     };
-    let keepalive = connect::keepalive_interval_from_headers(&headers);
+    let keepalive = protocol::keepalive_interval_from_headers(&headers);
     // Connect is an attachment, not a command owner. The Start request owns
     // the process deadline; applying Connect-Timeout-Ms here would terminate
     // long-lived PTY attachments after an absolute wall-clock interval.
@@ -338,7 +338,7 @@ async fn process_stream_input(
 ) -> axum::response::Response {
     // StreamInput is a streaming surface in both directions: request parsing
     // and service failures are returned as an EndStream error on HTTP 200.
-    if let Err(e) = connect::check_json_codec(&headers) {
+    if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
     if let Err(e) = rpc_token_check(&state, &headers) {
@@ -346,7 +346,7 @@ async fn process_stream_input(
     }
 
     let mut chunks = body.into_data_stream();
-    let mut decoder = connect::EnvelopeDecoder::default();
+    let mut decoder = protocol::EnvelopeDecoder::default();
     let mut selected = None;
     while let Some(chunk) = chunks.next().await {
         let chunk = match chunk {
@@ -574,7 +574,7 @@ watch_unary!(
 // ---------- unimplemented surfaces ----------
 
 async fn compose_unimplemented() -> axum::response::Response {
-    crate::error::RestError::new(
+    crate::protocol::RestError::new(
         axum::http::StatusCode::NOT_IMPLEMENTED,
         "/files/compose is not implemented by cube-envd (see CubeSandbox issue #1227 for the MVP scope)",
     )

@@ -14,13 +14,12 @@
 mod auth;
 mod blocking;
 mod cgroup;
-mod connect;
+mod compat;
 mod cors;
-mod error;
 mod exec;
-mod go_compat;
 mod legacy;
 mod msg;
+mod protocol;
 mod rest;
 mod server;
 mod services;

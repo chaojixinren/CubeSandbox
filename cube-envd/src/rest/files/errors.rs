@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use axum::http::{HeaderMap, StatusCode};
 
 use crate::auth::{self, User};
-use crate::error::RestError;
+use crate::protocol::RestError;
 use crate::state::AppState;
 
 /// Upload size cap for both upload paths (raw octet-stream and multipart).
@@ -20,7 +20,7 @@ use crate::state::AppState;
 /// while still bounding memory: unlike upstream, the body is buffered
 /// before the atomic temp-file write, so the cap is also the memory
 /// ceiling. (Streaming to disk would remove that trade-off — future work.)
-/// Deliberately NOT `connect::MAX_ENVELOPE_SIZE` (64 MiB): that constant
+/// Deliberately NOT `protocol::MAX_ENVELOPE_SIZE` (64 MiB): that constant
 /// bounds Connect envelopes, not file uploads.
 pub(crate) const MAX_UPLOAD_SIZE: usize = 256 * 1024 * 1024;
 

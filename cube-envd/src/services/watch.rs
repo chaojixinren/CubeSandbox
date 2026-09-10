@@ -24,7 +24,7 @@
 //!   GetWatcherEvents (the same channel upstream uses for watcher errors)
 //!   instead of silently dropping or silently growing.
 //! - the keepalive cadence defaults to the process-stream value (30s, see
-//!   `connect::DEFAULT_KEEPALIVE_INTERVAL`) rather than the filesystem
+//!   `protocol::DEFAULT_KEEPALIVE_INTERVAL`) rather than the filesystem
 //!   watch's 90s (`permissions/keepalive.go:10`) — same LB-idle-timeout
 //!   rationale already recorded for the Start stream. The
 //!   `Keepalive-Ping-Interval` header overrides it identically.
@@ -47,14 +47,14 @@ use tokio::io::unix::AsyncFd;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::{resolve_path, User};
-use crate::connect;
-use crate::error::{ConnectCode, ConnectError};
-use crate::go_compat::errno::{errno_text, go_path_error};
+use crate::compat::vocab::{errno_text, go_path_error};
 use crate::msg::filesystem::{
     CreateWatcherRequest, CreateWatcherResponse, EventType, FilesystemEvent,
     GetWatcherEventsRequest, GetWatcherEventsResponse, RemoveWatcherRequest, RemoveWatcherResponse,
     StartEvent, WatchDirRequest, WatchDirResponse,
 };
+use crate::protocol;
+use crate::protocol::{ConnectCode, ConnectError};
 
 /// The exact mask fsnotify requests for its default op set
 /// Create|Write|Remove|Rename|Chmod (`fsnotify.go:424-426` expanding through
@@ -641,8 +641,8 @@ fn drain_events(ino: &Inotify, st: &mut WatchState) -> Result<Vec<FilesystemEven
 
 fn frame_of(resp: &WatchDirResponse) -> bytes::Bytes {
     match serde_json::to_value(resp) {
-        Ok(v) => connect::message_frame(&v),
-        Err(e) => connect::end_stream_error(&ConnectError::new(
+        Ok(v) => protocol::message_frame(&v),
+        Err(e) => protocol::end_stream_error(&ConnectError::new(
             ConnectCode::Internal,
             format!("serialize response: {e}"),
         )),
@@ -650,7 +650,7 @@ fn frame_of(resp: &WatchDirResponse) -> bytes::Bytes {
 }
 
 fn fail_stream(tx: &tokio::sync::mpsc::Sender<bytes::Bytes>, e: &ConnectError) {
-    let _ = tx.try_send(connect::end_stream_error(e));
+    let _ = tx.try_send(protocol::end_stream_error(e));
 }
 
 fn internal(msg: impl Into<String>) -> ConnectError {
@@ -962,8 +962,8 @@ pub fn watch_dir(
         Err(e) => return crate::services::process::stream_error_response(e),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
-    let keepalive = connect::keepalive_interval_from_headers(headers);
-    let deadline = connect::timeout_from_headers(headers);
+    let keepalive = protocol::keepalive_interval_from_headers(headers);
+    let deadline = protocol::timeout_from_headers(headers);
     tokio::spawn(run_stream(ino, state, keepalive, deadline, tx));
     frame_stream_response(ReceiverStream::new(rx))
 }

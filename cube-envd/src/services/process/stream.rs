@@ -7,22 +7,22 @@ use bytes::Bytes;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::connect;
-use crate::connect::stream::{
-    next_delivery, terminal_frame, try_send_data_frame, try_send_terminal_frame, Delivery,
-};
-use crate::error::{ConnectCode, ConnectError};
 use crate::exec;
 use crate::msg::process::{Event, EventEnvelope, StartEvent};
+use crate::protocol;
+use crate::protocol::stream::{
+    next_delivery, terminal_frame, try_send_data_frame, try_send_terminal_frame, Delivery,
+};
+use crate::protocol::{ConnectCode, ConnectError};
 
-pub use crate::connect::stream::{
+pub use crate::protocol::stream::{
     empty_stream_response, frame_stream_response, stream_error_response,
 };
 
 fn event_frame(event: Event) -> Bytes {
     let value =
         serde_json::to_value(EventEnvelope { event }).unwrap_or_else(|_| serde_json::json!({}));
-    connect::message_frame(&value)
+    protocol::message_frame(&value)
 }
 
 /// Deliver process events without owning the supervised process lifetime.
@@ -77,12 +77,12 @@ pub(crate) async fn drive_stream(
                     // the required EndStream trailer.
                     let event = event_frame(Event::End(end));
                     let trailer = if deadline_seen {
-                        connect::end_stream_error(&ConnectError::new(
+                        protocol::end_stream_error(&ConnectError::new(
                             ConnectCode::DeadlineExceeded,
                             "context deadline exceeded",
                         ))
                     } else {
-                        connect::end_stream_ok()
+                        protocol::end_stream_ok()
                     };
                     try_send_terminal_frame(&mut output, terminal_frame(event, trailer));
                     return;
@@ -90,7 +90,7 @@ pub(crate) async fn drive_stream(
                 Ok(exec::PumpEvent::SpawnError(msg)) => {
                     try_send_terminal_frame(
                         &mut output,
-                        connect::end_stream_error(&ConnectError::new(ConnectCode::Internal, msg)),
+                        protocol::end_stream_error(&ConnectError::new(ConnectCode::Internal, msg)),
                     );
                     return;
                 }
@@ -104,7 +104,7 @@ pub(crate) async fn drive_stream(
                 Err(RecvError::Lagged(n)) => {
                     try_send_terminal_frame(
                         &mut output,
-                        connect::end_stream_error(&ConnectError::new(
+                        protocol::end_stream_error(&ConnectError::new(
                             ConnectCode::ResourceExhausted,
                             format!("output consumer too slow: {n} events dropped"),
                         )),
@@ -122,7 +122,7 @@ pub(crate) async fn drive_stream(
                     };
                     try_send_terminal_frame(
                         &mut output,
-                        connect::end_stream_error(&ConnectError::new(code, message)),
+                        protocol::end_stream_error(&ConnectError::new(code, message)),
                     );
                     return;
                 }
@@ -141,7 +141,7 @@ pub(crate) async fn drive_stream(
                 // for List, input and a later Connect.
                 try_send_terminal_frame(
                     &mut output,
-                    connect::end_stream_error(&ConnectError::new(
+                    protocol::end_stream_error(&ConnectError::new(
                         ConnectCode::DeadlineExceeded,
                         "context deadline exceeded",
                     )),
