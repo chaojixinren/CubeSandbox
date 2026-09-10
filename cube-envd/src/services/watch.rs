@@ -959,7 +959,7 @@ pub fn watch_dir(
 ) -> axum::response::Response {
     let (ino, state) = match build_stream(req, user) {
         Ok(v) => v,
-        Err(e) => return crate::services::process::stream_error_response(e),
+        Err(e) => return crate::process::stream_error_response(e),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
     let keepalive = protocol::keepalive_interval_from_headers(headers);
@@ -1023,7 +1023,7 @@ fn to_json<T: serde::Serialize>(value: T) -> Result<serde_json::Value, ConnectEr
 // `frame_stream_response` lives in process.rs (pub) and is reused here
 // verbatim; if the planned process.rs refactor moves it, this import is the
 // only line to touch.
-use crate::services::process::frame_stream_response;
+use crate::process::frame_stream_response;
 
 #[cfg(test)]
 mod tests {

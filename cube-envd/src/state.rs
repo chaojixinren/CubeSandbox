@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Rw
 
 use tokio::sync::broadcast;
 
-use crate::cgroup::{self, Manager, ProcType};
-use crate::exec;
-use crate::msg::process::ProcessConfig;
+use crate::process::cgroup::{self, Manager, ProcType};
+use crate::process::engine;
+use crate::process::wire::ProcessConfig;
 
 type ProcessControl = (
     u32,
@@ -43,13 +43,13 @@ pub struct ProcEntry {
     pub config: ProcessConfig,
     /// Output bus the pump publishes on. Held so `Connect` can attach a new
     /// subscriber to an already-running process via `sender.subscribe()`.
-    pub sender: broadcast::Sender<exec::PumpEvent>,
+    pub sender: broadcast::Sender<engine::PumpEvent>,
     /// Duplicate of the pty master fd (None for a pipe-spawned process), kept
     /// so `Update` can resize the window while the pump owns the original.
     pub pty_master: Option<std::fs::File>,
     /// Process-owned writable endpoint used by SendInput/StreamInput and
     /// CloseStdin. Cloned out of the table before any async write is awaited.
-    pub input: exec::InputHandle,
+    pub input: engine::InputHandle,
     /// Optional per-command cgroup leaf. The supervisor retains its own clone
     /// after removing the entry so escaped descendants can still be killed and
     /// the leaf removed without keeping the process table visible.
@@ -59,7 +59,7 @@ pub struct ProcEntry {
     /// Terminal event published by the output pump. This closes the small
     /// Connect-vs-exit race where a subscriber could otherwise attach after
     /// the broadcast terminal event and wait forever for a channel close.
-    pub terminal: Arc<Mutex<Option<exec::PumpEvent>>>,
+    pub terminal: Arc<Mutex<Option<engine::PumpEvent>>>,
 }
 
 /// Opaque, process-lifetime-unique key for a live process in the table.
@@ -162,7 +162,7 @@ impl AppState {
     }
 
     /// cgroup dir fd for `t`, or `None` under the Noop fallback. Handed to
-    /// `exec::spawn` at the process service layer (mirrors upstream
+    /// `engine::spawn` at the process service layer (mirrors upstream
     /// `getProcType` + `GetFileDescriptor` in handler.go).
     #[cfg(test)]
     pub fn cgroup_fd(&self, t: ProcType) -> Option<RawFd> {
@@ -267,7 +267,7 @@ impl AppState {
     /// subscribers still receive it through the broadcast bus; a new
     /// subscriber racing in the removal window receives the cached event via
     /// a one-shot broadcast channel.
-    pub fn mark_terminal(&self, handle: ProcHandle, event: exec::PumpEvent) {
+    pub fn mark_terminal(&self, handle: ProcHandle, event: engine::PumpEvent) {
         let guard = lock(&self.processes);
         if let Some(entry) = guard.get(&handle) {
             *lock(&entry.terminal) = Some(event);
@@ -321,7 +321,7 @@ impl AppState {
         &self,
         pid: Option<u32>,
         tag: Option<&str>,
-    ) -> Option<(u32, broadcast::Receiver<exec::PumpEvent>)> {
+    ) -> Option<(u32, broadcast::Receiver<engine::PumpEvent>)> {
         let guard = lock(&self.processes);
         find_entry(&guard, pid, tag).map(|e| {
             // Subscribe before inspecting the terminal cache. The pump writes
@@ -344,7 +344,7 @@ impl AppState {
     /// Resolve a selector and clone its process-owned input endpoint. The
     /// process-table lock is released before callers await the input mutex or
     /// perform I/O, so one blocked stdin cannot stall unrelated RPCs.
-    pub fn input_handle(&self, pid: Option<u32>, tag: Option<&str>) -> Option<exec::InputHandle> {
+    pub fn input_handle(&self, pid: Option<u32>, tag: Option<&str>) -> Option<engine::InputHandle> {
         let guard = lock(&self.processes);
         find_entry(&guard, pid, tag).map(|e| e.input.clone())
     }
@@ -362,7 +362,7 @@ impl AppState {
         let guard = lock(&self.processes);
         let entry = find_entry(&guard, pid, tag).ok_or(PtyResizeError::NotFound)?;
         let master = entry.pty_master.as_ref().ok_or(PtyResizeError::NotAPty)?;
-        exec::resize_pty(master, cols, rows).map_err(PtyResizeError::Io)
+        engine::resize_pty(master, cols, rows).map_err(PtyResizeError::Io)
     }
 }
 
@@ -399,14 +399,14 @@ mod tests {
     /// Build a ProcEntry with a throwaway broadcast bus — these tests exercise
     /// pid/tag resolution and reaping, never the output bus itself.
     fn proc_entry(pid: u32, tag: Option<&str>) -> ProcEntry {
-        let (sender, _rx) = broadcast::channel::<exec::PumpEvent>(1);
+        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
         ProcEntry {
             pid,
             tag: tag.map(String::from),
             config: ProcessConfig::default(),
             sender,
             pty_master: None,
-            input: Arc::new(tokio::sync::Mutex::new(exec::InputWriter::Pipe(None))),
+            input: Arc::new(tokio::sync::Mutex::new(engine::InputWriter::Pipe(None))),
             cgroup: None,
             termination: Arc::new(Mutex::new(None)),
             terminal: Arc::new(Mutex::new(None)),
@@ -549,9 +549,9 @@ mod tests {
     #[tokio::test]
     async fn subscribe_resolves_and_skips_pre_attach_history() {
         let s = AppState::new();
-        let (tx, _rx) = broadcast::channel::<exec::PumpEvent>(4);
+        let (tx, _rx) = broadcast::channel::<engine::PumpEvent>(4);
         let data = |v: &str| {
-            exec::PumpEvent::Data(crate::msg::process::DataEvent {
+            engine::PumpEvent::Data(crate::process::wire::DataEvent {
                 stdout: Some(v.into()),
                 ..Default::default()
             })
@@ -566,7 +566,7 @@ mod tests {
             config: ProcessConfig::default(),
             sender: tx.clone(),
             pty_master: None,
-            input: Arc::new(tokio::sync::Mutex::new(exec::InputWriter::Pipe(None))),
+            input: Arc::new(tokio::sync::Mutex::new(engine::InputWriter::Pipe(None))),
             cgroup: None,
             termination: Arc::new(Mutex::new(None)),
             terminal: Arc::new(Mutex::new(None)),
@@ -584,7 +584,7 @@ mod tests {
         // Only the post-attach event is delivered — "before" is not replayed.
         assert!(tx.send(data("after")).is_ok());
         match rx.recv().await.expect("post-attach event") {
-            exec::PumpEvent::Data(d) => assert_eq!(d.stdout.as_deref(), Some("after")),
+            engine::PumpEvent::Data(d) => assert_eq!(d.stdout.as_deref(), Some("after")),
             _ => panic!("expected a Data event"),
         }
 
@@ -596,19 +596,19 @@ mod tests {
     #[tokio::test]
     async fn subscribe_after_terminal_publication_gets_cached_event() {
         let s = AppState::new();
-        let (sender, _rx) = broadcast::channel::<exec::PumpEvent>(4);
+        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(4);
         let handle = s.insert_process(ProcEntry {
             pid: 9,
             tag: Some("finished".into()),
             config: ProcessConfig::default(),
             sender,
             pty_master: None,
-            input: Arc::new(tokio::sync::Mutex::new(exec::InputWriter::Pipe(None))),
+            input: Arc::new(tokio::sync::Mutex::new(engine::InputWriter::Pipe(None))),
             cgroup: None,
             termination: Arc::new(Mutex::new(None)),
             terminal: Arc::new(Mutex::new(None)),
         });
-        let terminal = exec::PumpEvent::End(crate::msg::process::EndEvent {
+        let terminal = engine::PumpEvent::End(crate::process::wire::EndEvent {
             exit_code: 0,
             exited: true,
             status: "exit status 0".into(),
@@ -620,7 +620,7 @@ mod tests {
         s.mark_terminal(handle, terminal.clone());
 
         let (_, mut events) = s.subscribe(Some(9), None).expect("finished entry remains");
-        assert!(matches!(events.recv().await, Ok(exec::PumpEvent::End(_))));
+        assert!(matches!(events.recv().await, Ok(engine::PumpEvent::End(_))));
         s.remove_process(handle);
         assert!(s.subscribe(Some(9), None).is_none());
     }
@@ -644,14 +644,14 @@ mod tests {
 
         // A live process whose "pty" is not a terminal → ioctl fails → Io.
         let not_a_tty = std::fs::File::open("/dev/null").unwrap();
-        let (sender, _rx) = broadcast::channel::<exec::PumpEvent>(1);
+        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
         s.insert_process(ProcEntry {
             pid: 8,
             tag: Some("bad-pty".into()),
             config: ProcessConfig::default(),
             sender,
             pty_master: Some(not_a_tty),
-            input: Arc::new(tokio::sync::Mutex::new(exec::InputWriter::Pipe(None))),
+            input: Arc::new(tokio::sync::Mutex::new(engine::InputWriter::Pipe(None))),
             cgroup: None,
             termination: Arc::new(Mutex::new(None)),
             terminal: Arc::new(Mutex::new(None)),

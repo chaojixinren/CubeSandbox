@@ -2,6 +2,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod filesystem;
-pub mod process;
 
 pub mod watch;

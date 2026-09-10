@@ -19,11 +19,12 @@ use futures::StreamExt;
 use crate::cors;
 use crate::legacy;
 use crate::platform::identity::{self, User};
+use crate::process as proc_svc;
 use crate::protocol;
 use crate::protocol::{ConnectCode, ConnectError};
 use crate::rest;
+use crate::services::filesystem as fs_svc;
 use crate::services::watch as watch_svc;
-use crate::services::{filesystem as fs_svc, process as proc_svc};
 use crate::state::AppState;
 
 pub(crate) const MAX_UNARY_BODY: usize = 4 * 1024 * 1024;
@@ -198,7 +199,7 @@ async fn process_start(
         Ok(p) => p,
         Err(e) => return proc_svc::stream_error_response(e),
     };
-    let req: crate::msg::process::StartRequest = match serde_json::from_slice(&payload) {
+    let req: crate::process::wire::StartRequest = match serde_json::from_slice(&payload) {
         Ok(r) => r,
         Err(e) => {
             return proc_svc::stream_error_response(ConnectError::new(
@@ -250,7 +251,7 @@ async fn process_connect(
         Ok(p) => p,
         Err(e) => return proc_svc::stream_error_response(e),
     };
-    let req: crate::msg::process::ConnectRequest = match serde_json::from_slice(&payload) {
+    let req: crate::process::wire::ConnectRequest = match serde_json::from_slice(&payload) {
         Ok(r) => r,
         Err(e) => {
             return proc_svc::stream_error_response(ConnectError::new(
@@ -291,11 +292,11 @@ async fn process_send_signal(
     if let Err(e) = rpc_token_check(&state, &headers) {
         return e.into_response();
     }
-    let req: crate::msg::process::SendSignalRequest = match read_unary_request(&headers, body).await
-    {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let req: crate::process::wire::SendSignalRequest =
+        match read_unary_request(&headers, body).await {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
     unary_result(proc_svc::send_signal(&state, &req))
 }
 
@@ -307,7 +308,7 @@ async fn process_send_input(
     if let Err(e) = rpc_token_check(&state, &headers) {
         return e.into_response();
     }
-    let req: crate::msg::process::SendInputRequest = match read_unary_request(&headers, body).await
+    let req: crate::process::wire::SendInputRequest = match read_unary_request(&headers, body).await
     {
         Ok(r) => r,
         Err(e) => return e.into_response(),
@@ -323,11 +324,11 @@ async fn process_close_stdin(
     if let Err(e) = rpc_token_check(&state, &headers) {
         return e.into_response();
     }
-    let req: crate::msg::process::CloseStdinRequest = match read_unary_request(&headers, body).await
-    {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let req: crate::process::wire::CloseStdinRequest =
+        match read_unary_request(&headers, body).await {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
     unary_result(proc_svc::close_stdin(&state, &req).await)
 }
 
@@ -365,7 +366,7 @@ async fn process_stream_input(
                 Ok(None) => break,
                 Err(e) => return proc_svc::stream_error_response(e),
             };
-            let req: crate::msg::process::StreamInputRequest =
+            let req: crate::process::wire::StreamInputRequest =
                 match serde_json::from_slice(&payload) {
                     Ok(req) => req,
                     Err(e) => {
@@ -394,7 +395,7 @@ async fn process_update(
     if let Err(e) = rpc_token_check(&state, &headers) {
         return e.into_response();
     }
-    let req: crate::msg::process::UpdateRequest = match read_unary_request(&headers, body).await {
+    let req: crate::process::wire::UpdateRequest = match read_unary_request(&headers, body).await {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };

@@ -1,3 +1,22 @@
-//! 启动失败降级：无 cgroup 强制、永不阻塞启动。
-//! 来源：承接 cgroup/noop.rs（原样迁入）。
-//! （PR-1 骨架：实现待 PR-2 搬运迁入）
+// Copyright (c) 2026 Tencent Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `NoopManager` — startup failure fallback (upstream noop.go): no cgroup
+//! enforcement, never blocks startup. Chosen once at startup when cgroup v2
+//! is unavailable; runtime failures of a real manager reject the command.
+
+#[cfg(test)]
+use std::os::unix::io::RawFd;
+
+use super::Manager;
+#[cfg(test)]
+use super::ProcType;
+
+pub struct NoopManager;
+
+impl Manager for NoopManager {
+    #[cfg(test)]
+    fn fd(&self, _t: ProcType) -> Option<RawFd> {
+        None
+    }
+}

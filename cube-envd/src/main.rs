@@ -12,13 +12,12 @@
 //! compatibility-tested against — see tests/e2e/envd_conformance.
 
 mod blocking;
-mod cgroup;
 mod compat;
 mod cors;
-mod exec;
 mod legacy;
 mod msg;
 mod platform;
+mod process;
 mod protocol;
 mod rest;
 mod server;
@@ -248,7 +247,7 @@ fn main() {
         .expect("build tokio runtime");
 
     runtime.block_on(async move {
-        let state = Arc::new(state::AppState::new().with_cgroup(cgroup::init()));
+        let state = Arc::new(state::AppState::new().with_cgroup(process::cgroup::init()));
         let app = server::router(state);
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cli.port));
         let listener = match tokio::net::TcpListener::bind(addr).await {
