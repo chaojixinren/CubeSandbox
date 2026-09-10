@@ -20,8 +20,9 @@
 //! - Watch family:    implemented in `filesystem/watch/` (streaming + pull watchers)
 
 use crate::compat::vocab::{go_link_error, go_path_error};
+use crate::filesystem::entry::entry_info;
 use crate::filesystem::wire::{
-    entry_info, EntryInfo, EntryResponse, ListDirRequest, ListDirResponse, MoveRequest, PathRequest,
+    EntryInfo, EntryResponse, ListDirRequest, ListDirResponse, MoveRequest, PathRequest,
 };
 use crate::platform::identity::User;
 use crate::protocol::{ConnectCode, ConnectError};
@@ -30,6 +31,7 @@ use std::os::unix::fs::DirBuilderExt;
 #[cfg(test)]
 mod data_plane_tests;
 pub mod download;
+pub mod entry;
 pub mod errors;
 pub mod http;
 pub mod upload;
