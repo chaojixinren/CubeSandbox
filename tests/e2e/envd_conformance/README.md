@@ -53,9 +53,11 @@ python3 perf.py
 
 - `PASS` — normalized fixtures identical.
 - `DECLARED-DIFF` — allowlisted in `conformance.py` `DECLARED_DIFFERENT`
-  with a reason; every entry maps to the "known differences" table in the
-  cube-envd design doc / PR description (watch, `/files/compose`,
-  gzip, nested-selector error differences, parser-specific error wording).
+  with a reason. There are four: gzip download encoding and `/files/compose`
+  (both unimplemented here), `fs_bad_json` (the JSON parse wording is
+  parser-specific; code and status still match), and
+  `rest_init_timestamp_out_of_range` (upstream's `UnixNano()` wraps and drops
+  the request as stale; cube-envd rejects it as a caller bug).
 - `FAIL` — a real behavioral divergence; fix cube-envd or, if the change
   is intentional, move it to the allowlist **with a reason** in the same PR.
 
@@ -67,7 +69,7 @@ python3 perf.py
 | error | bad user (REST 401 / RPC unauthenticated), missing paths, directory download, missing binary (127), malformed JSON |
 | timeout | `Connect-Timeout-Ms` expiry → `deadline_exceeded` + process killed, including an unread response whose output queue is full |
 | cancellation | client disconnect mid-stream → process keeps running (List + side-effect check) |
-| unimplemented | watch family / compose answer with stable protocol-correct errors |
+| unimplemented | `/files/compose` answers with a stable protocol-correct error; the watch family, listed here while it was still unimplemented, now has its own capture group (see **Running**) |
 
 ## Termination metadata extension
 
