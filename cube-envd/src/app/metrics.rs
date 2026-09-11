@@ -119,9 +119,8 @@ fn meminfo() -> (u64, u64, u64) {
 
 /// `statvfs(3)` on `path`, as `(total, used)` in bytes.
 ///
-/// Semantics follow upstream `host.diskStats` (metrics.go:83-97): the size
-/// multiplier is the filesystem block size, and "available" is `f_bavail` —
-/// what an unprivileged writer can still use — not `f_bfree`, which also
+/// "Available" follows upstream `host.diskStats` (metrics.go:83-97): `f_bavail`
+/// — what an unprivileged writer can still use — and not `f_bfree`, which also
 /// counts the blocks reserved for root. Reading `f_bfree` under-reports
 /// `disk_used` by the reserved amount on any filesystem that reserves space
 /// (ext4 defaults to 5%).
@@ -153,9 +152,13 @@ fn disk_usage(path: &str) -> (u64, u64) {
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return (0, 0);
     }
-    // glibc implements `statvfs` on top of `statfs(2)` and sets `f_frsize` from
-    // the filesystem block size, which is the value Go's `unix.Statfs` reads as
-    // `Bsize`, so the multiplier is upstream-equivalent on Linux.
+    // POSIX counts `f_blocks` and `f_bavail` in `f_frsize` units, so `f_frsize`
+    // is the correct multiplier. Upstream multiplies `st.Blocks` by `st.Bsize`
+    // instead (metrics.go:89-92); on Linux `statvfs.f_frsize` is the kernel's
+    // `statfs.f_frsize`, which is *not* required to equal `f_bsize`. The two
+    // coincide on every filesystem we could measure (ext4, overlayfs, tmpfs and
+    // drvfs all report 4096 for both), and where they diverge this side is the
+    // POSIX-correct one — a declared difference, not an equivalence.
     let block = stat.f_frsize as u64;
     let total = stat.f_blocks as u64 * block;
     let available = stat.f_bavail as u64 * block;
