@@ -33,12 +33,25 @@ docker run -d --name envd-rust -p 127.0.0.1:49984:49983 \
   -v $PWD/../../../_output/bin/cube-envd:/usr/bin/cube-envd:ro \
   -e ENVD_BIN=/usr/bin/cube-envd $BASE_IMAGE
 
-# 2. Capture fixtures from both (fresh containers matter: scenarios mutate
-#    the filesystem, and both sides must see identical starting state).
+# 2. Capture fixtures. Two groups, and each needs its own freshly started
+#    containers: `capture.py all` installs an access token through /init, after
+#    which every watch RPC answers 401, and both groups mutate the filesystem,
+#    so they cannot share a container in either order.
+#
+# 2a. Watch group — on the containers started in step 1, before anything has
+#     called /init.
+ENVD_BASE=http://127.0.0.1:49985 OUTDIR=fixtures-go-w   python3 capture.py watch
+ENVD_BASE=http://127.0.0.1:49984 OUTDIR=fixtures-rust-w python3 capture.py watch
+python3 conformance.py fixtures-go-w fixtures-rust-w
+
+# 2b. Main group — restart both containers first (same docker run as step 1).
+docker rm -f envd-go2 envd-rust
+# <repeat the two docker run commands above>
 ENVD_BASE=http://127.0.0.1:49985 OUTDIR=fixtures-go   python3 capture.py all
 ENVD_BASE=http://127.0.0.1:49984 OUTDIR=fixtures-rust python3 capture.py all
 
 # 3. Diff. Exit code 0 = conformant (declared differences excluded).
+#    Main group: 122 fixtures. Watch group: 9.
 python3 conformance.py fixtures-go fixtures-rust
 
 # 4. Lifecycle regression against cube-envd. The default is :49984; ENVD_BASE
