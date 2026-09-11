@@ -16,6 +16,75 @@ CubeSandbox-owned Rust implementation; the upstream Go envd remains available
 as an explicit rollback through the existing `ENVD_BIN` switch in
 `docker/cube-entrypoint.sh`.
 
+## Design
+
+The tree is a contract index and a dependency graph: a path states what is
+promised, an edge states who may call whom. Six layers, one allowed direction:
+
+```
+app -> {filesystem, process} -> platform -> protocol -> compat
+```
+
+```
+src/
+├── main.rs                  entry: wiring, signals, exit code
+│
+├── app/                     HTTP surface + composition root
+│   ├── cli.rs               Go-flag-compatible CLI
+│   ├── handlers.rs          Connect + REST handler bodies
+│   ├── lifecycle.rs         /init /health /envs, timestamp bookkeeping
+│   ├── metrics.rs           /metrics
+│   ├── pool.rs              blocking-thread pool
+│   ├── routes.rs            the whole URL surface
+│   ├── state.rs             AppState { config, processes }
+│   └── middleware/          cors.rs, legacy.rs (X-E2B-Legacy-SDK)
+│
+├── filesystem/              filesystem domain
+│   ├── mod.rs               stat / listDir / makeDir / move / remove
+│   ├── entry.rs             disk metadata -> EntryInfo
+│   ├── download.rs upload.rs
+│   ├── errors.rs            data-plane error -> gRPC status mapping
+│   ├── wire.rs              filesystem.proto serde shapes (pure data)
+│   ├── http/                content_disposition, encoding, httpdate,
+│   │                        preconditions, ranges
+│   └── watch/               inotify.rs, tree.rs, pump.rs
+│
+├── process/                 process domain
+│   ├── command.rs           Start / Connect / List / SendInput / ...
+│   ├── supervisor.rs        one process: spawn, signals, exit
+│   ├── table.rs             process table (lookup, output, cgroup leaves)
+│   ├── pump.rs metadata.rs
+│   ├── wire.rs              process.proto serde shapes (pure data)
+│   ├── cgroup/              cgroup2.rs, noop.rs
+│   └── engine/              spawn.rs, io.rs, pty.rs, cleanup.rs
+│
+├── platform/                host-facing services shared by both domains
+│   ├── config.rs            env defaults, access token, /init timestamp
+│   ├── identity.rs          user/group lookup, path anchoring
+│   └── lock.rs              poison-recovering lock helpers
+│
+├── protocol/                Connect wire layer, transport-independent
+│   ├── error.rs             error model + HTTP status mapping
+│   ├── frames.rs            envelope codec (unary cap + stream frames)
+│   └── keepalive.rs stream.rs timeout.rs
+│
+└── compat/                  Go stdlib emulation, as data
+    └── vocab.rs             go1.26 errno text table
+```
+
+`filesystem/` and `process/` never reference each other, and nothing below
+`app/` reaches back into it. That is enforced rather than merely intended:
+`tests/layer_rule.rs` reads `src/` and fails the suite on a forbidden module
+path, so an inverted edge cannot land while `cargo test`, `clippy` and `fmt`
+stay green.
+
+Notable protocol details preserved from the baseline: proto3 JSON emits
+camelCase and omits default values (`exitCode:0` disappears; SDKs recover it
+from `status`), int64 fields serialize as strings, oneofs are flat
+(`{"process":{"pid":1}}`), streaming errors always ride the EndStream frame
+on HTTP 200, and a signal-killed process reports `exitCode:-1` with
+`status:"signal: killed"`.
+
 ## Compatibility scope
 
 The protocol surface was locked against a recorded behavior baseline of Go
@@ -159,30 +228,6 @@ documented in [tests/e2e/envd_conformance](../tests/e2e/envd_conformance/).
   daemon surface now implements the watch family; 0.1.0 keeps the e2b SDK
   watch-related feature gates safely disabled — enabling them is an SDK-side
   change outside the daemon's scope.
-
-## Design
-
-Module layout mirrors the protocol split:
-
-```
-src/
-├── main.rs        CLI + runtime bootstrap
-├── server.rs      single-port router (REST + two Connect services)
-├── connect.rs     Connect JSON codec: unary bodies + 5-byte stream envelopes
-├── auth.rs        Basic auth / username query → /etc/passwd, path anchoring
-├── state.rs       /init env store, access token, process table
-├── exec.rs        spawn + privilege drop + stdout/stderr pump
-├── rest/          /health /init /envs /metrics /files
-├── services/      process.Process, filesystem.Filesystem
-└── msg/           hand-written proto3-JSON serde types (spec/ snapshots)
-```
-
-Notable protocol details preserved from the baseline: proto3 JSON emits
-camelCase and omits default values (`exitCode:0` disappears; SDKs recover it
-from `status`), int64 fields serialize as strings, oneofs are flat
-(`{"process":{"pid":1}}`), streaming errors always ride the EndStream frame
-on HTTP 200, and a signal-killed process reports `exitCode:-1` with
-`status:"signal: killed"`.
 
 ## Process termination metadata and cgroup policy
 
