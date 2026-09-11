@@ -26,51 +26,73 @@ app -> {filesystem, process} -> platform -> protocol -> compat
 ```
 
 ```
-src/
-├── main.rs                  entry: wiring, signals, exit code
-│
-├── app/                     HTTP surface + composition root
-│   ├── cli.rs               Go-flag-compatible CLI
-│   ├── handlers.rs          Connect + REST handler bodies
-│   ├── lifecycle.rs         /init /health /envs, timestamp bookkeeping
-│   ├── metrics.rs           /metrics
-│   ├── pool.rs              blocking-thread pool
-│   ├── routes.rs            the whole URL surface
-│   ├── state.rs             AppState { config, processes }
-│   └── middleware/          cors.rs, legacy.rs (X-E2B-Legacy-SDK)
-│
-├── filesystem/              filesystem domain
-│   ├── mod.rs               stat / listDir / makeDir / move / remove
-│   ├── entry.rs             disk metadata -> EntryInfo
-│   ├── download.rs upload.rs
-│   ├── errors.rs            data-plane error -> gRPC status mapping
-│   ├── wire.rs              filesystem.proto serde shapes (pure data)
-│   ├── http/                content_disposition, encoding, httpdate,
-│   │                        preconditions, ranges
-│   └── watch/               inotify.rs, tree.rs, pump.rs
-│
-├── process/                 process domain
-│   ├── command.rs           Start / Connect / List / SendInput / ...
-│   ├── supervisor.rs        one process: spawn, signals, exit
-│   ├── table.rs             process table (lookup, output, cgroup leaves)
-│   ├── pump.rs metadata.rs
-│   ├── wire.rs              process.proto serde shapes (pure data)
-│   ├── cgroup/              cgroup2.rs, noop.rs
-│   └── engine/              spawn.rs, io.rs, pty.rs, cleanup.rs
-│
-├── platform/                host-facing services shared by both domains
-│   ├── config.rs            env defaults, access token, /init timestamp
-│   ├── identity.rs          user/group lookup, path anchoring
-│   └── lock.rs              poison-recovering lock helpers
-│
-├── protocol/                Connect wire layer, transport-independent
-│   ├── error.rs             error model + HTTP status mapping
-│   ├── frames.rs            envelope codec (unary cap + stream frames)
-│   └── keepalive.rs stream.rs timeout.rs
-│
-└── compat/                  Go stdlib emulation, as data
-    └── vocab.rs             go1.26 errno text table
+cube-envd/                            the component directory; everything below is inside it
+├── spec/                             protocol snapshots the wire types mirror
+│   ├── filesystem/
+│   │   └── filesystem.proto
+│   ├── process/
+│   │   └── process.proto
+│   └── envd.yaml
+├── src/
+│   ├── app/                          HTTP surface and startup wiring
+│   │   ├── middleware/               cors.rs, legacy.rs (X-E2B-Legacy-SDK)
+│   │   ├── cli.rs                    Go-flag-compatible CLI
+│   │   ├── handlers.rs               Connect + REST handler bodies
+│   │   ├── lifecycle.rs              /init /health /envs, timestamps
+│   │   ├── metrics.rs                /metrics
+│   │   ├── mod.rs
+│   │   ├── pool.rs                   blocking-thread pool
+│   │   ├── routes.rs                 the whole URL surface
+│   │   └── state.rs                  AppState { config, processes }
+│   ├── compat/                       Go stdlib emulation, as data
+│   │   ├── mod.rs
+│   │   └── vocab.rs                  go1.26 errno text table
+│   ├── filesystem/                   filesystem domain
+│   │   ├── http/                     content_disposition, encoding, httpdate, preconditions, ranges
+│   │   ├── watch/                    inotify.rs, tree.rs, pump.rs
+│   │   ├── data_plane_tests.rs       data-plane tests
+│   │   ├── download.rs
+│   │   ├── entry.rs                  disk metadata -> EntryInfo
+│   │   ├── errors.rs                 error -> gRPC status mapping
+│   │   ├── mod.rs                    stat / listDir / makeDir / move / remove
+│   │   ├── upload.rs
+│   │   └── wire.rs                   filesystem.proto shapes (pure data)
+│   ├── platform/                     host-facing services shared by both domains
+│   │   ├── config.rs                 env defaults, token, /init time
+│   │   ├── identity.rs               user/group lookup, path anchoring
+│   │   ├── lock.rs                   poison-recovering lock helpers
+│   │   └── mod.rs
+│   ├── process/                      process domain
+│   │   ├── cgroup/                   cgroup2.rs, noop.rs
+│   │   ├── engine/                   spawn.rs, io.rs, pty.rs, cleanup.rs
+│   │   ├── command.rs                Start / Connect / List / SendInput / ...
+│   │   ├── metadata.rs
+│   │   ├── mod.rs
+│   │   ├── pump.rs
+│   │   ├── supervisor.rs             one process: spawn, signals, exit
+│   │   ├── table.rs                  process table, output, cgroup leaves
+│   │   └── wire.rs                   process.proto shapes (pure data)
+│   ├── protocol/                     Connect wire layer, transport-independent
+│   │   ├── error.rs                  error model + HTTP status mapping
+│   │   ├── frames.rs                 envelope codec, unary + stream
+│   │   ├── keepalive.rs
+│   │   ├── mod.rs
+│   │   ├── stream.rs
+│   │   └── timeout.rs
+│   └── main.rs                       entry: wiring, signals, exit code
+├── Cargo.lock                        locked dependency set
+├── Cargo.toml                        crate manifest
+├── Makefile                          component targets; the repo Makefile wraps them
+└── rust-toolchain.toml               pinned toolchain
 ```
+
+`spec/` is the protocol snapshot the `wire.rs` files mirror, and `tests/` holds
+the layer assertion below. Directories come first within each level, then files,
+each group alphabetically — the order an editor or GitHub renders the directory
+in. Every path in the block resolves, and leaf directories with one uniform
+purpose are summarised in the annotation rather than expanded. Not listed: `target/`
+(cargo's build directory, ignored by `cube-envd/.gitignore`), `.gitignore`
+itself, and this README.
 
 `filesystem/` and `process/` never reference each other, and nothing below
 `app/` reaches back into it. That is enforced rather than merely intended:
