@@ -98,7 +98,7 @@ Implemented (behavior matched fixture-by-fixture against the baseline):
 |---|---|
 | REST | `GET /health` (204), `POST /init` (envVars merge + optional accessToken), `GET /envs`, `GET /metrics`, `GET/POST /files` (octet-stream + multipart, relative paths, ownership, error vocabulary) |
 | `process.Process` | `Start` (Connect JSON streaming: start/data/end events; optional pipe stdin defaults on; `pty` allocates a real pty with merged `data.pty` output, CRLF line discipline and initial window size; `cwd` validation and privilege drop; whole-group deadline cleanup; a client disconnect leaves the child running), `Connect` (attach by pid/tag from the current output head), `List`, `SendSignal`, `SendInput`, `StreamInput`, `CloseStdin` and `Update` |
-| `filesystem.Filesystem` | `Stat`, `ListDir` (BFS depth), `MakeDir` (ownership on every created component), `Move`, `Remove` (idempotent), `WatchDir` (Connect server streaming: `start`/`keepalive`/`filesystem` events; fsnotify-faithful op mapping with the fixed expansion order; per-directory inotify watches with optional full recursion incl. synthetic creates for pre-existing subtrees and cookie-paired rename path rewrites), `CreateWatcher` / `GetWatcherEvents` / `RemoveWatcher` (pull watchers with id lifecycle) |
+| `filesystem.Filesystem` | `Stat`, `ListDir` (depth-limited; lexical, depth-first `filepath.WalkDir` order), `MakeDir` (ownership on every created component), `Move`, `Remove` (idempotent), `WatchDir` (Connect server streaming: `start`/`keepalive`/`filesystem` events; fsnotify-faithful op mapping with the fixed expansion order; per-directory inotify watches with optional full recursion incl. synthetic creates for pre-existing subtrees and cookie-paired rename path rewrites), `CreateWatcher` / `GetWatcherEvents` / `RemoveWatcher` (pull watchers with id lifecycle) |
 | CLI | Go `flag` compatible: `-port` (u16, `-port N` or `-port=N`), `-isnotfc` (accepted and ignored; `-isnotfc=false` is **rejected** — only the non-FC mode is implemented), `-version`/`--version`, `-commit`, `-h`/`-help` (usage, exit 0); `-cmd`/`-cgroup-root` are recognized but not implemented yet (warned and skipped); **any other flag or positional argument is a usage error — Go's message + usage on stderr + exit 2** |
 | Auth | `Authorization: Basic base64("<user>:")` / `username` query, `/etc/passwd` resolution, default user `root`, privilege drop per operation, `X-Access-Token` enforced only after /init provides one |
 
@@ -198,7 +198,7 @@ baseline (asserted by the conformance fixtures, not allowlisted):
 Everything runs inside the repo builder container:
 
 ```bash
-make cube-envd        # → _output/bin/cube-envd (static musl, ~2.6 MB)
+make cube-envd        # → _output/bin/cube-envd (static musl, ~3.2 MiB)
 make cube-envd-test   # cargo test + clippy -D warnings
 ```
 
@@ -265,8 +265,10 @@ Configuration:
   `min(total/8, 128 MiB)` from the effective guest/parent memory ceiling.
 
 A Start timeout kills the command, publishes the real EndEvent, then emits a
-`deadline_exceeded` trailer. Connect ignores `Connect-Timeout-Ms`: it is an
-attachment and remains until the process ends or the client disconnects; the
-client SDKs may still apply their own idle/request timeout. Python Commands always uses the in-house
+`deadline_exceeded` trailer. `Connect-Timeout-Ms` bounds the attachment, not
+the process: on expiry the stream ends with a `deadline_exceeded` trailer while
+the command keeps running, and without the header the attachment remains until
+the process ends or the client disconnects. The client SDKs may still apply
+their own idle/request timeout. Python Commands always uses the in-house
 Connect-JSON decoder, regardless of whether the E2B package is installed;
 Go Commands copies termination fields into the public CommandResult.
