@@ -2,8 +2,6 @@
 
 CubeSandbox-maintained in-guest data-plane daemon, protocol-compatible with
 the E2B envd that CubeSandbox previously consumed from `e2b-dev/infra`.
-Implements the MVP scope agreed in
-[issue #1227](https://github.com/TencentCloud/CubeSandbox/issues/1227).
 
 ## Why
 
