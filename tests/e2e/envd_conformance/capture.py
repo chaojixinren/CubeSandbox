@@ -366,6 +366,35 @@ def cap_rest():
         "POST", "/files?username=user", part,
         {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
     # download ok / relative path
+    # multipart where ?path and the part filename disagree: upstream uses ?path
+    record("rest_files_upload_multipart_query_path_wins", http_req(
+        "POST", "/files?path=/home/user/base_c.bin&username=user",
+        (f"--{boundary}\r\n"
+         'Content-Disposition: form-data; name="file"; filename="/home/user/elsewhere.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\n").encode() + b"query-wins" +
+        f"\r\n--{boundary}--\r\n".encode(),
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+    # a part whose field name is not `file` is a form field, not an upload
+    record("rest_files_upload_multipart_other_field_name", http_req(
+        "POST", "/files?username=user",
+        (f"--{boundary}\r\n"
+         'Content-Disposition: form-data; name="envd"; filename="/home/user/not-a-file.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\n").encode() + b"ignored" +
+        f"\r\n--{boundary}--\r\n".encode(),
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+    # an unsupported content type is a 400 that never touches the body
+    record("rest_files_upload_unsupported_type", http_req(
+        "POST", "/files?path=/home/user/base_d.bin&username=user",
+        b"text=NOT-A-FILE", {"Content-Type": "application/x-www-form-urlencoded"}))
+    # ... and the filesystem shows where each of those landed
+    record("rest_files_download_query_path_target", http_req(
+        "GET", "/files?path=/home/user/base_c.bin&username=user"))
+    record("rest_files_download_part_filename_absent", http_req(
+        "GET", "/files?path=/home/user/elsewhere.bin&username=user"))
+    record("rest_files_download_other_field_name_absent", http_req(
+        "GET", "/files?path=/home/user/not-a-file.bin&username=user"))
+    record("rest_files_download_unsupported_type_absent", http_req(
+        "GET", "/files?path=/home/user/base_d.bin&username=user"))
     record("rest_files_download", http_req("GET", "/files?path=/home/user/base_a.txt&username=user"))
     record("rest_files_download_relative", http_req("GET", "/files?path=base_a.txt&username=user"))
     # gzip response encoding: upstream compresses, cube-envd serves identity

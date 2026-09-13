@@ -171,8 +171,19 @@ load-bearing ones, and why cube-envd differs:
   in the target, concurrent readers see it grow, and a failed upload is not
   rolled back. Above the 256 MiB cap the upload stops mid-stream with 413.
   Overwriting an existing file preserves its mode bits (`O_TRUNC` never
-  touches the mode). Multipart parts without a filename are ignored as form
-  fields (only the raw octet-stream path uses the `?path` query target).
+  touches the mode).
+- **`/files` dispatch and multipart targeting follow upstream exactly.** The
+  Content-Type decides the path: `application/octet-stream` is the raw body
+  (the `path` query parameter is then required, `400` otherwise), any
+  `multipart/*` subtype takes the multipart path, and anything else — a missing
+  header included — is `400 unsupported content type: …`, rejected without
+  reading the body. Inside a multipart body only parts whose **field name** is
+  `file` are uploads (Go's `FormName()` defaults an absent name to `"file"`);
+  the **`?path` query wins when present**, and the part's filename is only the
+  fallback, used verbatim rather than `filepath.Base`
+  (`upload.go resolvePath`). A second part resolving to the same path is
+  rejected with the first write left in place, and a multipart body with no
+  `file` part answers `200` with an empty array.
 - **CLI parsing is stricter than Go's `flag` (documented).** *Unlike the
   upstream Go envd, cube-envd strictly validates every command-line argument:
   an invalid flag, a positional argument or a malformed value terminates
