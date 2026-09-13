@@ -829,3 +829,41 @@ mod download_tests {
         assert!(!hvary.contains_key(header::VARY));
     }
 }
+
+/// Upstream rejects a directory target before opening the file
+/// (`processFile`: `path is a directory: <path>`, 400). Without the pre-check
+/// the EISDIR from `open` reached the caller as a 500.
+#[cfg(test)]
+mod upload_dir_target_tests {
+    use axum::body::Body;
+    use axum::http::{header, HeaderMap, StatusCode};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn a_directory_target_is_a_400_with_upstreams_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        let params =
+            HashMap::from([("path".to_string(), dir.path().to_str().unwrap().to_string())]);
+        let response = crate::filesystem::upload(
+            &crate::platform::config::Config::new(),
+            params,
+            headers,
+            Body::from("x"),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains(&format!("path is a directory: {}", dir.path().display())),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}

@@ -382,6 +382,19 @@ def cap_rest():
     record("rest_files_upload_root", http_req(
         "POST", "/files?path=/root/base_root.txt&username=root",
         b"root-file\n", {"Content-Type": "application/octet-stream"}))
+    # A directory target is a caller error upstream (`processFile` stats first
+    # and answers 400 `path is a directory: <path>`), not a 500 from the open.
+    record("rest_files_upload_to_directory", http_req(
+        "POST", "/files?path=/home/user&username=user",
+        b"x", {"Content-Type": "application/octet-stream"}))
+    # Multiple ranges: upstream answers 206 + multipart/byteranges, cube-envd
+    # serves the whole file with 200 (declared different).
+    record("rest_files_range_multi", http_req(
+        "GET", "/files?path=/home/user/base_a.txt&username=user", None,
+        {"Range": "bytes=0-1,4-5"}))
+    # HEAD: upstream has no HEAD route (405), axum answers it automatically.
+    record("rest_files_head", http_req(
+        "HEAD", "/files?path=/home/user/base_a.txt&username=user"))
 
 
 # Runs LAST: compose deletes its source files on the Go implementation,
@@ -1067,6 +1080,25 @@ def cap_process():
     # Nested (non-flat) selector: upstream rejects the shape outright.
     record("proc_connect_missing", connect_stream(
         "process.Process/Connect", {"process": {"selector": {"pid": 99999}}}, timeout=8, read_deadline=5))
+    # SendSignal with an unknown enum name. Upstream decodes it to the proto3
+    # zero value and the service answers `unimplemented` with a fixed message;
+    # the process has to be alive for the signal to be parsed at all.
+    def run_bad_signal_target():
+        connect_stream("process.Process/Start",
+                       start_req("sleep 30", tag="baseline-bad-signal",
+                                 include_stdin=False), timeout=20, read_deadline=3)
+
+    t_sig = threading.Thread(target=run_bad_signal_target)
+    t_sig.start()
+    sig_pid = wait_for_tag("baseline-bad-signal")
+    if sig_pid:
+        record("proc_send_signal_invalid_name", connect_unary(
+            "process.Process/SendSignal",
+            {"process": {"pid": sig_pid}, "signal": "SIGNAL_NOT_A_SIGNAL"}))
+        connect_unary("process.Process/SendSignal",
+                      {"process": {"pid": sig_pid}, "signal": "SIGNAL_SIGKILL"})
+    t_sig.join(timeout=10)
+
     # SendInput to non-stdin process (error shape)
     record("proc_sendinput_probe", connect_unary(
         "process.Process/SendInput",

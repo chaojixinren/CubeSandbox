@@ -38,6 +38,8 @@ DECLARED_DIFFERENT = {
     "rest_files_compose_probe": "/files/compose: implemented upstream, 501 in cube-envd",
     "fs_bad_json": "JSON parse error wording is parser-specific (code and status equal)",
     "rest_init_timestamp_out_of_range": "timestamp outside i64-nanosecond range (9999): upstream UnixNano() wraps and drops as stale (204); cube-envd rejects as a caller bug (400). Neither applies anything nor moves the gate",
+    "rest_files_range_multi": "multi-range downloads: upstream answers 206 multipart/byteranges, cube-envd serves the whole file with 200 (no multipart writer)",
+    "rest_files_head": "HEAD /files: upstream has no HEAD route and answers 405, axum serves it automatically with 200 and the same headers",
 }
 # Fixtures that depend on prior state in ways the rerun reproduces
 # differently. Currently empty; kept for the next scenario that needs it.

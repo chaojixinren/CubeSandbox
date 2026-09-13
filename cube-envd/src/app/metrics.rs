@@ -14,8 +14,13 @@ use axum::response::IntoResponse;
 use crate::app::state::AppState;
 
 pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    if crate::app::lifecycle::check_token(&state.config, &headers).is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Some(_failure) = crate::app::lifecycle::token_failure(&state.config, &headers) {
+        // Same middleware answer as every other protected path.
+        return crate::protocol::RestError::new(
+            StatusCode::UNAUTHORIZED,
+            crate::app::lifecycle::MIDDLEWARE_UNAUTHORIZED,
+        )
+        .into_response();
     }
     // One blocking-pool crossing for the whole sample (proc reads + the
     // 100ms cpu window + statvfs): /metrics is polled at most a few times
