@@ -42,9 +42,23 @@ pub(crate) fn rpc_user(config: &Config, headers: &HeaderMap) -> Result<User, Con
     })
 }
 
-pub(crate) fn rpc_token_check(config: &Config, headers: &HeaderMap) -> Result<(), ConnectError> {
-    crate::app::lifecycle::check_token(config, headers)
-        .map_err(|_| ConnectError::new(ConnectCode::Unauthenticated, "invalid access token"))
+/// Upstream checks the access token in an HTTP middleware that runs *before*
+/// the Connect handler, and answers with a plain REST body. Every path outside
+/// `/health`, `/init` and `/files` is protected that way, unary and streaming
+/// alike, so the failure here is a ready response rather than a `ConnectError`
+/// (which would render a Connect envelope upstream never produces). `None` means
+/// the request may proceed.
+pub(crate) fn rpc_token_check(
+    config: &Config,
+    headers: &HeaderMap,
+) -> Option<axum::response::Response> {
+    crate::app::lifecycle::token_failure(config, headers).map(|_| {
+        crate::protocol::RestError::new(
+            axum::http::StatusCode::UNAUTHORIZED,
+            crate::app::lifecycle::MIDDLEWARE_UNAUTHORIZED,
+        )
+        .into_response()
+    })
 }
 
 pub(crate) fn unary_json(value: serde_json::Value) -> axum::response::Response {
@@ -100,8 +114,8 @@ pub(crate) async fn process_start(
     if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return proc_svc::stream_error_response(e);
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
         Ok(b) => b,
@@ -159,8 +173,8 @@ pub(crate) async fn process_connect(
     if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return proc_svc::stream_error_response(e);
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
         Ok(b) => b,
@@ -198,8 +212,8 @@ pub(crate) async fn process_list(
 ) -> axum::response::Response {
     // Token gate first, like every other handler: an unauthenticated caller
     // learns nothing about the body parser.
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let parsed: Result<serde_json::Value, _> = read_unary_request(&headers, body).await;
     if let Err(e) = parsed {
@@ -213,8 +227,8 @@ pub(crate) async fn process_send_signal(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let req: crate::process::wire::SendSignalRequest =
         match read_unary_request(&headers, body).await {
@@ -229,8 +243,8 @@ pub(crate) async fn process_send_input(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let req: crate::process::wire::SendInputRequest = match read_unary_request(&headers, body).await
     {
@@ -245,8 +259,8 @@ pub(crate) async fn process_close_stdin(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let req: crate::process::wire::CloseStdinRequest =
         match read_unary_request(&headers, body).await {
@@ -266,8 +280,8 @@ pub(crate) async fn process_stream_input(
     if let Err(e) = protocol::check_json_codec(&headers) {
         return proc_svc::stream_error_response(e);
     }
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return proc_svc::stream_error_response(e);
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
 
     let mut chunks = body.into_data_stream();
@@ -317,8 +331,8 @@ pub(crate) async fn process_update(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let req: crate::process::wire::UpdateRequest = match read_unary_request(&headers, body).await {
         Ok(r) => r,
@@ -344,8 +358,8 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(&T, &User) -> Result<serde_json::Value, ConnectError> + Send + 'static,
 {
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let req: T = match read_unary_request(&headers, body).await {
         Ok(r) => r,
@@ -437,8 +451,8 @@ pub(crate) async fn fs_watch_dir(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    if let Err(e) = rpc_token_check(&state.config, &headers) {
-        return e.into_response();
+    if let Some(resp) = rpc_token_check(&state.config, &headers) {
+        return resp;
     }
     let req: crate::filesystem::wire::WatchDirRequest =
         match read_unary_request(&headers, body).await {
@@ -463,8 +477,8 @@ macro_rules! watch_unary {
             headers: HeaderMap,
             body: axum::body::Body,
         ) -> axum::response::Response {
-            if let Err(e) = rpc_token_check(&state.config, &headers) {
-                return e.into_response();
+            if let Some(resp) = rpc_token_check(&state.config, &headers) {
+                return resp;
             }
             let req: $req = match read_unary_request(&headers, body).await {
                 Ok(r) => r,

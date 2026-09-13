@@ -43,8 +43,18 @@ pub(crate) fn resolve_request_user(
 }
 
 pub(crate) fn check_token_rest(config: &Config, headers: &HeaderMap) -> Result<(), RestError> {
-    let token = headers.get("x-access-token").and_then(|v| v.to_str().ok());
-    config
-        .check_access_token(token)
-        .map_err(|_| RestError::new(StatusCode::UNAUTHORIZED, "invalid access token".to_string()))
+    // `/files` is excluded from upstream's auth middleware so its handler can
+    // accept a request signature instead of the token; the two failure shapes
+    // therefore carry `validateSigning`'s wording, not the middleware's.
+    match config.token_failure(headers.get("x-access-token").and_then(|v| v.to_str().ok())) {
+        None => Ok(()),
+        Some(crate::platform::config::TokenFailure::Missing) => Err(RestError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing signature query parameter".to_string(),
+        )),
+        Some(crate::platform::config::TokenFailure::Mismatch) => Err(RestError::new(
+            StatusCode::UNAUTHORIZED,
+            "access token present in header but does not match".to_string(),
+        )),
+    }
 }

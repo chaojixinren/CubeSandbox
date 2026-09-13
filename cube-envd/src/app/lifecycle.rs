@@ -223,8 +223,10 @@ pub(crate) fn parse_rfc3339_nanos(raw: &str) -> Option<i64> {
 
 /// GET /envs — the accumulated env-var store (includes E2B_SANDBOX).
 pub async fn envs(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    if check_token(&state.config, &headers).is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if token_failure(&state.config, &headers).is_some() {
+        // Protected by upstream's middleware, like every non-excluded path.
+        return crate::protocol::RestError::new(StatusCode::UNAUTHORIZED, MIDDLEWARE_UNAUTHORIZED)
+            .into_response();
     }
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -238,14 +240,42 @@ pub(crate) fn no_store(status: StatusCode) -> impl IntoResponse {
     (status, [(axum::http::header::CACHE_CONTROL, "no-store")])
 }
 
-pub(crate) fn check_token(config: &Config, headers: &HeaderMap) -> Result<(), ()> {
-    let token = headers.get("x-access-token").and_then(|v| v.to_str().ok());
-    config.check_access_token(token)
+pub(crate) use crate::platform::config::MIDDLEWARE_UNAUTHORIZED;
+
+/// Thin wrapper so the call sites read the same either way.
+pub(crate) fn token_failure(
+    config: &Config,
+    headers: &HeaderMap,
+) -> Option<crate::platform::config::TokenFailure> {
+    config.token_failure(headers.get("x-access-token").and_then(|v| v.to_str().ok()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/files` needs to tell "no token sent" from "wrong token"; every other
+    /// path uses one message, but both must be distinguishable here.
+    #[test]
+    fn token_failure_distinguishes_missing_from_mismatch() {
+        let config = Config::new();
+        let empty = HeaderMap::new();
+        assert_eq!(token_failure(&config, &empty), None);
+        config.set_access_token("secret".into());
+        assert_eq!(
+            token_failure(&config, &empty),
+            Some(crate::platform::config::TokenFailure::Missing)
+        );
+        let mut wrong = HeaderMap::new();
+        wrong.insert("x-access-token", "nope".parse().unwrap());
+        assert_eq!(
+            token_failure(&config, &wrong),
+            Some(crate::platform::config::TokenFailure::Mismatch)
+        );
+        let mut right = HeaderMap::new();
+        right.insert("x-access-token", "secret".parse().unwrap());
+        assert_eq!(token_failure(&config, &right), None);
+    }
 
     #[test]
     fn parse_rfc3339_nanos_basics() {
