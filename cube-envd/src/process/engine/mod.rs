@@ -14,7 +14,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{broadcast, oneshot, Notify};
+use tokio::sync::{oneshot, Notify};
+
+use crate::process::{OutputBus, Subscription};
 
 mod child;
 mod cleanup;
@@ -33,16 +35,16 @@ pub use pty::spawn_pty;
 #[derive(Debug)]
 pub struct SpawnedProcess {
     pub pid: u32,
-    /// First subscriber on the process's output bus. Created before the pump
-    /// task is spawned so it never misses an early event (a broadcast receiver
-    /// sees only events published after it subscribes — there is no replay of
-    /// pre-subscription history). `Connect` attaches a later subscriber via
+    /// First subscription on the process's output bus. Created before the pump
+    /// task is spawned so it never misses an early event (a subscription sees
+    /// only events published after it attaches — there is no replay of earlier
+    /// history). `Connect` attaches a later subscription via
     /// `sender.subscribe()`; the pump task keeps the bus alive for the child's
     /// whole lifetime.
-    pub initial: broadcast::Receiver<PumpEvent>,
-    /// A clone of the bus's Sender, kept so `Connect` can hand a fresh
-    /// receiver to an Nth subscriber attaching to a running process.
-    pub sender: broadcast::Sender<PumpEvent>,
+    pub initial: Subscription,
+    /// The bus handle, kept so `Connect` can attach an Nth subscription to a
+    /// running process.
+    pub sender: Arc<OutputBus>,
     /// A duplicate of the pty master fd (None for a pipe-spawned process),
     /// kept so `Update` can resize the window while the pump owns the original.
     pub pty_master: Option<std::fs::File>,
@@ -55,8 +57,8 @@ pub struct SpawnedProcess {
     pub completion: oneshot::Receiver<()>,
     /// Terminal event cache shared with the process table. A Connect racing
     /// with terminal publication can use this cache to receive the complete
-    /// End/SpawnError event instead of subscribing after the broadcast head
-    /// and observing a bare channel close.
+    /// End/SpawnError event instead of attaching after the terminal event was
+    /// published and observing a bare channel close.
     pub terminal: Arc<std::sync::Mutex<Option<PumpEvent>>>,
     /// Fired immediately after `child.wait()` returns, before output-drain
     /// grace. Deadline supervision uses this signal so a child that exited

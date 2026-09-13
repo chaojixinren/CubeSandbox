@@ -4,15 +4,13 @@
 //! Process event encoding and attachment termination policy.
 
 use bytes::Bytes;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
+use crate::process::bus::{next_delivery, BusError, Delivery};
 use crate::process::engine;
 use crate::process::wire::{Event, EventEnvelope, StartEvent};
 use crate::protocol;
-use crate::protocol::stream::{
-    next_delivery, terminal_frame, try_send_data_frame, try_send_terminal_frame, Delivery,
-};
+use crate::protocol::stream::{terminal_frame, try_send_data_frame, try_send_terminal_frame};
 use crate::protocol::{ConnectCode, ConnectError};
 
 pub use crate::protocol::stream::{
@@ -28,14 +26,14 @@ fn event_frame(event: Event) -> Bytes {
 /// Deliver process events without owning the supervised process lifetime.
 pub(crate) async fn drive_stream(
     pid: u32,
-    mut events: broadcast::Receiver<engine::PumpEvent>,
+    mut events: crate::process::Subscription,
     tx: mpsc::Sender<Bytes>,
     keepalive_interval: std::time::Duration,
     stream_deadline: Option<std::time::Duration>,
 ) {
     // The producer is dropped immediately on backpressure or disconnect.
     // Process lifetime is owned by the separate supervisor, so this task
-    // never needs to retain a dead HTTP client's broadcast subscription.
+    // never needs to retain a dead HTTP client's output subscription.
     let mut output = Some(tx);
     let mut deadline_seen = false;
     if !try_send_data_frame(&mut output, event_frame(Event::Start(StartEvent { pid }))) {
@@ -101,7 +99,7 @@ pub(crate) async fn drive_stream(
                     // both the actual signal and `killedBy: "timeout"`.
                     deadline_seen = true;
                 }
-                Err(RecvError::Lagged(n)) => {
+                Err(BusError::Lagged(n)) => {
                     try_send_terminal_frame(
                         &mut output,
                         protocol::end_stream_error(&ConnectError::new(
@@ -111,7 +109,7 @@ pub(crate) async fn drive_stream(
                     );
                     return;
                 }
-                Err(RecvError::Closed) => {
+                Err(BusError::Closed) | Err(BusError::Evicted) => {
                     let (code, message) = if deadline_seen {
                         (ConnectCode::DeadlineExceeded, "context deadline exceeded")
                     } else {

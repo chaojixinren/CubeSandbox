@@ -9,7 +9,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{broadcast, oneshot, Notify};
+use tokio::sync::{oneshot, Notify};
+
+use crate::process::OutputBus;
 
 use crate::platform::identity::User;
 
@@ -17,7 +19,7 @@ use super::io::{
     decorate_terminal, pump_pty, terminal_after_output, terminal_after_wait, OUTPUT_DRAIN_GRACE,
 };
 use super::spawn::child_pre_exec;
-use super::{InputWriter, PumpEvent, SpawnedProcess};
+use super::{InputWriter, SpawnedProcess};
 
 /// Allocate a pty pair the portable, non-libutil way and return `(master,
 /// slave)`.
@@ -173,10 +175,10 @@ pub fn spawn_pty_with_cgroup(
     let mut child = command.spawn()?;
     let pid = child.id().unwrap_or_default();
 
-    let (tx, initial) = broadcast::channel::<PumpEvent>(64);
-    // A clone kept for `Connect` to subscribe later subscribers; the pump task
-    // moves `tx` itself below.
-    let sender = tx.clone();
+    let (bus, initial) = OutputBus::new();
+    // A clone kept for `Connect` to attach later subscribers; the pump task
+    // moves `bus` itself below.
+    let sender = Arc::clone(&bus);
     let (completion_tx, completion) = oneshot::channel();
     let terminal = Arc::new(std::sync::Mutex::new(None));
     let terminal_for_pump = terminal.clone();
@@ -188,7 +190,7 @@ pub fn spawn_pty_with_cgroup(
     let cgroup_for_pump = cgroup.clone();
 
     tokio::spawn(async move {
-        let output = pump_pty(master, tx.clone());
+        let output = pump_pty(master, Arc::clone(&bus));
         tokio::pin!(output);
         let wait = child.wait();
         tokio::pin!(wait);
@@ -214,7 +216,7 @@ pub fn spawn_pty_with_cgroup(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(terminal.clone());
         drop(slot);
-        let _ = tx.send(terminal);
+        let _ = bus.publish(terminal);
         let _ = completion_tx.send(());
     });
 
@@ -237,6 +239,7 @@ mod tests {
     use super::*;
     use crate::process::engine::spawn::DEFAULT_PATH;
     use crate::process::engine::tests::current_user;
+    use crate::process::engine::PumpEvent;
     use crate::process::wire::EndEvent;
 
     #[tokio::test]

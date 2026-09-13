@@ -15,8 +15,6 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::broadcast;
-
 use crate::platform::lock::lock;
 use crate::process::cgroup::{self, Manager, ProcType};
 use crate::process::engine;
@@ -34,7 +32,7 @@ pub struct ProcEntry {
     pub config: ProcessConfig,
     /// Output bus the pump publishes on. Held so `Connect` can attach a new
     /// subscriber to an already-running process via `sender.subscribe()`.
-    pub sender: broadcast::Sender<engine::PumpEvent>,
+    pub sender: std::sync::Arc<crate::process::OutputBus>,
     /// Duplicate of the pty master fd (None for a pipe-spawned process), kept
     /// so `Update` can resize the window while the pump owns the original.
     pub pty_master: Option<std::fs::File>,
@@ -147,9 +145,9 @@ impl ProcessTable {
     }
 
     /// Cache a terminal event before removing a process entry. Existing
-    /// subscribers still receive it through the broadcast bus; a new
+    /// subscribers still receive it through the output bus; a new
     /// subscriber racing in the removal window receives the cached event via
-    /// a one-shot broadcast channel.
+    /// a one-shot subscription.
     pub fn mark_terminal(&self, handle: ProcHandle, event: engine::PumpEvent) {
         let guard = lock(&self.processes);
         if let Some(entry) = guard.get(&handle) {
@@ -197,14 +195,14 @@ impl ProcessTable {
 
     /// Resolve a selector to a live process and subscribe to its output bus.
     /// `Connect` attaches this way: the fresh `broadcast::Receiver` starts at
-    /// the current head of the ring, so it sees only events published after
-    /// the attach (no replay of history). Resolution mirrors `find_pid` — an
+    /// the moment it attaches, so it sees only events published after that
+    /// (no replay of history). Resolution mirrors `find_pid` — an
     /// explicit pid wins, otherwise the most recent tag match.
     pub fn subscribe(
         &self,
         pid: Option<u32>,
         tag: Option<&str>,
-    ) -> Option<(u32, broadcast::Receiver<engine::PumpEvent>)> {
+    ) -> Option<(u32, crate::process::Subscription)> {
         let guard = lock(&self.processes);
         find_entry(&guard, pid, tag).map(|e| {
             // Subscribe before inspecting the terminal cache. The pump writes
@@ -215,9 +213,10 @@ impl ProcessTable {
             // with a one-shot channel carrying the cached event.
             let receiver = e.sender.subscribe();
             if let Some(terminal) = lock(&e.terminal).clone() {
-                let (sender, receiver) = broadcast::channel(1);
-                let _ = sender.send(terminal);
-                (e.pid, receiver)
+                (
+                    e.pid,
+                    crate::process::OutputBus::subscription_from_event(terminal),
+                )
             } else {
                 (e.pid, receiver)
             }
@@ -253,10 +252,10 @@ impl ProcessTable {
 mod tests {
     use super::*;
 
-    /// Build a ProcEntry with a throwaway broadcast bus — these tests exercise
+    /// Build a ProcEntry with a throwaway output bus — these tests exercise
     /// pid/tag resolution and reaping, never the output bus itself.
     fn proc_entry(pid: u32, tag: Option<&str>) -> ProcEntry {
-        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _rx) = crate::process::OutputBus::with_capacity(4);
         ProcEntry {
             pid,
             tag: tag.map(String::from),
@@ -322,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_resolves_and_skips_pre_attach_history() {
         let s = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let (tx, _rx) = broadcast::channel::<engine::PumpEvent>(4);
+        let (tx, _rx) = crate::process::OutputBus::with_capacity(4);
         let data = |v: &str| {
             engine::PumpEvent::Data(crate::process::wire::DataEvent {
                 stdout: Some(v.into()),
@@ -331,7 +330,10 @@ mod tests {
         };
         // An event published before the attach is history: a Connect subscriber
         // starts at the current ring head and must not see it.
-        assert!(tx.send(data("before")).is_ok());
+        assert_eq!(
+            tx.publish(data("before")),
+            crate::process::bus::PublishOutcome::Published
+        );
 
         s.insert_process(ProcEntry {
             pid: 7,
@@ -355,7 +357,10 @@ mod tests {
         );
 
         // Only the post-attach event is delivered — "before" is not replayed.
-        assert!(tx.send(data("after")).is_ok());
+        assert_eq!(
+            tx.publish(data("after")),
+            crate::process::bus::PublishOutcome::Published
+        );
         match rx.recv().await.expect("post-attach event") {
             engine::PumpEvent::Data(d) => assert_eq!(d.stdout.as_deref(), Some("after")),
             _ => panic!("expected a Data event"),
@@ -369,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_after_terminal_publication_gets_cached_event() {
         let s = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(4);
+        let (sender, _rx) = crate::process::OutputBus::with_capacity(4);
         let handle = s.insert_process(ProcEntry {
             pid: 9,
             tag: Some("finished".into()),
@@ -417,7 +422,7 @@ mod tests {
 
         // A live process whose "pty" is not a terminal → ioctl fails → Io.
         let not_a_tty = std::fs::File::open("/dev/null").unwrap();
-        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _rx) = crate::process::OutputBus::with_capacity(4);
         s.insert_process(ProcEntry {
             pid: 8,
             tag: Some("bad-pty".into()),

@@ -9,8 +9,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 #[cfg(test)]
-use tokio::sync::broadcast;
-#[cfg(test)]
 use tokio::sync::mpsc;
 
 use super::metadata;
@@ -133,7 +131,7 @@ pub fn start(
         }
     };
     // PTY vs pipe spawn differ only in the stdio plumbing; everything
-    // downstream (broadcast pump → drive_stream) is identical because the pty
+    // downstream (output pump → drive_stream) is identical because the pty
     // master publishes the same `DataEvent { pty }` onto the same bus.
     let spawn_once = |cgroup_fd, cgroup_for_spawn: Option<Arc<cgroup::ProcessCgroup>>| {
         if let Some(pty) = &req.pty {
@@ -649,9 +647,9 @@ mod tests {
     ) -> (
         u32,
         crate::process::table::ProcHandle,
-        broadcast::Receiver<engine::PumpEvent>,
+        crate::process::Subscription,
         tokio::sync::oneshot::Receiver<()>,
-        broadcast::Sender<engine::PumpEvent>,
+        std::sync::Arc<crate::process::OutputBus>,
         Arc<tokio::sync::Notify>,
         Arc<std::sync::Mutex<Option<String>>>,
     ) {
@@ -697,7 +695,7 @@ mod tests {
     fn list_shape() {
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
         assert_eq!(list(&table), serde_json::json!({}));
-        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _rx) = crate::process::OutputBus::new();
         table.insert_process(ProcEntry {
             pid: 7,
             tag: Some("t".into()),
@@ -835,7 +833,7 @@ mod tests {
             ConnectCode::NotFound
         );
         // Missing pty on a live process is a silent no-op success, not an error.
-        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _rx) = crate::process::OutputBus::new();
         table.insert_process(ProcEntry {
             pid: 7,
             tag: Some("t".into()),
@@ -865,7 +863,7 @@ mod tests {
     #[test]
     fn update_non_pty_process_is_internal() {
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _rx) = crate::process::OutputBus::new();
         table.insert_process(ProcEntry {
             pid: 7,
             tag: None,
@@ -1040,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_driver_exits_when_response_receiver_disconnects() {
-        let (_pub_tx, events) = broadcast::channel::<engine::PumpEvent>(4);
+        let (_pub_tx, events) = crate::process::OutputBus::new();
         let (tx, mut rx) = mpsc::channel::<Bytes>(4);
         let driver = tokio::spawn(drive_stream(
             42,
@@ -1157,7 +1155,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_output_bus_returns_explicit_error_frame() {
-        let (pub_tx, events) = broadcast::channel::<engine::PumpEvent>(4);
+        let (pub_tx, events) = crate::process::OutputBus::new();
         let (tx, mut rx) = mpsc::channel::<Bytes>(4);
         let driver = tokio::spawn(drive_stream(
             42,
@@ -1431,7 +1429,7 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let (pub_tx, events) = broadcast::channel::<engine::PumpEvent>(4);
+        let (pub_tx, events) = crate::process::OutputBus::new();
         let _handle = table.insert_process(ProcEntry {
             pid: 42,
             tag: None,
@@ -1454,12 +1452,13 @@ mod tests {
             None,
         ));
         tokio::task::yield_now().await;
-        assert!(pub_tx
-            .send(engine::PumpEvent::Data(crate::process::wire::DataEvent {
+        assert_eq!(
+            pub_tx.publish(engine::PumpEvent::Data(crate::process::wire::DataEvent {
                 stdout: Some("eA==".into()),
                 ..Default::default()
-            }))
-            .is_ok());
+            })),
+            crate::process::bus::PublishOutcome::Published
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         assert!(rx.recv().await.is_some(), "Start frame missing");
@@ -1484,7 +1483,7 @@ mod tests {
 
     #[tokio::test]
     async fn end_event_and_end_stream_share_one_queue_slot() {
-        let (pub_tx, events) = broadcast::channel::<engine::PumpEvent>(4);
+        let (pub_tx, events) = crate::process::OutputBus::new();
         let (tx, mut rx) = mpsc::channel::<Bytes>(2);
         let driver = tokio::spawn(drive_stream(
             42,
@@ -1494,8 +1493,8 @@ mod tests {
             None,
         ));
         tokio::task::yield_now().await;
-        assert!(pub_tx
-            .send(engine::PumpEvent::End(crate::process::wire::EndEvent {
+        assert_eq!(
+            pub_tx.publish(engine::PumpEvent::End(crate::process::wire::EndEvent {
                 exit_code: 0,
                 exited: true,
                 status: "exit status 0".into(),
@@ -1503,8 +1502,9 @@ mod tests {
                 signal: None,
                 oom_killed: None,
                 killed_by: None,
-            }))
-            .is_ok());
+            })),
+            crate::process::bus::PublishOutcome::Published
+        );
         driver.await.unwrap();
 
         let start = rx.recv().await.expect("Start queue item");
@@ -1525,7 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn stream_input_requires_start_and_reuses_selected_writer() {
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let (sender, _events) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _events) = crate::process::OutputBus::new();
         table.insert_process(ProcEntry {
             pid: 7,
             tag: Some("shell".into()),
@@ -1572,7 +1572,7 @@ mod tests {
     #[tokio::test]
     async fn input_oneof_validation_reports_unimplemented() {
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let (sender, _events) = broadcast::channel::<engine::PumpEvent>(1);
+        let (sender, _events) = crate::process::OutputBus::new();
         let pid = table.insert_process(ProcEntry {
             pid: 8,
             tag: None,
@@ -1611,15 +1611,21 @@ mod tests {
         // Capacity-1 ring: publishing two events before the driver reads any
         // overflows the ring, so its first recv() reports Lagged instead of
         // delivering the overwritten event.
-        let (pub_tx, events) = broadcast::channel::<engine::PumpEvent>(1);
+        let (pub_tx, events) = crate::process::OutputBus::with_capacity(1);
         let data = |s: &str| {
             engine::PumpEvent::Data(crate::process::wire::DataEvent {
                 stdout: Some(s.into()),
                 ..Default::default()
             })
         };
-        assert!(pub_tx.send(data("a")).is_ok());
-        assert!(pub_tx.send(data("b")).is_ok());
+        assert_eq!(
+            pub_tx.publish(data("a")),
+            crate::process::bus::PublishOutcome::Published
+        );
+        assert_eq!(
+            pub_tx.publish(data("b")),
+            crate::process::bus::PublishOutcome::Published
+        );
 
         let (tx, mut rx) = mpsc::channel::<Bytes>(16);
         let driver = tokio::spawn(async move {

@@ -8,8 +8,7 @@
 //! Callers retain ownership of service lifetimes and terminal-event policy.
 
 use bytes::Bytes;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::protocol;
 use crate::protocol::{ConnectCode, ConnectError};
@@ -58,33 +57,6 @@ pub(crate) fn terminal_frame(message: Bytes, trailer: Bytes) -> Bytes {
     Bytes::from(frames)
 }
 
-/// A transport event; service-specific payloads and error policy stay opaque.
-pub(crate) enum Delivery<T> {
-    Event(Result<T, RecvError>),
-    Disconnected,
-    Keepalive,
-    Deadline,
-}
-
-/// Select the next broadcast, disconnect or timer event without waiting for
-/// HTTP queue capacity. The caller may disable its attachment deadline while
-/// awaiting an already-announced terminal event. Returning Disconnected lets
-/// the caller immediately drop its subscription and other attachment resources.
-pub(crate) async fn next_delivery<T: Clone>(
-    events: &mut broadcast::Receiver<T>,
-    output: &mpsc::Sender<Bytes>,
-    keepalive: &mut tokio::time::Interval,
-    deadline: impl std::future::Future<Output = ()>,
-    deadline_enabled: bool,
-) -> Delivery<T> {
-    tokio::select! {
-        _ = output.closed() => Delivery::Disconnected,
-        event = events.recv() => Delivery::Event(event),
-        _ = keepalive.tick() => Delivery::Keepalive,
-        _ = deadline, if deadline_enabled => Delivery::Deadline,
-    }
-}
-
 /// Never await HTTP response capacity from a stream driver. One queue slot
 /// is reserved for the terminal error: when ordinary output reaches that
 /// boundary, close only this connection with an explicit resource_exhausted
@@ -126,124 +98,6 @@ pub(crate) fn try_send_terminal_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn quiet_interval() -> tokio::time::Interval {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.reset();
-        interval
-    }
-
-    #[tokio::test]
-    async fn broadcast_delivery_is_independent_of_process_events() {
-        let (publisher, mut events) = broadcast::channel(1);
-        let (output, _body) = response_channel();
-        let mut interval = quiet_interval();
-        publisher.send("created").unwrap();
-        publisher.send("modified").unwrap();
-        assert!(matches!(
-            next_delivery(
-                &mut events,
-                &output,
-                &mut interval,
-                std::future::pending(),
-                true
-            )
-            .await,
-            Delivery::Event(Err(RecvError::Lagged(1)))
-        ));
-        assert!(matches!(
-            next_delivery(
-                &mut events,
-                &output,
-                &mut interval,
-                std::future::pending(),
-                true
-            )
-            .await,
-            Delivery::Event(Ok("modified"))
-        ));
-        drop(publisher);
-        assert!(matches!(
-            next_delivery(
-                &mut events,
-                &output,
-                &mut interval,
-                std::future::pending(),
-                true
-            )
-            .await,
-            Delivery::Event(Err(RecvError::Closed))
-        ));
-    }
-
-    #[tokio::test]
-    async fn body_disconnect_wakes_idle_driver_and_releases_subscription() {
-        let (publisher, mut events) = broadcast::channel::<&str>(1);
-        let (output, body) = response_channel();
-        let driver = tokio::spawn(async move {
-            let mut interval = quiet_interval();
-            assert!(matches!(
-                next_delivery(
-                    &mut events,
-                    &output,
-                    &mut interval,
-                    std::future::pending(),
-                    true
-                )
-                .await,
-                Delivery::Disconnected
-            ));
-        });
-        drop(body);
-        tokio::time::timeout(std::time::Duration::from_secs(1), driver)
-            .await
-            .expect("idle attachment retained after body drop")
-            .unwrap();
-        assert_eq!(publisher.receiver_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn delivery_preserves_keepalive_and_deadline_gating() {
-        let (publisher, mut events) = broadcast::channel(1);
-        let (output, _body) = response_channel();
-        // An interval's initial tick is ready without waiting on wall-clock time.
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        assert!(matches!(
-            next_delivery(
-                &mut events,
-                &output,
-                &mut interval,
-                std::future::pending(),
-                true
-            )
-            .await,
-            Delivery::Keepalive
-        ));
-        interval.reset();
-        assert!(matches!(
-            next_delivery(
-                &mut events,
-                &output,
-                &mut interval,
-                std::future::ready(()),
-                true
-            )
-            .await,
-            Delivery::Deadline
-        ));
-        publisher.send("terminal").unwrap();
-        assert!(matches!(
-            next_delivery(
-                &mut events,
-                &output,
-                &mut interval,
-                std::future::ready(()),
-                false
-            )
-            .await,
-            Delivery::Event(Ok("terminal"))
-        ));
-    }
 
     #[tokio::test]
     async fn full_response_queue_reserves_an_explicit_error_trailer() {

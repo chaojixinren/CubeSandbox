@@ -8,7 +8,9 @@ use std::os::fd::RawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{broadcast, oneshot, Notify};
+use tokio::sync::{oneshot, Notify};
+
+use crate::process::OutputBus;
 
 use crate::platform::config::Config;
 use crate::platform::identity::User;
@@ -18,7 +20,7 @@ use super::cleanup::kill_process_group;
 use super::io::{
     decorate_terminal, pump_pipe, terminal_after_output, terminal_after_wait, OUTPUT_DRAIN_GRACE,
 };
-use super::{InputHandle, InputWriter, PumpEvent, SpawnedProcess};
+use super::{InputHandle, InputWriter, SpawnedProcess};
 
 /// Write this child's pid into `dirfd`'s `cgroup.procs`. Runs in the child
 /// before `execve`, so it must be allocation-free and call only async-signal-safe
@@ -275,17 +277,17 @@ pub fn spawn_with_cgroup(
     // against 0/1 regardless so a bogus pid can never signal envd's own group.
     let pid = child.id().unwrap_or_default();
 
-    // A bounded broadcast (capacity 64) is the per-process output bus: the
-    // pump publishes here and each connection subscribes. A subscriber that
-    // falls behind the ring is dropped on its own `Lagged` error instead of
-    // backpressuring the pump — the cancel-on-overflow shape upstream #3292
-    // recommends, so one stale subscriber can't wedge the whole fan-out.
-    // `initial` is created *before* the pump task so the first subscriber
+    // The per-process output bus (see `process::bus`): the pump publishes here
+    // and each connection holds a subscription. Overflow policy is unchanged in
+    // this commit — a subscriber that falls behind is told on its next `recv`
+    // (`Lagged`) instead of backpressuring the pump — and a later commit turns
+    // that into backpressure plus progress-based eviction.
+    // `initial` is created *before* the pump task so the first subscription
     // never misses an early event.
-    let (tx, initial) = broadcast::channel::<PumpEvent>(64);
-    // A clone kept for `Connect` to subscribe later subscribers; the pump task
-    // moves `tx` itself below.
-    let sender = tx.clone();
+    let (bus, initial) = OutputBus::new();
+    // A clone kept for `Connect` to attach later subscribers; the pump task
+    // moves `bus` itself below.
+    let sender = Arc::clone(&bus);
     let (completion_tx, completion) = oneshot::channel();
     let terminal = Arc::new(std::sync::Mutex::new(None));
     let terminal_for_pump = terminal.clone();
@@ -299,8 +301,8 @@ pub fn spawn_with_cgroup(
     tokio::spawn(async move {
         let output = async {
             tokio::try_join!(
-                pump_pipe(stdout, tx.clone(), false),
-                pump_pipe(stderr, tx.clone(), true)
+                pump_pipe(stdout, Arc::clone(&bus), false),
+                pump_pipe(stderr, Arc::clone(&bus), true)
             )
             .map(|_| ())
         };
@@ -333,7 +335,7 @@ pub fn spawn_with_cgroup(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(terminal.clone());
         drop(slot);
-        let _ = tx.send(terminal);
+        let _ = bus.publish(terminal);
         // Signal completion only after the terminal event is cached and
         // published. This gives the supervisor a race-free handoff point for
         // process-table removal.
@@ -406,6 +408,7 @@ mod tests {
     use super::*;
     use crate::process::engine::spawn_pty;
     use crate::process::engine::tests::current_user;
+    use crate::process::engine::PumpEvent;
     use crate::process::wire::EndEvent;
 
     #[tokio::test]

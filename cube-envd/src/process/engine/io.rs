@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
-use tokio::sync::broadcast;
 
 use crate::process::wire::{DataEvent, EndEvent};
+use crate::process::OutputBus;
 
 const READ_CHUNK: usize = 32 * 1024;
 /// Once the direct child has been reaped, inherited stdout/stderr or PTY
@@ -18,8 +18,8 @@ const READ_CHUNK: usize = 32 * 1024;
 /// daemonized descendants that deliberately retain those descriptors.
 pub(super) const OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// One output event published on a process's broadcast bus. `Clone` because
-/// `broadcast::Sender::send` fans a copy out to every subscriber.
+/// One output event published on a process's output bus. `Clone` because
+/// `OutputBus::publish` fans a copy out to every subscriber.
 #[derive(Clone, Debug)]
 pub enum PumpEvent {
     Data(DataEvent),
@@ -136,7 +136,7 @@ pub(super) fn terminal_after_wait(
 /// on a full pty buffer) but stop encoding.
 pub(super) async fn pump_pty(
     master: AsyncFd<std::fs::File>,
-    tx: broadcast::Sender<PumpEvent>,
+    bus: Arc<OutputBus>,
 ) -> std::io::Result<()> {
     use base64::Engine;
     use std::io::Read;
@@ -153,7 +153,7 @@ pub(super) async fn pump_pty(
                 // A disconnected Start must not permanently disable output
                 // for a later Connect. Skip work while nobody is attached,
                 // but re-check on every read so reattachment resumes delivery.
-                if tx.receiver_count() == 0 {
+                if bus.subscriber_count() == 0 {
                     continue;
                 }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -161,7 +161,7 @@ pub(super) async fn pump_pty(
                     pty: Some(b64),
                     ..Default::default()
                 };
-                let _ = tx.send(PumpEvent::Data(event));
+                bus.publish(PumpEvent::Data(event));
             }
         }
     }
@@ -199,7 +199,7 @@ fn is_pty_eof(error: &std::io::Error) -> bool {
 
 pub(super) async fn pump_pipe<R>(
     pipe: Option<R>,
-    tx: broadcast::Sender<PumpEvent>,
+    bus: Arc<OutputBus>,
     is_stderr: bool,
 ) -> std::io::Result<()>
 where
@@ -214,7 +214,7 @@ where
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
             Ok(n) => {
-                if tx.receiver_count() == 0 {
+                if bus.subscriber_count() == 0 {
                     continue;
                 }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -229,7 +229,7 @@ where
                         ..Default::default()
                     }
                 };
-                let _ = tx.send(PumpEvent::Data(event));
+                bus.publish(PumpEvent::Data(event));
             }
         }
     }
