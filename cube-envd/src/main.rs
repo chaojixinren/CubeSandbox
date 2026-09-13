@@ -65,7 +65,11 @@ fn main() {
             }
         };
         tracing::info!("cube-envd {VERSION} ({COMMIT}) listening on {addr}");
-        if let Err(e) = axum::serve(listener, app).await {
+        // Nagle is on by default and costs a full delayed-ACK round trip on
+        // any response whose head and body leave as separate small writes:
+        // a 4 KiB `/files` download measured 44 ms against 1.6 ms for 1 MiB,
+        // while the Go baseline's `net/http` sets TCP_NODELAY itself.
+        if let Err(e) = axum::serve(listener, app).tcp_nodelay(true).await {
             tracing::error!("server error: {e}");
             std::process::exit(1);
         }
