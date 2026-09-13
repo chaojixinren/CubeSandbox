@@ -45,9 +45,17 @@ pub struct ProcEntry {
     pub cgroup: Option<Arc<cgroup::ProcessCgroup>>,
     /// Shared cause marker consumed by the output pump when it publishes End.
     pub termination: Arc<std::sync::Mutex<Option<String>>>,
-    /// Terminal event published by the output pump. This closes the small
-    /// Connect-vs-exit race where a subscriber could otherwise attach after
-    /// the terminal event and wait forever for a channel close.
+    /// Terminal event published by the output pump. It closes the
+    /// Connect-vs-exit race for subscriptions taken while the entry is still in
+    /// the table: such a subscriber either finds this cached event or is already
+    /// attached when the pump publishes it, so it cannot wait forever for a
+    /// close.
+    ///
+    /// The cache is reachable only through the entry, and the supervisor removes
+    /// the entry as soon as the child is reaped (so a slow reader cannot pin
+    /// process-table cleanup). A `Connect` that arrives after that removal is
+    /// answered with [`BusError::Closed`] rather than a replay of the exit; see
+    /// `supervise_process`.
     pub terminal: Arc<Mutex<Option<engine::PumpEvent>>>,
 }
 
@@ -210,6 +218,8 @@ impl ProcessTable {
                 // race window in which Connect misses the event and later
                 // observes only a closed bus. If the cache was already
                 // populated, hand out a one-shot subscription carrying it.
+                // Either way this only applies while the entry exists: removal
+                // happens at child reap, so a Connect after that is `Closed`.
                 let mut receiver = e.sender.subscribe()?;
                 receiver.watch_terminal_cache(Arc::clone(&e.terminal));
                 if let Some(terminal) = lock(&e.terminal).clone() {

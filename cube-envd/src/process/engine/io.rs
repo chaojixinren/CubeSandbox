@@ -123,6 +123,17 @@ pub(super) fn terminal_after_output(
     }
 }
 
+/// Build the terminal event once the direct child has been reaped.
+///
+/// Known deviation, deliberate: when `stopped_by_grace` is set, whatever is
+/// still in the pipe is dropped and the stream ends with a normal `End` that
+/// carries the child's real exit status. The original drain design asked for an
+/// error trailer whenever data is abandoned. It stays a normal end because the
+/// usual cause is a descendant that inherited the pipe (`cmd &`), and turning a
+/// command that succeeded into an RPC error is worse than losing the tail of
+/// its output; the loss is bounded by one read chunk plus the pipe capacity and
+/// is logged below. A reader that needs the error instead has to decide what
+/// `sh -c 'daemon & echo done'` should return first.
 pub(super) fn terminal_after_wait(
     output_name: &str,
     pid: u32,

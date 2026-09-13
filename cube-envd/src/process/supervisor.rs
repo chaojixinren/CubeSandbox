@@ -44,6 +44,12 @@ pub(crate) async fn supervise_process(
                     table.remove_process(handle);
                     let _ = sender.publish_terminal(error);
                 } else {
+                    // Remove at child reap, not at terminal publication: a
+                    // non-reading client keeps the pump inside `publish_data`
+                    // for up to the eviction window, and cleanup must not wait
+                    // for it. Consequence, accepted: a `Connect` that arrives
+                    // after this removal is answered `Closed` instead of
+                    // replaying the cached exit (see `ProcEntry::terminal`).
                     table.remove_process(handle);
                 }
                 if monitor_ok {
