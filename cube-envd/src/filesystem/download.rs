@@ -135,7 +135,7 @@ pub async fn download(
     if let Some(len) = body_len {
         b = b.header(axum::http::header::CONTENT_LENGTH, len);
     }
-    let stream = reader_stream(file, stream_limit);
+    let stream = reader_stream(file, stream_limit).await;
     b.body(axum::body::Body::from_stream(stream))
         .expect("build download response")
 }
@@ -545,42 +545,193 @@ async fn sniff_content_type(f: &mut tokio::fs::File) -> std::io::Result<&'static
     }
 }
 
-/// Read size for a download body. Every chunk costs one read syscall, one
-/// allocation and (in the sandbox) one deep wakeup, and those per-chunk costs
-/// are what a download is actually limited by there — the same effect the
-/// process-stream read chunk fixes. Go gets a zero-copy `sendfile` here, which
-/// cube-envd's body stream cannot use, so it buys the equivalent by making the
-/// copies few and large instead. Only the chunking changes: total bytes,
-/// `Content-Length` and range boundaries are unaffected.
-const DOWNLOAD_CHUNK: usize = 256 * 1024;
+/// Read size for a download body.
+///
+/// A download is limited by per-chunk cost, not bandwidth: each chunk costs a
+/// read syscall, an allocation and (in a sandbox) a wakeup, and Go's
+/// `http.ServeContent` sidesteps all of it with a kernel-side `sendfile` loop
+/// that cube-envd's body stream cannot reach. So this path buys the equivalent
+/// the other way: as few chunks as possible, read and written concurrently,
+/// over recycled buffers.
+///
+/// The size is a memory/syscall trade, not a knee: each doubling halves the
+/// read (and channel-wakeup) syscalls and doubles the buffers in flight. On one
+/// 32 MiB body the daemon's syscall count per download was 343 at 512 KiB, 226
+/// at 1 MiB and 171 at 2 MiB, against 1102 before this change; 1 MiB keeps the
+/// extra memory at ~4 MiB per body in flight while capturing most of the drop.
+/// Only the chunking changes: total bytes, `Content-Length` and range
+/// boundaries are unaffected.
+const DOWNLOAD_CHUNK: usize = 1024 * 1024;
+
+/// How far the blocking reader may run ahead of the socket. Two chunks are
+/// enough to keep the read off the write's critical path; the socket, not the
+/// disk, is the slower side, so a deeper window only costs memory.
+const DOWNLOAD_READ_AHEAD: usize = 2;
+
+/// A read buffer that recycles itself into its pool once the last `Bytes`
+/// slice of it is dropped.
+struct PooledBuffer {
+    pool: ReadPool,
+    buf: Vec<u8>,
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        self.pool.recycle(std::mem::take(&mut self.buf));
+    }
+}
+
+/// Recycled read buffers. Allocating a fresh `DOWNLOAD_CHUNK` buffer per read
+/// costs an `mmap`, a `munmap` and a page-faulting zero-fill of the whole
+/// chunk — under musl that was 278 syscalls per 32 MiB download (142 `mmap` +
+/// 136 `munmap`), a quarter of the whole path's budget. Recycling keeps the
+/// allocation count per body constant instead of per chunk.
+#[derive(Clone)]
+struct ReadPool {
+    free: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    len: usize,
+    /// Buffers kept for reuse: `READ_AHEAD` queued, one being filled by the
+    /// reader and one in flight to the socket.
+    keep: usize,
+}
+
+impl ReadPool {
+    fn new(len: usize) -> ReadPool {
+        let len = len.max(1);
+        ReadPool {
+            free: Default::default(),
+            len,
+            keep: DOWNLOAD_READ_AHEAD + 2,
+        }
+    }
+
+    /// A buffer of at least `len` bytes, reused when one is free.
+    fn take(&self) -> Vec<u8> {
+        let recycled = match self.free.lock() {
+            Ok(mut free) => free.pop(),
+            // A poisoned lock only means some *other* download's body task
+            // panicked; the buffers themselves are plain bytes.
+            Err(poisoned) => poisoned.into_inner().pop(),
+        };
+        recycled.unwrap_or_else(|| vec![0u8; self.len])
+    }
+
+    fn recycle(&self, buf: Vec<u8>) {
+        if buf.len() != self.len {
+            return;
+        }
+        match self.free.lock() {
+            Ok(mut free) => {
+                if free.len() < self.keep {
+                    free.push(buf);
+                }
+            }
+            Err(poisoned) => poisoned.into_inner().push(buf),
+        }
+    }
+
+    /// `Bytes` over the first `n` bytes of `buf`, recycled when dropped.
+    fn bytes(&self, buf: Vec<u8>, n: usize) -> bytes::Bytes {
+        bytes::Bytes::from_owner(PooledBuffer {
+            pool: self.clone(),
+            buf,
+        })
+        .slice(..n)
+    }
+}
 
 /// Chunked reader stream (`DOWNLOAD_CHUNK`) without pulling in tokio-util.
 /// `limit` bounds the total bytes produced (single-range 206 bodies); `None`
 /// streams to EOF.
-fn reader_stream(
-    file: tokio::fs::File,
+///
+/// A body that fits in one chunk keeps the plain single-read shape (one
+/// blocking crossing, no reader thread): the pipeline below only pays off
+/// across several chunks, and small files are the common SDK download. A
+/// larger body is read by one blocking task — a single pool crossing for the
+/// whole body instead of one per chunk, which is what `tokio::fs` charges —
+/// that runs ahead of the socket by up to `DOWNLOAD_READ_AHEAD` recycled
+/// buffers, so the read syscalls happen while the socket is being written
+/// instead of alternating with it.
+async fn reader_stream(
+    mut file: tokio::fs::File,
     limit: Option<u64>,
-) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
+) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
+    use futures::StreamExt;
     use tokio::io::AsyncReadExt;
-    futures::stream::unfold((file, limit), |(mut file, mut remaining)| async move {
-        let want = match remaining {
-            Some(0) => return None,
+
+    if let Some(n) = limit {
+        if n <= DOWNLOAD_CHUNK as u64 {
+            return futures::stream::once(async move {
+                let mut buf = vec![0u8; n as usize];
+                match file.read(&mut buf).await {
+                    // A short read (the file shrank under us) is the whole
+                    // body; an empty one is no body at all, like EOF.
+                    Ok(0) => None,
+                    Ok(read) => {
+                        buf.truncate(read);
+                        Some(Ok(bytes::Bytes::from(buf)))
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .filter_map(futures::future::ready)
+            .boxed();
+        }
+    }
+
+    let pool = ReadPool::new(match limit {
+        Some(n) => (n as usize).min(DOWNLOAD_CHUNK),
+        None => DOWNLOAD_CHUNK,
+    });
+    let (tx, rx) = tokio::sync::mpsc::channel(DOWNLOAD_READ_AHEAD);
+    // `into_std` waits for any in-flight operation on the tokio handle; from
+    // here the reader owns the fd and does plain blocking reads.
+    let std_file = file.into_std().await;
+    tokio::task::spawn_blocking(move || read_ahead(std_file, limit, pool, tx));
+    tokio_stream::wrappers::ReceiverStream::new(rx).boxed()
+}
+
+/// The blocking side of `reader_stream`: sequential reads into pooled buffers,
+/// handed to the socket through a bounded channel (so a slow client stops the
+/// reader instead of growing memory).
+fn read_ahead(
+    mut file: std::fs::File,
+    mut limit: Option<u64>,
+    pool: ReadPool,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) {
+    use std::io::Read;
+    loop {
+        let want = match limit {
+            Some(0) => return,
             Some(r) => r.min(DOWNLOAD_CHUNK as u64) as usize,
             None => DOWNLOAD_CHUNK,
         };
-        let mut buf = vec![0u8; want];
-        match file.read(&mut buf).await {
-            Ok(0) => None,
+        let mut buf = pool.take();
+        match file.read(&mut buf[..want]) {
+            Ok(0) => return,
             Ok(n) => {
-                buf.truncate(n);
-                if let Some(r) = remaining.as_mut() {
+                if let Some(r) = limit.as_mut() {
                     *r -= n as u64;
                 }
-                Some((Ok(bytes::Bytes::from(buf)), (file, remaining)))
+                if tx.blocking_send(Ok(pool.bytes(buf, n))).is_err() {
+                    // The body was dropped (client gone, or the response ended
+                    // early) — stop reading rather than fill the channel.
+                    return;
+                }
             }
-            Err(e) => Some((Err(e), (file, remaining))),
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -588,54 +739,123 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    /// The download stream reads in `DOWNLOAD_CHUNK` pieces. That shape is the
-    /// point of the constant (one syscall, one allocation and one wakeup per
-    /// chunk), and it is invisible to any content assertion, so pin it: a
-    /// regression to small reads would still pass every correctness test and
-    /// only show up as sandbox throughput.
+    /// Deterministic, position-dependent content: a chunk sliced from the
+    /// wrong offset of a pooled buffer still has the right length.
+    fn write_pattern(path: &std::path::Path, size: usize) {
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(path, data).unwrap();
+    }
+
+    async fn collect(
+        file: tokio::fs::File,
+        limit: Option<u64>,
+    ) -> Vec<Result<bytes::Bytes, std::io::Error>> {
+        reader_stream(file, limit).await.collect().await
+    }
+
+    fn total(chunks: &[Result<bytes::Bytes, std::io::Error>]) -> usize {
+        chunks.iter().map(|c| c.as_ref().unwrap().len()).sum()
+    }
+
+    /// The single-chunk arm: one read, one item, exact bytes.
     #[tokio::test]
-    async fn reader_stream_reads_in_large_chunks_and_honours_the_limit() {
+    async fn a_body_that_fits_in_one_chunk_is_one_read() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("payload.bin");
+        let path = dir.path().join("small.bin");
+        let size = 4096;
+        write_pattern(&path, size);
+
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let chunks = collect(file, Some(size as u64)).await;
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks.into_iter().next().unwrap().unwrap();
+        assert_eq!(chunk.len(), size);
+        assert!(chunk.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+    }
+
+    /// The chunking is the point of `DOWNLOAD_CHUNK` and is invisible to any
+    /// content assertion, so pin it: a regression to smaller reads would still
+    /// pass every correctness test and only show up as sandbox throughput.
+    #[tokio::test]
+    async fn a_large_body_reads_in_chunks_and_stops_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
         let size = DOWNLOAD_CHUNK + 4096;
-        std::fs::write(&path, vec![0x5au8; size]).unwrap();
+        write_pattern(&path, size);
 
+        // One full chunk plus the tail, in order.
         let file = tokio::fs::File::open(&path).await.unwrap();
-        let whole: Vec<bytes::Bytes> = reader_stream(file, None)
-            .map(|chunk| chunk.unwrap())
-            .collect()
-            .await;
-        assert_eq!(whole.iter().map(bytes::Bytes::len).sum::<usize>(), size);
-        assert_eq!(whole.len(), 2, "one full chunk plus the tail");
-        assert_eq!(whole[0].len(), DOWNLOAD_CHUNK);
-        assert!(whole.iter().all(|chunk| chunk.len() <= DOWNLOAD_CHUNK));
-        assert!(whole[0].iter().all(|byte| *byte == 0x5a));
+        let chunks = collect(file, Some(size as u64)).await;
+        let lens: Vec<usize> = chunks.iter().map(|c| c.as_ref().unwrap().len()).collect();
+        assert_eq!(lens, vec![DOWNLOAD_CHUNK, 4096]);
+        let all: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|c| c.unwrap().to_vec())
+            .collect();
+        assert_eq!(all.len(), size);
+        assert!(all.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
 
-        // A limit inside one chunk is a single read (206 with a short range).
+        // A limit inside the first chunk is a single read (206 with a short
+        // range).
         let file = tokio::fs::File::open(&path).await.unwrap();
-        let limited: Vec<bytes::Bytes> = reader_stream(file, Some(4096))
-            .map(|chunk| chunk.unwrap())
-            .collect()
-            .await;
+        let limited = collect(file, Some(4096)).await;
         assert_eq!(limited.len(), 1);
-        assert_eq!(limited[0].len(), 4096);
+        assert_eq!(total(&limited), 4096);
 
-        // A limit crossing a chunk boundary stops exactly at the limit.
+        // A limit crossing the chunk boundary stops exactly at the limit.
         let file = tokio::fs::File::open(&path).await.unwrap();
-        let crossed: usize = reader_stream(file, Some(DOWNLOAD_CHUNK as u64 + 10))
-            .map(|chunk| chunk.unwrap().len())
-            .collect::<Vec<_>>()
-            .await
-            .iter()
-            .sum();
-        assert_eq!(crossed, DOWNLOAD_CHUNK + 10);
+        let crossed = collect(file, Some(DOWNLOAD_CHUNK as u64 + 10)).await;
+        assert_eq!(total(&crossed), DOWNLOAD_CHUNK + 10);
 
         // An exhausted limit reads nothing at all.
         let file = tokio::fs::File::open(&path).await.unwrap();
-        let empty: Vec<bytes::Bytes> = reader_stream(file, Some(0))
-            .map(|chunk| chunk.unwrap())
-            .collect()
-            .await;
-        assert!(empty.is_empty());
+        assert!(collect(file, Some(0)).await.is_empty());
+
+        // No limit streams to EOF.
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        assert_eq!(total(&collect(file, None).await), size);
+    }
+
+    /// A read error reaches the body instead of ending the stream silently.
+    /// Reading a directory fd fails with EISDIR; the limit forces the
+    /// pipelined reader.
+    #[tokio::test]
+    async fn read_errors_are_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tokio::fs::File::open(dir.path()).await.unwrap();
+        let chunks = collect(file, Some(DOWNLOAD_CHUNK as u64 + 1)).await;
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks.into_iter().next().unwrap().is_err());
+    }
+
+    /// The pool is what keeps a 1 MiB chunk from paying an allocation per
+    /// read; pin both halves of it (recycle on last drop, and stay bounded).
+    #[test]
+    fn pooled_buffers_recycle_and_the_pool_stays_bounded() {
+        let pool = ReadPool::new(64);
+        let bytes = pool.bytes(pool.take(), 8);
+        assert_eq!(bytes.len(), 8);
+        let live = bytes.clone();
+        drop(bytes);
+        assert_eq!(
+            pool.free.lock().unwrap().len(),
+            0,
+            "a live slice keeps the buffer out of the pool"
+        );
+        drop(live);
+        assert_eq!(
+            pool.free.lock().unwrap().len(),
+            1,
+            "the last slice recycles the buffer"
+        );
+        let held: Vec<bytes::Bytes> = (0..(DOWNLOAD_READ_AHEAD + 4))
+            .map(|_| pool.bytes(pool.take(), 1))
+            .collect();
+        drop(held);
+        assert_eq!(
+            pool.free.lock().unwrap().len(),
+            pool.keep,
+            "surplus buffers are dropped instead of retained"
+        );
     }
 }
