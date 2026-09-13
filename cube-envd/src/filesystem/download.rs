@@ -646,19 +646,60 @@ impl ReadPool {
     }
 }
 
+/// Prefetch budget: `DOWNLOAD_PREFETCH` permits shared by every in-flight large
+/// body (a follow-up derives this from the configurable pool size). A permit buys the *blocking* producer — one
+/// pool crossing for the whole body, which is the fast shape — and is held
+/// until that body ends, so at most that many blocking threads can ever be
+/// pinned by downloads, leaving the rest of the pool to process reaping,
+/// uploads and filesystem RPCs. Without a permit a body falls back to the
+/// async producer: a little slower per chunk, but it parks on the channel
+/// instead of on a thread, which is what keeps a stalled client from starving
+/// the pool. See `reader_stream_with` for why both producers exist.
+static PREFETCH_BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+/// How many bodies may use the blocking producer. A quarter of the default
+/// 64-thread pool: downloads are the only user that holds a pool thread for the
+/// whole duration of a client stall, so everything else (`spawn` reaping,
+/// uploads, filesystem RPCs) keeps the rest.
+const DOWNLOAD_PREFETCH: usize = 16;
+
+fn prefetch_budget() -> std::sync::Arc<tokio::sync::Semaphore> {
+    PREFETCH_BUDGET
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_PREFETCH)))
+        .clone()
+}
+
 /// Chunked reader stream (`DOWNLOAD_CHUNK`) without pulling in tokio-util.
 /// `limit` bounds the total bytes produced (single-range 206 bodies); `None`
 /// streams to EOF.
+async fn reader_stream(
+    file: tokio::fs::File,
+    limit: Option<u64>,
+) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
+    reader_stream_with(prefetch_budget(), file, limit).await
+}
+
+/// The body pipeline, with the prefetch budget passed in so tests can drive
+/// the blocking/async split without the process-wide semaphore.
 ///
 /// A body that fits in one chunk keeps the plain single-read shape (one
-/// blocking crossing, no reader thread): the pipeline below only pays off
-/// across several chunks, and small files are the common SDK download. A
-/// larger body is read by one blocking task — a single pool crossing for the
-/// whole body instead of one per chunk, which is what `tokio::fs` charges —
-/// that runs ahead of the socket by up to `DOWNLOAD_READ_AHEAD` recycled
-/// buffers, so the read syscalls happen while the socket is being written
-/// instead of alternating with it.
-async fn reader_stream(
+/// blocking crossing, no permit and no producer task): the pipeline below only
+/// pays off across several chunks, and small files are the common SDK
+/// download. A larger body is read ahead of the socket by up to
+/// `DOWNLOAD_READ_AHEAD` recycled buffers, so the read syscalls happen while
+/// the socket is being written instead of alternating with it.
+///
+/// Which producer runs depends on the budget: both deliver the same bytes, and
+/// the difference is only what a *stalled* client costs. The blocking one runs
+/// the whole body on one pool thread (`spawn_blocking` + plain reads, no
+/// per-chunk crossing) and therefore holds that thread until the body ends;
+/// the async one crosses the pool per read and parks on the channel while the
+/// client is not reading. The budget caps how many bodies may pay the first
+/// price, so a burst of stalled downloads degrades the extra ones to the
+/// second price instead of consuming every thread the rest of the daemon needs.
+async fn reader_stream_with(
+    budget: std::sync::Arc<tokio::sync::Semaphore>,
     mut file: tokio::fs::File,
     limit: Option<u64>,
 ) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
@@ -690,21 +731,34 @@ async fn reader_stream(
         None => DOWNLOAD_CHUNK,
     });
     let (tx, rx) = tokio::sync::mpsc::channel(DOWNLOAD_READ_AHEAD);
-    // `into_std` waits for any in-flight operation on the tokio handle; from
-    // here the reader owns the fd and does plain blocking reads.
-    let std_file = file.into_std().await;
-    tokio::task::spawn_blocking(move || read_ahead(std_file, limit, pool, tx));
+    match budget.try_acquire_owned() {
+        // Never `acquire().await`: waiting for a permit would turn a saturated
+        // budget into head-of-line blocking behind a stalled body. Degrading to
+        // the async producer is slower but bounded.
+        Ok(permit) => {
+            // `into_std` waits for any in-flight operation on the tokio handle;
+            // from here the producer owns the fd and does plain blocking reads.
+            let std_file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                read_ahead_blocking(std_file, limit, pool, tx, permit)
+            });
+        }
+        Err(_) => {
+            tokio::spawn(read_ahead(file, limit, pool, tx));
+        }
+    }
     tokio_stream::wrappers::ReceiverStream::new(rx).boxed()
 }
 
-/// The blocking side of `reader_stream`: sequential reads into pooled buffers,
-/// handed to the socket through a bounded channel (so a slow client stops the
-/// reader instead of growing memory).
-fn read_ahead(
+/// The budgeted (fast) producer: one pool crossing for the whole body, plain
+/// blocking reads. Holds `_permit` until the body ends, which is what makes the
+/// budget a bound on *pinned threads* rather than on a rate.
+fn read_ahead_blocking(
     mut file: std::fs::File,
     mut limit: Option<u64>,
     pool: ReadPool,
     tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     use std::io::Read;
     loop {
@@ -728,6 +782,43 @@ fn read_ahead(
             }
             Err(e) => {
                 let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        }
+    }
+}
+
+/// The unbudgeted (fallback) producer: the same loop, but it must not hold a
+/// pool thread while the client is not reading, so it awaits both the read and
+/// the send. Same bytes, same channel, same buffers.
+async fn read_ahead(
+    mut file: tokio::fs::File,
+    mut limit: Option<u64>,
+    pool: ReadPool,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let want = match limit {
+            Some(0) => return,
+            Some(r) => r.min(DOWNLOAD_CHUNK as u64) as usize,
+            None => DOWNLOAD_CHUNK,
+        };
+        let mut buf = pool.take();
+        match file.read(&mut buf[..want]).await {
+            Ok(0) => return,
+            Ok(n) => {
+                if let Some(r) = limit.as_mut() {
+                    *r -= n as u64;
+                }
+                if tx.send(Ok(pool.bytes(buf, n))).await.is_err() {
+                    // The body was dropped (client gone, or the response ended
+                    // early) — stop reading rather than fill the channel.
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
                 return;
             }
         }
@@ -856,6 +947,104 @@ mod tests {
             pool.free.lock().unwrap().len(),
             pool.keep,
             "surplus buffers are dropped instead of retained"
+        );
+    }
+
+    /// The pipeline's only new failure mode: the client goes away mid-body.
+    /// Dropping the body drops the receiver, the producer's `send` fails, and
+    /// the task must end with every buffer back in the pool. This is also the
+    /// property that keeps a stalled download off the shared blocking pool:
+    /// the producer parks on the channel, never on a thread.
+    #[tokio::test]
+    async fn dropping_the_body_stops_the_producer_and_recycles_its_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let size = DOWNLOAD_CHUNK * 4;
+        write_pattern(&path, size);
+
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let pool = ReadPool::new(DOWNLOAD_CHUNK);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(DOWNLOAD_READ_AHEAD);
+        let producer = tokio::spawn(read_ahead(file, Some(size as u64), pool.clone(), tx));
+
+        // Taking `READ_AHEAD + 1` chunks proves the producer ran and had
+        // `READ_AHEAD` more queued or in hand; then the client "disconnects" by
+        // dropping the receiver.
+        let mut taken = Vec::new();
+        for _ in 0..=DOWNLOAD_READ_AHEAD {
+            let chunk = rx.recv().await.expect("chunk").unwrap();
+            assert_eq!(chunk.len(), DOWNLOAD_CHUNK);
+            taken.push(chunk);
+        }
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), producer)
+            .await
+            .expect("the producer must stop once the body is dropped")
+            .expect("the producer task must not panic");
+
+        drop(taken);
+        let free = pool.free.lock().unwrap().len();
+        assert!(
+            free > DOWNLOAD_READ_AHEAD && free <= pool.keep,
+            "every buffer came back and the pool did not grow (free = {free}, keep = {})",
+            pool.keep
+        );
+    }
+
+    /// The budget is what keeps downloads from pinning the whole blocking pool:
+    /// one permit per *blocking* producer, held for the life of that body, and
+    /// the next body degrades to the async producer instead of queueing behind
+    /// a permit a stalled client may hold forever.
+    #[tokio::test]
+    async fn the_prefetch_budget_bounds_blocking_producers_and_returns_permits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        // Long enough that the producer fills the channel and parks in
+        // `send`, which is exactly the stalled-client shape: with a short body
+        // it would finish and give the permit back on its own.
+        let size = DOWNLOAD_CHUNK * (DOWNLOAD_READ_AHEAD + 4);
+        write_pattern(&path, size);
+
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        // Not polled on purpose: this body stands in for a stalled client, so
+        // it keeps its permit for as long as it is alive.
+        let stalled = reader_stream_with(
+            std::sync::Arc::clone(&budget),
+            tokio::fs::File::open(&path).await.unwrap(),
+            Some(size as u64),
+        )
+        .await;
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "the blocking producer took the only permit"
+        );
+
+        // With the budget exhausted the next body must still produce the exact
+        // bytes, through the async producer.
+        let degraded = reader_stream_with(
+            std::sync::Arc::clone(&budget),
+            tokio::fs::File::open(&path).await.unwrap(),
+            Some(size as u64),
+        )
+        .await;
+        let chunks = degraded.collect::<Vec<_>>().await;
+        assert_eq!(total(&chunks), size);
+        assert_eq!(budget.available_permits(), 0, "the fallback took no permit");
+
+        // Ending (or dropping) the stalled body gives its permit back, so the
+        // next download gets the fast producer again.
+        drop(stalled);
+        for _ in 0..200 {
+            if budget.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            budget.available_permits(),
+            1,
+            "the permit must come back when the body ends"
         );
     }
 }
