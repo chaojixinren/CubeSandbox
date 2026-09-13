@@ -382,6 +382,34 @@ def cap_rest():
          "Content-Type: application/octet-stream\r\n\r\n").encode() + b"ignored" +
         f"\r\n--{boundary}--\r\n".encode(),
         {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+    # a part with a filename but no `name`: Go's FormName() returns "" (no
+    # default), so handlePart skips it and nothing is written
+    record("rest_files_upload_multipart_unnamed_part", http_req(
+        "POST", "/files?username=user",
+        (f"--{boundary}\r\n"
+         'Content-Disposition: form-data; filename="/home/user/unnamed.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\n").encode() + b"unnamed" +
+        f"\r\n--{boundary}--\r\n".encode(),
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+    record("rest_files_download_unnamed_part_absent", http_req(
+        "GET", "/files?path=/home/user/unnamed.bin&username=user"))
+    # the same path twice in one body: rejected, first write kept, and the
+    # message lists the other uploaded paths the way upstream joins them
+    record("rest_files_upload_multipart_duplicate_path", http_req(
+        "POST", "/files?username=user",
+        (f"--{boundary}\r\n"
+         'Content-Disposition: form-data; name="file"; filename="/home/user/dup-a.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\ndup-a\r\n"
+         f"--{boundary}\r\n"
+         'Content-Disposition: form-data; name="file"; filename="/home/user/dup-b.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\ndup-b\r\n"
+         f"--{boundary}\r\n"
+         'Content-Disposition: form-data; name="file"; filename="/home/user/dup-a.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\ndup-a-again\r\n"
+         f"--{boundary}--\r\n").encode(),
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+    record("rest_files_download_duplicate_path_first_kept", http_req(
+        "GET", "/files?path=/home/user/dup-a.bin&username=user"))
     # an unsupported content type is a 400 that never touches the body
     record("rest_files_upload_unsupported_type", http_req(
         "POST", "/files?path=/home/user/base_d.bin&username=user",

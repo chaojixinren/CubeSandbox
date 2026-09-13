@@ -178,7 +178,8 @@ load-bearing ones, and why cube-envd differs:
   `multipart/*` subtype takes the multipart path, and anything else — a missing
   header included — is `400 unsupported content type: …`, rejected without
   reading the body. Inside a multipart body only parts whose **field name** is
-  `file` are uploads (Go's `FormName()` defaults an absent name to `"file"`);
+  exactly `file` are uploads — Go's `FormName()` returns the `name` parameter
+  with no default, so a part with a filename but no name is a form field too;
   the **`?path` query wins when present**, and the part's filename is only the
   fallback, used verbatim rather than `filepath.Base`
   (`upload.go resolvePath`). A second part resolving to the same path is
@@ -196,6 +197,14 @@ load-bearing ones, and why cube-envd differs:
   in the startup log. `X-Envd-Version`, the header later E2B daemons answer on
   `POST /init`, is deliberately absent because the 0.5.13 baseline does not
   send it.
+  **Which version to report, and who bumps it:** the target is the upstream ref
+  the image pins — `docker/Dockerfile.cube-base`'s `ENVD_REF` (currently
+  `2026.16`, whose envd reports `0.5.13`), *not* the older daemon a particular
+  image may still ship. The constant is raised in the same change that
+  implements the next generation's gated semantics, and that change must carry
+  the conformance capture for them; until then it stays put, because reporting
+  a generation whose features are missing is worse than reporting an older
+  one.
 - **CLI parsing is stricter than Go's `flag` (documented).** *Unlike the
   upstream Go envd, cube-envd strictly validates every command-line argument:
   an invalid flag, a positional argument or a malformed value terminates

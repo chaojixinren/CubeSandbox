@@ -198,10 +198,12 @@ async fn upload_multipart(
     let mut entries: Vec<UploadEntry> = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(map_multipart_error)? {
         // Upstream treats a part as a file only when its *field name* is
-        // `file` (Go's `FormName()` defaults an absent name to `"file"`); any
-        // other part is skipped as an ordinary form field and writes nothing
-        // (`upload.go` handlePart).
-        if !matches!(field.name(), None | Some("file")) {
+        // exactly `file`: Go's `FormName()` returns the `name` parameter with
+        // no default (it is `""` for an absent one, and `""` for a disposition
+        // that is not `form-data`), and `handlePart` skips anything that is not
+        // `"file"` — so a part carrying a filename but no name is a form field,
+        // not an upload.
+        if field.name() != Some("file") {
             continue;
         }
         // The `?path` query wins when it is present; the part's filename is
@@ -232,9 +234,11 @@ async fn upload_multipart(
                 "you cannot upload multiple files to the same path '{path}' in one upload request, only the first specified file was uploaded"
             );
             if others.len() > 1 {
+                // `%v` of `strings.Join(alreadyUploaded, ", ")` — a bare,
+                // comma-space separated list, no brackets.
                 message.push_str(&format!(
-                    ", also the following files were uploaded: [{}]",
-                    others.join(" ")
+                    ", also the following files were uploaded: {}",
+                    others.join(", ")
                 ));
             }
             return Err(RestError::new(StatusCode::BAD_REQUEST, message));

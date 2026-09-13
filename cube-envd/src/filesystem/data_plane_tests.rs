@@ -836,6 +836,12 @@ mod download_tests {
 /// only parts named `file` are files, and an unsupported Content-Type is a 400
 /// that never touches the body.
 #[cfg(test)]
+/// POST /files shapes where upstream's rule and a "reasonable" reading differ.
+/// Every case here was measured against the Go daemons before it was written
+/// (see `docs/cube-envd/sdk-call-sites-issues-zh.md`): the `?path` query wins,
+/// only parts named `file` are files, and an unsupported Content-Type is a 400
+/// that never touches the body.
+#[cfg(test)]
 mod upload_semantics_tests {
     use axum::body::Body;
     use axum::http::{header, HeaderMap, StatusCode};
@@ -861,6 +867,19 @@ mod upload_semantics_tests {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// A part with a `filename` but no `name` parameter: Go's `FormName()`
+    /// returns `""` for an absent one, so upstream's `handlePart` skips it.
+    fn multipart_body_unnamed(boundary: &str, filename: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = format!("--{boundary}\r\n").into_bytes();
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; filename=\"{filename}\"\r\n").as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         body
     }
 
@@ -936,12 +955,13 @@ mod upload_semantics_tests {
     async fn parts_not_named_file_are_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let kept = dir.path().join("kept.bin");
-        let skipped = dir.path().join("skipped.bin");
+        let other_name = dir.path().join("other-name.bin");
+        let no_name = dir.path().join("no-name.bin");
         let boundary = "X";
         let body = multipart_body(
             boundary,
             &[
-                ("envd", Some(skipped.to_str().unwrap()), b"must-not-land"),
+                ("envd", Some(other_name.to_str().unwrap()), b"must-not-land"),
                 ("file", Some(kept.to_str().unwrap()), b"kept"),
             ],
         );
@@ -954,7 +974,25 @@ mod upload_semantics_tests {
         assert_eq!(status, StatusCode::OK);
         assert!(text.contains("kept.bin"), "{text}");
         assert_eq!(std::fs::read(&kept).unwrap(), b"kept");
-        assert!(!skipped.exists(), "a non-`file` field must not be written");
+        assert!(
+            !other_name.exists(),
+            "a non-`file` field must not be written"
+        );
+
+        // Go's `FormName()` has no default, so a part carrying a filename but
+        // no `name` parameter is a form field as well.
+        let body = multipart_body_unnamed(boundary, no_name.to_str().unwrap(), b"must-not-land");
+        let (status, _) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !no_name.exists(),
+            "a part without a name must not be written"
+        );
     }
 
     #[tokio::test]
@@ -1034,7 +1072,52 @@ mod upload_semantics_tests {
             text.contains("you cannot upload multiple files to the same path"),
             "{text}"
         );
+        // Only one other path was uploaded, so upstream appends no clause.
+        assert!(
+            !text.contains("also the following files were uploaded"),
+            "{text}"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    }
+
+    /// With two *other* paths present, upstream appends
+    /// `strings.Join(alreadyUploaded, ", ")` through `%v`: a bare comma-space
+    /// list in upload order, no brackets.
+    #[tokio::test]
+    async fn a_repeated_multipart_path_lists_the_other_files_upstream_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        let c = dir.path().join("c.bin");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[
+                ("file", Some(a.to_str().unwrap()), b"a"),
+                ("file", Some(b.to_str().unwrap()), b"b"),
+                ("file", Some(c.to_str().unwrap()), b"c"),
+                ("file", Some(a.to_str().unwrap()), b"again"),
+            ],
+        );
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains(&format!(
+                "also the following files were uploaded: {}, {}",
+                b.display(),
+                c.display()
+            )),
+            "{text}"
+        );
+        // The first three parts were written; the fourth is rejected unwritten.
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+        assert_eq!(std::fs::read(&c).unwrap(), b"c");
     }
 
     #[tokio::test]
