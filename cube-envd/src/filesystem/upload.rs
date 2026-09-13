@@ -36,14 +36,36 @@ pub async fn upload(
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
         .unwrap_or_default();
 
-    let result = if content_type.starts_with("multipart/form-data") {
-        upload_multipart(&content_type, body, &user).await
-    } else {
-        let content_length = headers
-            .get(axum::http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        upload_raw(body, &params, &user, content_length).await
+    // Upstream dispatches on the parsed media type — lowercased, parameters
+    // stripped: `application/octet-stream` is the raw path, any `multipart/*`
+    // subtype is the multipart path, and everything else (a missing header and
+    // `text/plain` included) is rejected *before* the body is read
+    // (`upload.go` PostFiles switch). Matching only `multipart/form-data` and
+    // treating every other type as raw bodies let a mistyped Content-Type
+    // write the request body into the `?path` target.
+    let result = match media_type(&content_type).as_deref() {
+        Some("application/octet-stream") => {
+            let content_length = headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            upload_raw(body, &params, &user, content_length).await
+        }
+        Some(media) if media.starts_with("multipart/") => {
+            upload_multipart(
+                &content_type,
+                body,
+                &user,
+                params.get("path").map(String::as_str),
+            )
+            .await
+        }
+        _ => Err(RestError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported content type: {content_type}, expected multipart/form-data or application/octet-stream"
+            ),
+        )),
     };
 
     match result {
@@ -79,7 +101,8 @@ async fn upload_raw(
     let Some(raw_path) = params.get("path") else {
         return Err(RestError::new(
             StatusCode::BAD_REQUEST,
-            "the 'path' query parameter is required for application/octet-stream uploads",
+            // Upstream's wording for this shape (`upload.go` handleRawUpload).
+            "path query parameter is required for raw body upload",
         ));
     };
     let path = identity::resolve_path(raw_path, user);
@@ -142,10 +165,87 @@ pub(crate) fn parse_boundary(content_type: &str) -> Option<String> {
     .filter(|b| !b.is_empty())
 }
 
+/// The part's `Content-Disposition`, parsed the way upstream reads it.
+///
+/// Go's `mime.ParseMediaType` lowercases the disposition type and every
+/// *parameter name* while leaving values alone, and `Part.FormName()` returns
+/// the empty string unless the type is exactly `form-data`. `multer`'s own
+/// `name()`/`file_name()` compare parameter names case-sensitively, so a valid
+/// `NAME="file"` part was skipped and the upload was silently dropped; parse the
+/// header here instead.
+fn part_disposition(field: &multer::Field<'_>) -> Option<mime::Mime> {
+    let raw = field
+        .headers()
+        .get(axum::http::header::CONTENT_DISPOSITION)?;
+    // A Content-Disposition value is a *bare* disposition (`form-data; …`), which
+    // `mime` refuses to parse because it wants `type/subtype`. Prefix a throwaway
+    // type so the real parser handles quoting, escapes and case-insensitive
+    // parameter names, then compare the lowercased essence the way Go's
+    // ParseMediaType + FormName() do.
+    let parsed: mime::Mime = format!("text/{}", raw.to_str().ok()?).parse().ok()?;
+    (parsed.essence_str() == "text/form-data").then_some(parsed)
+}
+
+/// A `Content-Disposition` parameter by (case-insensitive) name, accepting the
+/// RFC 2231 `key*=charset'lang'value` form the way Go's parser does for the
+/// usual `filename*=utf-8''name` shape.
+fn disposition_param(parsed: &mime::Mime, key: &str) -> Option<String> {
+    if let Some(value) = parsed.get_param(key) {
+        return Some(value.as_str().to_string());
+    }
+    for (name, value) in parsed.params() {
+        let name = name.as_str();
+        if name.len() != key.len() + 1 || !name.ends_with('*') {
+            continue;
+        }
+        if !name[..key.len()].eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let value = value.as_str();
+        let encoded = match (value.find('\''), value.rfind('\'')) {
+            (Some(first), Some(second)) if first < second => &value[second + 1..],
+            _ => value,
+        };
+        return Some(percent_decode(encoded));
+    }
+    None
+}
+
+/// RFC 2231 values are percent-encoded; `%` not followed by two hex digits is
+/// left as-is, like Go's `unescape` fallback.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The lowercased `type/subtype` of a Content-Type value, parameters stripped —
+/// the shape Go's `mime.ParseMediaType` yields for upstream's dispatch switch.
+/// `None` when the value carries no media type at all, which upstream then
+/// rejects like any other unsupported type.
+fn media_type(content_type: &str) -> Option<String> {
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    (!media.is_empty()).then(|| media.to_ascii_lowercase())
+}
+
 async fn upload_multipart(
     content_type: &str,
     body: axum::body::Body,
     user: &User,
+    query_path: Option<&str>,
 ) -> Result<Vec<UploadEntry>, RestError> {
     let boundary = parse_boundary(content_type)
         .ok_or_else(|| RestError::new(StatusCode::BAD_REQUEST, "missing multipart boundary"))?;
@@ -162,17 +262,59 @@ async fn upload_multipart(
     );
     let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
 
-    let mut entries = Vec::new();
+    let mut entries: Vec<UploadEntry> = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(map_multipart_error)? {
-        // Only parts carrying a filename are file uploads (part filename =
-        // target path, matching upstream). A plain form field must not fall
-        // back to the `?path` query target — that would let a stray text
-        // field overwrite the real file's bytes. The `?path` fallback
-        // belongs to the raw octet-stream path only.
-        let Some(target) = field.file_name().map(|s| s.to_string()) else {
+        // Upstream treats a part as a file only when its *field name* is
+        // exactly `file`: Go's `FormName()` returns the empty string unless the
+        // disposition type is `form-data`, and returns the `name` parameter with
+        // no default, so `handlePart` skips a part with no name, with a
+        // different name, or with a non-`form-data` disposition — even when it
+        // carries a filename. (`multer`'s accessors compare the parameter *name*
+        // case-sensitively, so `NAME="file"` used to be dropped silently.)
+        let Some(disposition) = part_disposition(&field) else {
             continue;
         };
+        match disposition_param(&disposition, "name") {
+            Some(name) if name == "file" => {}
+            _ => continue,
+        }
+        // The `?path` query wins when it is present; the part's filename is
+        // only the fallback, and it is used verbatim — path separators and
+        // all, not `filepath.Base` (`upload.go` resolvePath).
+        let target = match query_path {
+            Some(path) => path.to_string(),
+            None => match disposition_param(&disposition, "filename") {
+                Some(name) => name,
+                None => {
+                    return Err(RestError::new(
+                        StatusCode::BAD_REQUEST,
+                        "error getting multipart custom part file name: filename not found in Content-Disposition header",
+                    ))
+                }
+            },
+        };
         let path = identity::resolve_path(&target, user);
+        if entries.iter().any(|entry| entry.path == path) {
+            // Upstream refuses a second write to the same path in one request
+            // and keeps whatever the first part wrote.
+            let others: Vec<&str> = entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .filter(|other| *other != path)
+                .collect();
+            let mut message = format!(
+                "you cannot upload multiple files to the same path '{path}' in one upload request, only the first specified file was uploaded"
+            );
+            if others.len() > 1 {
+                // `%v` of `strings.Join(alreadyUploaded, ", ")` — a bare,
+                // comma-space separated list, no brackets.
+                message.push_str(&format!(
+                    ", also the following files were uploaded: {}",
+                    others.join(", ")
+                ));
+            }
+            return Err(RestError::new(StatusCode::BAD_REQUEST, message));
+        }
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, RestError>>(16);
         let writer = spawn_upload_writer(path.clone(), user.clone(), rx);
         loop {
@@ -198,12 +340,8 @@ async fn upload_multipart(
         })??;
         entries.push(entry_for(&path));
     }
-    if entries.is_empty() {
-        return Err(RestError::new(
-            StatusCode::BAD_REQUEST,
-            "multipart upload contained no file",
-        ));
-    }
+    // Upstream answers 200 with an empty array when no part was a file part;
+    // it does not treat that as a bad request.
     Ok(entries)
 }
 

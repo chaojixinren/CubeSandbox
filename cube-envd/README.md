@@ -171,8 +171,40 @@ load-bearing ones, and why cube-envd differs:
   in the target, concurrent readers see it grow, and a failed upload is not
   rolled back. Above the 256 MiB cap the upload stops mid-stream with 413.
   Overwriting an existing file preserves its mode bits (`O_TRUNC` never
-  touches the mode). Multipart parts without a filename are ignored as form
-  fields (only the raw octet-stream path uses the `?path` query target).
+  touches the mode).
+- **`/files` dispatch and multipart targeting follow upstream exactly.** The
+  Content-Type decides the path: `application/octet-stream` is the raw body
+  (the `path` query parameter is then required, `400` otherwise), any
+  `multipart/*` subtype takes the multipart path, and anything else — a missing
+  header included — is `400 unsupported content type: …`, rejected without
+  reading the body. Inside a multipart body only parts whose **field name** is
+  exactly `file` are uploads — Go's `FormName()` returns the `name` parameter
+  with no default, so a part with a filename but no name is a form field too;
+  the **`?path` query wins when present**, and the part's filename is only the
+  fallback, used verbatim rather than `filepath.Base`
+  (`upload.go resolvePath`). A second part resolving to the same path is
+  rejected with the first write left in place, and a multipart body with no
+  `file` part answers `200` with an empty array.
+- **`-version` reports the emulated upstream generation, not the crate
+  version.** Callers gate features on this string: the E2B SDKs compare a
+  sandbox's reported version against per-feature minimums (recursive watch
+  0.1.4, command stdin 0.3.0, default user 0.4.0, closeStdin 0.5.2,
+  octet-stream upload 0.5.7, file metadata 0.6.2, watch `includeEntry` 0.6.3,
+  network mounts 0.6.4), and the platform records it as the template's
+  `envdVersion`. Reporting `0.1.0` made every gate answer "too old", so
+  `-version` prints the generation cube-envd is locked to (`0.5.13`) and the
+  build's real short sha comes from `-commit`, with the implementation version
+  in the startup log. `X-Envd-Version`, the header later E2B daemons answer on
+  `POST /init`, is deliberately absent because the 0.5.13 baseline does not
+  send it.
+  **Which version to report, and who bumps it:** the target is the upstream ref
+  the image pins — `docker/Dockerfile.cube-base`'s `ENVD_REF` (currently
+  `2026.16`, whose envd reports `0.5.13`), *not* the older daemon a particular
+  image may still ship. The constant is raised in the same change that
+  implements the next generation's gated semantics, and that change must carry
+  the conformance capture for them; until then it stays put, because reporting
+  a generation whose features are missing is worse than reporting an older
+  one.
 - **CLI parsing is stricter than Go's `flag` (documented).** *Unlike the
   upstream Go envd, cube-envd strictly validates every command-line argument:
   an invalid flag, a positional argument or a malformed value terminates

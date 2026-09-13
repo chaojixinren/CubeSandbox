@@ -494,6 +494,51 @@ perf 制品文件也会污染 ListDir。
 （Go 整数渲染 vs Rust 浮点），rest_metrics 在宿主负载凑整时必挂；改为
 值无关的 `<volatile>`。
 
+## 2c. PR #30 复审轮（2026-09-13）
+
+场景：`POST /files` 的分发与目标路径对齐上游、`-version` 改报兼容版本，两处复审发现。
+
+**单元测试**：`cargo test` → **317 passed, 0 failed, 2 ignored**（本轮 +13 个用例）；
+`cargo clippy --release --all-targets -- -D warnings` 与 `cargo fmt --all` 干净。
+
+**一致性对拍**（`make cube-envd` 产物经 `ENVD_BIN` 注入 base 镜像 2026.16，
+同一台机器两个全新容器，Go 0.5.13 为基线）：
+
+```
+watch 组：PASS 9   FAIL 0  DECLARED-DIFF 0  SKIP 0  MISSING 0
+main  组：PASS 129 FAIL 0  DECLARED-DIFF 4  SKIP 0  MISSING 0   （两侧各录 133 个 fixture）
+```
+
+- fixture 数由 122 增至 **133**：本轮新增 11 个场景——multipart 的 `?path` 与 part
+  文件名冲突、字段名不是 `file`、**带 filename 但没有 `name` 的 part**、不支持的
+  Content-Type、同一 body 内重复路径的报错文案，以及对应的"文件不该存在 / 第一次写入
+  应保留"下载断言。
+- 4 个 DECLARED-DIFF 仍是既有 allowlist（gzip 下载、`/files/compose`、
+  JSON 解析措辞、`/init` 时间戳越界）。
+- **lifecycle smoke**（`go run lifecycle_smoke.go`）：全新容器上 cube-envd 与 Go
+  各 **4/4 PASS**（pipe input/EOF、PTY input、fragmented StreamInput、
+  slow-client deadline cleanup）。注意它**必须用全新容器**：main 组 capture 会经
+  `/init` 装 access token，之后未带 token 的请求一律 401，复用容器会得到假失败
+  （第一次复跑就是这样，换新容器即通过）。
+
+**复审两处发现的处置**：
+1. **[Low] 缺 `name` 参数的 part 被当文件写入**——Go 的 `FormName()` 对缺省 `name`
+   返回 `""`（无默认值），`handlePart` 因此跳过；cube-envd 曾把 `None` 当文件。
+   修复：`field.name() != Some("file")` 即跳过；测试覆盖"带 filename、无 name"的 part
+   （对旧实现会失败），README 里"Go 默认 name 为 file"的错误说法一并改掉。
+2. **[nit] 重复路径消息的分隔符**——上游是
+   `fmt.Errorf("… %v", strings.Join(alreadyUploaded, ", "))`，即逗号+空格、无方括号；
+   原实现是空格分隔并加了方括号。修复并加测试：4 个 part（a、b、c、a）触发
+   `also the following files were uploaded: <b>, <c>`；对拍里也补了
+   `rest_files_upload_multipart_duplicate_path` 与"第一次写入保留"的下载断言，
+   Go 与 cube-envd 的 400 文案逐字节相同。
+3. **[警告] 版本常量契约**——`VERSION` 现按 `docker/Dockerfile.cube-base` 的
+   `ENVD_REF`（2026.16 → 0.5.13）对齐；README 写明"由实现下一代 gated 语义的那次改动
+   负责抬高，并必须带对拍记录"。
+4. **[警告] dispatch 收紧的调用方确认**——仓内 `/files` 写入方只有 Go / Python / Node
+   三个 SDK（均为 `application/octet-stream` 优先、multipart 兜底）与 conformance
+   harness，没有依赖旧宽容行为（任意 Content-Type 当 raw 写）的调用方。
+
 ## 复现
 
 见 [README.md](README.md)。E2E 需要本地部署环境与两个模板：

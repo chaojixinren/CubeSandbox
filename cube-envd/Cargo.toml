@@ -10,6 +10,9 @@ repository = "https://github.com/TencentCloud/CubeSandbox"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7" }
 multer = "3"
+# Content-Disposition is parsed with `mime` (already in the tree via multer) so
+# parameter names match case-insensitively, the way Go's mime.ParseMediaType does.
+mime = "0.3"
 tower-http = { version = "0.5", features = ["catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

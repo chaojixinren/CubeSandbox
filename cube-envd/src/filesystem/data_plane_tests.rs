@@ -829,3 +829,443 @@ mod download_tests {
         assert!(!hvary.contains_key(header::VARY));
     }
 }
+
+/// POST /files shapes where upstream's rule and a "reasonable" reading differ.
+/// POST /files shapes where upstream's rule and a "reasonable" reading differ.
+/// Every case here was measured against the Go daemons before it was written
+/// (see `docs/cube-envd/sdk-call-sites-issues-zh.md`): the `?path` query wins,
+/// only parts named `file` are files, and an unsupported Content-Type is a 400
+/// that never touches the body.
+#[cfg(test)]
+mod upload_semantics_tests {
+    use axum::body::Body;
+    use axum::http::{header, HeaderMap, StatusCode};
+    use std::collections::HashMap;
+
+    fn multipart_body(boundary: &str, parts: &[(&str, Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, filename, data) in parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            match filename {
+                Some(filename) => body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+                    )
+                    .as_bytes(),
+                ),
+                None => body.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{name}\"\r\n").as_bytes(),
+                ),
+            }
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// A part with a `filename` but no `name` parameter: Go's `FormName()`
+    /// returns `""` for an absent one, so upstream's `handlePart` skips it.
+    fn multipart_body_unnamed(boundary: &str, filename: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = format!("--{boundary}\r\n").into_bytes();
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; filename=\"{filename}\"\r\n").as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    async fn post(
+        params: &[(&str, &str)],
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, String) {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+        let params = params
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect::<HashMap<_, _>>();
+        let response = crate::filesystem::upload(
+            &crate::platform::config::Config::new(),
+            params,
+            headers,
+            Body::from(body),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        (parts.status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// A part built with arbitrary header text, so a test can say exactly what
+    /// the `Content-Disposition` looks like (`multipart_body` always writes the
+    /// canonical lowercase form). `None` omits the header entirely.
+    fn multipart_body_raw(boundary: &str, parts: &[(Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (disposition, data) in parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            if let Some(disposition) = disposition {
+                body.extend_from_slice(
+                    format!("Content-Disposition: {disposition}\r\n").as_bytes(),
+                );
+            }
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Go's MIME parser treats *parameter names* case-insensitively, so
+    /// `NAME="file"` is a file part upstream; `multer`'s accessor compared it
+    /// case-sensitively and the upload was dropped with a 200 `[]`.
+    #[tokio::test]
+    async fn an_uppercase_name_parameter_is_still_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("upper.bin");
+        let boundary = "X";
+        let disposition = format!(
+            "FORM-DATA; NAME=\"file\"; FILENAME=\"{}\"",
+            target.display()
+        );
+        let body = multipart_body_raw(boundary, &[(Some(&disposition), b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("upper.bin"), "{text}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    /// The `filename` parameter name is case-insensitive too (Go lowercases the
+    /// map keys), and its value is used verbatim.
+    #[tokio::test]
+    async fn an_uppercase_filename_parameter_is_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("upper-filename.bin");
+        let boundary = "X";
+        let disposition = format!(
+            "form-data; name=\"file\"; FILENAME=\"{}\"",
+            target.display()
+        );
+        let body = multipart_body_raw(boundary, &[(Some(&disposition), b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("upper-filename.bin"), "{text}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    /// `FormName()` returns "" unless the disposition type is `form-data`, so a
+    /// part that carries a filename under `attachment` is a form field.
+    #[tokio::test]
+    async fn a_non_form_data_disposition_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("attachment.bin");
+        let boundary = "X";
+        let disposition = format!(
+            "attachment; name=\"file\"; filename=\"{}\"",
+            target.display()
+        );
+        let body = multipart_body_raw(boundary, &[(Some(&disposition), b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "[]");
+        assert!(!target.exists());
+    }
+
+    /// A part with no `Content-Disposition` at all is not `form-data` either.
+    #[tokio::test]
+    async fn a_part_without_a_content_disposition_is_skipped() {
+        let boundary = "X";
+        let body = multipart_body_raw(boundary, &[(None, b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "[]");
+    }
+
+    #[tokio::test]
+    async fn query_path_wins_over_the_part_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let query_target = dir.path().join("query-target.txt");
+        let part_name = dir.path().join("part-name.txt");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[("file", Some(part_name.to_str().unwrap()), b"payload")],
+        );
+        let (status, text) = post(
+            &[("path", query_target.to_str().unwrap())],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("query-target.txt"), "{text}");
+        assert_eq!(std::fs::read(&query_target).unwrap(), b"payload");
+        assert!(
+            !part_name.exists(),
+            "the part filename must not be the target when ?path is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn part_filename_is_the_fallback_without_a_query_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("from-part.bin");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[("file", Some(target.to_str().unwrap()), b"payload")],
+        );
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("from-part.bin"), "{text}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn parts_not_named_file_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept.bin");
+        let other_name = dir.path().join("other-name.bin");
+        let no_name = dir.path().join("no-name.bin");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[
+                ("envd", Some(other_name.to_str().unwrap()), b"must-not-land"),
+                ("file", Some(kept.to_str().unwrap()), b"kept"),
+            ],
+        );
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("kept.bin"), "{text}");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"kept");
+        assert!(
+            !other_name.exists(),
+            "a non-`file` field must not be written"
+        );
+
+        // Go's `FormName()` has no default, so a part carrying a filename but
+        // no `name` parameter is a form field as well.
+        let body = multipart_body_unnamed(boundary, no_name.to_str().unwrap(), b"must-not-land");
+        let (status, _) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !no_name.exists(),
+            "a part without a name must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_without_a_file_part_is_an_empty_ok() {
+        let boundary = "X";
+        let body = multipart_body(boundary, &[("note", None, b"not a file")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "[]");
+    }
+
+    #[tokio::test]
+    async fn unsupported_content_type_is_rejected_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist.txt");
+        let (status, text) = post(
+            &[("path", target.to_str().unwrap())],
+            "application/x-www-form-urlencoded",
+            b"text=NOT-A-FILE".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains(
+                "unsupported content type: application/x-www-form-urlencoded, expected multipart/form-data or application/octet-stream"
+            ),
+            "{text}"
+        );
+        assert!(
+            !target.exists(),
+            "a rejected upload must not create the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_is_rejected() {
+        let (status, text) = post(&[], "", b"raw".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("unsupported content type"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn raw_upload_without_a_path_uses_the_upstream_message() {
+        let (status, text) = post(&[], "application/octet-stream", b"raw".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains("path query parameter is required for raw body upload"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_multipart_path_is_rejected_and_keeps_the_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("same.bin");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[
+                ("file", Some("/ignored/first.bin"), b"first"),
+                ("file", Some("/ignored/second.bin"), b"second"),
+            ],
+        );
+        let (status, text) = post(
+            &[("path", target.to_str().unwrap())],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains("you cannot upload multiple files to the same path"),
+            "{text}"
+        );
+        // Only one other path was uploaded, so upstream appends no clause.
+        assert!(
+            !text.contains("also the following files were uploaded"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    }
+
+    /// With two *other* paths present, upstream appends
+    /// `strings.Join(alreadyUploaded, ", ")` through `%v`: a bare comma-space
+    /// list in upload order, no brackets.
+    #[tokio::test]
+    async fn a_repeated_multipart_path_lists_the_other_files_upstream_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        let c = dir.path().join("c.bin");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[
+                ("file", Some(a.to_str().unwrap()), b"a"),
+                ("file", Some(b.to_str().unwrap()), b"b"),
+                ("file", Some(c.to_str().unwrap()), b"c"),
+                ("file", Some(a.to_str().unwrap()), b"again"),
+            ],
+        );
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains(&format!(
+                "also the following files were uploaded: {}, {}",
+                b.display(),
+                c.display()
+            )),
+            "{text}"
+        );
+        // The first three parts were written; the fourth is rejected unwritten.
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+        assert_eq!(std::fs::read(&c).unwrap(), b"c");
+    }
+
+    #[tokio::test]
+    async fn a_file_part_without_a_filename_and_without_a_path_is_a_400() {
+        let boundary = "X";
+        let body = multipart_body(boundary, &[("file", None, b"data")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains("filename not found in Content-Disposition header"),
+            "{text}"
+        );
+    }
+
+    /// The media type is matched case-insensitively and independently of its
+    /// parameters, like upstream's `mime.ParseMediaType` + switch.
+    #[tokio::test]
+    async fn content_type_is_matched_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("upper.bin");
+        let (status, _) = post(
+            &[("path", target.to_str().unwrap())],
+            "Application/Octet-Stream",
+            b"upper".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::fs::read(&target).unwrap(), b"upper");
+    }
+
+    /// Any `multipart/*` subtype takes the multipart path, not just
+    /// `multipart/form-data`.
+    #[tokio::test]
+    async fn other_multipart_subtypes_use_the_multipart_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mixed.bin");
+        let boundary = "X";
+        let body = multipart_body(
+            boundary,
+            &[("file", Some(target.to_str().unwrap()), b"mixed")],
+        );
+        let (status, _) = post(&[], &format!("multipart/mixed; boundary={boundary}"), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::fs::read(&target).unwrap(), b"mixed");
+    }
+}
