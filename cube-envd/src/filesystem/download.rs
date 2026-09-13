@@ -545,9 +545,18 @@ async fn sniff_content_type(f: &mut tokio::fs::File) -> std::io::Result<&'static
     }
 }
 
-/// Chunked reader stream (64 KiB) without pulling in tokio-util. `limit`
-/// bounds the total bytes produced (single-range 206 bodies); `None` streams
-/// to EOF.
+/// Read size for a download body. Every chunk costs one read syscall, one
+/// allocation and (in the sandbox) one deep wakeup, and those per-chunk costs
+/// are what a download is actually limited by there — the same effect the
+/// process-stream read chunk fixes. Go gets a zero-copy `sendfile` here, which
+/// cube-envd's body stream cannot use, so it buys the equivalent by making the
+/// copies few and large instead. Only the chunking changes: total bytes,
+/// `Content-Length` and range boundaries are unaffected.
+const DOWNLOAD_CHUNK: usize = 256 * 1024;
+
+/// Chunked reader stream (`DOWNLOAD_CHUNK`) without pulling in tokio-util.
+/// `limit` bounds the total bytes produced (single-range 206 bodies); `None`
+/// streams to EOF.
 fn reader_stream(
     file: tokio::fs::File,
     limit: Option<u64>,
@@ -556,8 +565,8 @@ fn reader_stream(
     futures::stream::unfold((file, limit), |(mut file, mut remaining)| async move {
         let want = match remaining {
             Some(0) => return None,
-            Some(r) => r.min(64 * 1024) as usize,
-            None => 64 * 1024,
+            Some(r) => r.min(DOWNLOAD_CHUNK as u64) as usize,
+            None => DOWNLOAD_CHUNK,
         };
         let mut buf = vec![0u8; want];
         match file.read(&mut buf).await {
@@ -572,4 +581,61 @@ fn reader_stream(
             Err(e) => Some((Err(e), (file, remaining))),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    /// The download stream reads in `DOWNLOAD_CHUNK` pieces. That shape is the
+    /// point of the constant (one syscall, one allocation and one wakeup per
+    /// chunk), and it is invisible to any content assertion, so pin it: a
+    /// regression to small reads would still pass every correctness test and
+    /// only show up as sandbox throughput.
+    #[tokio::test]
+    async fn reader_stream_reads_in_large_chunks_and_honours_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let size = DOWNLOAD_CHUNK + 4096;
+        std::fs::write(&path, vec![0x5au8; size]).unwrap();
+
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let whole: Vec<bytes::Bytes> = reader_stream(file, None)
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        assert_eq!(whole.iter().map(bytes::Bytes::len).sum::<usize>(), size);
+        assert_eq!(whole.len(), 2, "one full chunk plus the tail");
+        assert_eq!(whole[0].len(), DOWNLOAD_CHUNK);
+        assert!(whole.iter().all(|chunk| chunk.len() <= DOWNLOAD_CHUNK));
+        assert!(whole[0].iter().all(|byte| *byte == 0x5a));
+
+        // A limit inside one chunk is a single read (206 with a short range).
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let limited: Vec<bytes::Bytes> = reader_stream(file, Some(4096))
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].len(), 4096);
+
+        // A limit crossing a chunk boundary stops exactly at the limit.
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let crossed: usize = reader_stream(file, Some(DOWNLOAD_CHUNK as u64 + 10))
+            .map(|chunk| chunk.unwrap().len())
+            .collect::<Vec<_>>()
+            .await
+            .iter()
+            .sum();
+        assert_eq!(crossed, DOWNLOAD_CHUNK + 10);
+
+        // An exhausted limit reads nothing at all.
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let empty: Vec<bytes::Bytes> = reader_stream(file, Some(0))
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        assert!(empty.is_empty());
+    }
 }
