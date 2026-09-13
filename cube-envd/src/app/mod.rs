@@ -16,4 +16,5 @@ pub mod metrics;
 pub mod middleware;
 pub mod pool;
 pub mod routes;
+pub mod serve;
 pub mod state;

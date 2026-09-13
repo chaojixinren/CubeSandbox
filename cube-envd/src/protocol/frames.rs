@@ -17,6 +17,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::protocol::error::{ConnectCode, ConnectError};
 
 pub const END_STREAM_FLAG: u8 = 0x02;
+/// `[flags:1B][len:u32 BE]` — the prefix in front of every envelope payload.
+pub const FRAME_HEADER_LEN: usize = 5;
 pub const COMPRESSED_FLAG: u8 = 0x01;
 /// Same cap the SDKs enforce on their side.
 pub const MAX_ENVELOPE_SIZE: usize = 64 * 1024 * 1024;
@@ -32,7 +34,7 @@ pub const STREAM_CONTENT_TYPE: &str = "application/connect+json";
 
 /// Encode one Connect streaming envelope.
 pub fn encode_envelope(flags: u8, payload: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + payload.len());
+    let mut buf = BytesMut::with_capacity(FRAME_HEADER_LEN + payload.len());
     buf.put_u8(flags);
     buf.put_u32(payload.len() as u32);
     buf.put_slice(payload);
@@ -41,6 +43,29 @@ pub fn encode_envelope(flags: u8, payload: &[u8]) -> Bytes {
 
 pub fn message_frame(value: &serde_json::Value) -> Bytes {
     encode_envelope(0, value.to_string().as_bytes())
+}
+
+/// Frame one JSON message without building a `Value` tree or an intermediate
+/// string: the envelope header is written first and `serde_json` streams the
+/// value directly behind it, so a large payload is copied once instead of
+/// three times. Errors cannot be reported here (the caller has no way to
+/// answer mid-stream), so a serialization failure ends the message short and
+/// the trailer still follows.
+pub fn json_message_frame<T: serde::Serialize>(value: &T) -> Bytes {
+    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + 1024);
+    buf.extend_from_slice(&[0; FRAME_HEADER_LEN]);
+    match serde_json::to_writer(&mut buf, value) {
+        Ok(()) => {
+            let len = (buf.len() - FRAME_HEADER_LEN) as u32;
+            buf[1..FRAME_HEADER_LEN].copy_from_slice(&len.to_be_bytes());
+        }
+        Err(e) => {
+            tracing::warn!("message_frame: could not serialize the envelope: {e}");
+            buf.truncate(FRAME_HEADER_LEN);
+            buf[1..FRAME_HEADER_LEN].copy_from_slice(&0u32.to_be_bytes());
+        }
+    }
+    Bytes::from(buf)
 }
 
 pub fn end_stream_ok() -> Bytes {
@@ -190,6 +215,42 @@ pub fn check_json_codec(headers: &axum::http::HeaderMap) -> Result<(), ConnectEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `json_message_frame` frames the same JSON `message_frame(&to_value(..))`
+    /// does, without the `Value` tree. Key *order* inside an object is not part
+    /// of the Connect/JSON contract, and it is the one thing that differs: this
+    /// path emits the serializer's declaration order, the `Value` path emits
+    /// sorted keys. Everything a client observes must still match.
+    #[test]
+    fn json_message_frame_frames_the_same_json_as_the_value_path() {
+        #[derive(serde::Serialize)]
+        struct Probe {
+            payload: String,
+            empty: Option<String>,
+        }
+        for payload in [
+            String::new(),
+            "x".repeat(4096),
+            "quote \" backslash \\ newline \n tab \t unicode \u{1f600}".into(),
+        ] {
+            let probe = Probe {
+                payload,
+                empty: None,
+            };
+            let actual = json_message_frame(&probe);
+            assert_eq!(actual[0], 0, "a message frame is not an end-stream frame");
+            let len = u32::from_be_bytes([actual[1], actual[2], actual[3], actual[4]]) as usize;
+            assert_eq!(len, actual.len() - FRAME_HEADER_LEN, "length prefix");
+            let payload = &actual[FRAME_HEADER_LEN..];
+            let decoded: serde_json::Value = serde_json::from_slice(payload).unwrap();
+            let expected = serde_json::to_value(&probe).unwrap();
+            assert_eq!(decoded, expected, "same JSON value, whatever the key order");
+            // Same payload bytes as serializing straight into a buffer, which is
+            // what the header is glued in front of.
+            assert_eq!(payload, serde_json::to_vec(&probe).unwrap());
+            assert!(MAX_ENVELOPE_SIZE >= decoded.to_string().len());
+        }
+    }
 
     #[test]
     fn envelope_roundtrip() {

@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
-
 use super::metadata;
 use crate::process::cgroup;
 use crate::process::engine;
@@ -19,7 +17,7 @@ pub(crate) async fn supervise_process(
     table: Arc<ProcessTable>,
     handle: crate::process::table::ProcHandle,
     pid: u32,
-    sender: broadcast::Sender<engine::PumpEvent>,
+    sender: Arc<crate::process::OutputBus>,
     mut completion: tokio::sync::oneshot::Receiver<()>,
     deadline: Option<std::time::Duration>,
     cgroup: Option<Arc<cgroup::ProcessCgroup>>,
@@ -44,8 +42,14 @@ pub(crate) async fn supervise_process(
                     );
                     table.mark_terminal(handle, error.clone());
                     table.remove_process(handle);
-                    let _ = sender.send(error);
+                    let _ = sender.publish_terminal(error);
                 } else {
+                    // Remove at child reap, not at terminal publication: a
+                    // non-reading client keeps the pump inside `publish_data`
+                    // for up to the eviction window, and cleanup must not wait
+                    // for it. Consequence, accepted: a `Connect` that arrives
+                    // after this removal is answered `Closed` instead of
+                    // replaying the cached exit (see `ProcEntry::terminal`).
                     table.remove_process(handle);
                 }
                 if monitor_ok {
@@ -63,7 +67,7 @@ pub(crate) async fn supervise_process(
                 // runtime worker; ordering this event first guarantees every
                 // still-attached stream observes deadline_exceeded rather than
                 // a misleading normal End.
-                let _ = sender.send(engine::PumpEvent::DeadlineExceeded);
+                let _ = sender.publish_control(engine::PumpEvent::DeadlineExceeded);
                 // Keep the timeout marker and kill syscall atomic with
                 // respect to EndEvent decoration and SendSignal.
                 let kill_result =
@@ -98,7 +102,7 @@ pub(crate) async fn supervise_process(
             );
             table.mark_terminal(handle, error.clone());
             table.remove_process(handle);
-            let _ = sender.send(error);
+            let _ = sender.publish_terminal(error);
         } else {
             table.remove_process(handle);
         }

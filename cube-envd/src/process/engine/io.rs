@@ -7,19 +7,40 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 use crate::process::wire::{DataEvent, EndEvent};
+use crate::process::OutputBus;
 
-const READ_CHUNK: usize = 32 * 1024;
+/// One read from a child's pipe or pty. Every frame costs a fixed amount of
+/// cross-task work (a queue slot, a wakeup, a base64 string, a JSON envelope),
+/// and this sandbox's cost per handoff dominates the per-byte cost, so the
+/// chunk is sized to what a pipe can carry in one go: the pipe capacity below
+/// is raised to match, and a `cat`-style writer fills it.
+const READ_CHUNK: usize = 128 * 1024;
+
+/// Ask the kernel for a child pipe large enough to fill `READ_CHUNK` in one
+/// read. Linux caps this at `/proc/sys/fs/pipe-max-size` (1 MiB by default), so
+/// the request is best effort and a refusal only means smaller reads.
+pub(super) fn widen_pipe<F: std::os::fd::AsRawFd>(pipe: &F, name: &str) {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: `fd` is an open pipe read end owned by the caller.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, READ_CHUNK as libc::c_int) };
+    if result < 0 {
+        tracing::debug!(
+            "{name}: could not widen the pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
 /// Once the direct child has been reaped, inherited stdout/stderr or PTY
 /// slave descriptors must not keep the process entry alive forever. Normal
 /// exits reach EOF immediately; this grace period only catches background or
 /// daemonized descendants that deliberately retain those descriptors.
 pub(super) const OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// One output event published on a process's broadcast bus. `Clone` because
-/// `broadcast::Sender::send` fans a copy out to every subscriber.
+/// One output event published on a process's output bus. `Clone` because
+/// `OutputBus::publish` fans a copy out to every subscriber.
 #[derive(Clone, Debug)]
 pub enum PumpEvent {
     Data(DataEvent),
@@ -62,6 +83,27 @@ impl OutputKind {
     pub(super) fn read_error_is_fatal(self) -> bool {
         matches!(self, Self::Process)
     }
+}
+
+/// Bytes still buffered on a pipe or pty read end, via `FIONREAD`.
+///
+/// The drain grace stops reading when a descendant keeps the pipe open; this
+/// tells "there was nothing left" from "output was abandoned", and only the
+/// latter may end the stream with an error.
+pub(super) fn unread_bytes(fd: std::os::fd::RawFd) -> usize {
+    let mut pending: libc::c_int = 0;
+    // SAFETY: `fd` is an open descriptor and FIONREAD writes one `c_int`.
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } < 0 {
+        return 0;
+    }
+    pending.max(0) as usize
+}
+
+/// The `End` for a reaped child, marked when the grace abandoned output.
+fn end_event(status: std::process::ExitStatus, abandoned: bool) -> EndEvent {
+    let mut event = EndEvent::from_exit_status(status);
+    event.output_truncated = abandoned;
+    event
 }
 
 pub(super) fn decorate_terminal(
@@ -128,32 +170,45 @@ pub(super) fn terminal_after_output(
     }
 }
 
+/// Build the terminal event once the direct child has been reaped.
+///
+/// `abandoned` is true when the grace stopped reading with bytes still buffered
+/// (the caller probes the pipe with `FIONREAD`), and it is what keeps this from
+/// being a silent truncation: the event keeps the child's real exit status, and
+/// the trailer turns into an error (see `process::pump::end_trailer`).
+///
+/// The distinction matters because the usual cause of a stop is a descendant
+/// that inherited the pipe (`sh -c 'daemon & echo done'`), whose output is
+/// already complete: that case has nothing buffered, ends normally, and must
+/// not be turned into an RPC error. Only output that was really left behind is
+/// reported as truncated.
 pub(super) fn terminal_after_wait(
     kind: OutputKind,
     pid: u32,
     wait_result: std::io::Result<std::process::ExitStatus>,
-    output_result: Result<std::io::Result<()>, tokio::time::error::Elapsed>,
+    output_result: std::io::Result<()>,
+    stopped_by_grace: bool,
+    abandoned: bool,
 ) -> PumpEvent {
     let output_name = kind.label();
     let status = match wait_result {
         Ok(status) => status,
         Err(wait_error) => return PumpEvent::SpawnError(format!("wait failed: {wait_error}")),
     };
+    if stopped_by_grace {
+        tracing::warn!(
+            "pid {pid}: {output_name} remained open after the direct child exited; stopped reading after {:?}",
+            OUTPUT_DRAIN_GRACE
+        );
+    }
     match output_result {
-        Ok(Ok(())) => PumpEvent::End(EndEvent::from_exit_status(status)),
-        Ok(Err(read_error)) if !kind.read_error_is_fatal() => {
+        Ok(()) => PumpEvent::End(end_event(status, abandoned)),
+        Err(read_error) if !kind.read_error_is_fatal() => {
             tracing::warn!(pid, "error reading from pty: {read_error}");
-            PumpEvent::End(EndEvent::from_exit_status(status))
+            PumpEvent::End(end_event(status, abandoned))
         }
-        Ok(Err(read_error)) => {
+        Err(read_error) => {
             PumpEvent::SpawnError(format!("{output_name} read failed: {read_error}"))
-        }
-        Err(_) => {
-            tracing::warn!(
-                "pid {pid}: {output_name} remained open after the direct child exited; closing it after {:?}",
-                OUTPUT_DRAIN_GRACE
-            );
-            PumpEvent::End(EndEvent::from_exit_status(status))
         }
     }
 }
@@ -163,13 +218,22 @@ pub(super) fn terminal_after_wait(
 /// on a full pty buffer) but stop encoding.
 pub(super) async fn pump_pty(
     master: AsyncFd<std::fs::File>,
-    tx: broadcast::Sender<PumpEvent>,
+    bus: Arc<OutputBus>,
+    mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     use base64::Engine;
     use std::io::Read;
+    widen_pipe(&master, "pty");
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        let mut readiness = master.readable().await?;
+        // The drain grace only *stops reading*: a publish that is already in
+        // flight still runs to completion, so bytes read from the child are
+        // never dropped because the grace expired.
+        let mut readiness = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            readiness = master.readable() => readiness?,
+        };
         match readiness.try_io(|inner| inner.get_ref().read(&mut buf)) {
             Ok(Ok(0)) => return Ok(()),
             Ok(Err(e)) if is_pty_eof(&e) => return Ok(()),
@@ -180,7 +244,7 @@ pub(super) async fn pump_pty(
                 // A disconnected Start must not permanently disable output
                 // for a later Connect. Skip work while nobody is attached,
                 // but re-check on every read so reattachment resumes delivery.
-                if tx.receiver_count() == 0 {
+                if bus.subscriber_count() == 0 {
                     continue;
                 }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -188,7 +252,7 @@ pub(super) async fn pump_pty(
                     pty: Some(b64),
                     ..Default::default()
                 };
-                let _ = tx.send(PumpEvent::Data(event));
+                bus.publish_data(PumpEvent::Data(event)).await;
             }
         }
     }
@@ -226,22 +290,29 @@ fn is_pty_eof(error: &std::io::Error) -> bool {
 
 pub(super) async fn pump_pipe<R>(
     pipe: Option<R>,
-    tx: broadcast::Sender<PumpEvent>,
+    bus: Arc<OutputBus>,
+    mut stop: watch::Receiver<bool>,
     is_stderr: bool,
 ) -> std::io::Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + std::os::fd::AsRawFd,
 {
     use base64::Engine;
     let Some(mut pipe) = pipe else { return Ok(()) };
+    widen_pipe(&pipe, if is_stderr { "stderr" } else { "stdout" });
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        match pipe.read(&mut buf).await {
+        let read = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            read = pipe.read(&mut buf) => read,
+        };
+        match read {
             Ok(0) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
             Ok(n) => {
-                if tx.receiver_count() == 0 {
+                if bus.subscriber_count() == 0 {
                     continue;
                 }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -256,7 +327,7 @@ where
                         ..Default::default()
                     }
                 };
-                let _ = tx.send(PumpEvent::Data(event));
+                bus.publish_data(PumpEvent::Data(event)).await;
             }
         }
     }
@@ -268,6 +339,33 @@ mod tests {
     use crate::process::engine::tests::current_user;
     use crate::process::engine::{spawn, Spawn};
     use std::collections::HashMap;
+
+    /// `widen_pipe` is best effort by design (the kernel caps the request at
+    /// `pipe-max-size`), so what matters is that the fd it touched still works
+    /// as a pipe afterwards: a wrong fd or a bad argument would break output.
+    #[test]
+    fn widening_a_pipe_keeps_it_usable() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just created and are owned from here.
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same descriptors, each taken exactly once.
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        widen_pipe(&read_end, "test");
+        // SAFETY: `read_end` is an open pipe whose size is queried read-only.
+        let size = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        assert!(size > 0, "a pipe keeps a positive size, got {size}");
+
+        (&write_end).write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        (&read_end).read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+    }
 
     #[test]
     fn oom_metadata_requires_sigkill_and_preserves_recorded_causes() {
@@ -325,7 +423,9 @@ mod tests {
             OutputKind::Pty,
             42,
             Ok(std::process::ExitStatus::from_raw(libc::SIGTERM)),
-            Ok(Err(std::io::Error::from_raw_os_error(libc::EBADF))),
+            Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            false,
+            false,
         );
         let PumpEvent::End(end) = terminal else {
             panic!("PTY drain failure replaced child exit status: {terminal:?}");
@@ -369,7 +469,7 @@ mod tests {
         let sender = proc.sender.clone();
         drop(proc.initial);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut attached = sender.subscribe();
+        let mut attached = sender.subscribe().expect("attach within the limit");
         let mut output = Vec::new();
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(3), attached.recv())

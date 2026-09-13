@@ -9,6 +9,11 @@ repository = "https://github.com/TencentCloud/CubeSandbox"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7" }
+# Used to serve the accepted connections ourselves: `axum::serve` has no
+# hook between accept and serve, and the socket needs TCP_NODELAY set.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 multer = "3"
 tower-http = { version = "0.5", features = ["catch-panic"] }
 serde = { version = "1", features = ["derive"] }

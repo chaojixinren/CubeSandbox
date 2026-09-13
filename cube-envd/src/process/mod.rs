@@ -13,6 +13,7 @@
 //! termination marker in `metadata`, the wire shapes in `wire`, the child
 //! machinery in `engine/`, and the resource boundary in `cgroup/`.
 
+mod bus;
 mod command;
 mod metadata;
 mod pump;
@@ -23,6 +24,7 @@ pub mod engine;
 pub mod table;
 pub mod wire;
 
+pub use bus::{OutputBus, Subscription};
 pub use command::{
     close_stdin, connect, list, send_input, send_signal, start, stream_input_event, update,
 };

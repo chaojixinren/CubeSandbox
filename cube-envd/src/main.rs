@@ -65,7 +65,7 @@ fn main() {
             }
         };
         tracing::info!("cube-envd {VERSION} ({COMMIT}) listening on {addr}");
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = app::serve::serve(listener, app).await {
             tracing::error!("server error: {e}");
             std::process::exit(1);
         }

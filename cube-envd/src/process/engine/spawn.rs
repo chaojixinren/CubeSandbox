@@ -10,7 +10,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{broadcast, oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
+
+use crate::process::OutputBus;
 
 use crate::platform::config::Config;
 use crate::platform::identity::User;
@@ -18,10 +20,10 @@ use crate::platform::identity::User;
 use super::child::{spawn_without_fork, ChildHandle, ChildSpec, ChildStdio, SpawnFailure};
 use super::cleanup::kill_process_group;
 use super::io::{
-    decorate_terminal, pump_pipe, pump_pty, terminal_after_output, terminal_after_wait, OutputKind,
-    OUTPUT_DRAIN_GRACE,
+    decorate_terminal, pump_pipe, pump_pty, terminal_after_output, terminal_after_wait,
+    unread_bytes, OutputKind, OUTPUT_DRAIN_GRACE,
 };
-use super::{InputHandle, InputWriter, PumpEvent, SpawnedProcess};
+use super::{InputHandle, InputWriter, SpawnedProcess};
 
 /// Write this child's pid into `dirfd`'s `cgroup.procs`. Runs in the child
 /// before `execve`, so it must be allocation-free and call only async-signal-safe
@@ -346,18 +348,54 @@ pub fn spawn(req: Spawn<'_>) -> std::io::Result<SpawnedProcess> {
     // against 0/1 regardless so a bogus pid can never signal envd's own group.
     let pid = child.id().unwrap_or_default();
 
-    // A bounded broadcast (capacity 64) is the per-process output bus: the
-    // pump publishes here and each connection subscribes. A subscriber that
-    // falls behind the ring is dropped on its own `Lagged` error instead of
-    // backpressuring the pump, so one stale subscriber can't wedge the fan-out.
-    // `initial` is created *before* the pump task so the first subscriber
+    // The per-process output bus (see `process::bus`): the pump publishes here
+    // and each connection holds a subscription. A subscriber that falls behind
+    // backpressures the pump rather than losing data, and one that makes no
+    // progress for the eviction window is disconnected on its own.
+    // `initial` is created *before* the pump task so the first subscription
     // never misses an early event.
-    let (tx, initial) = broadcast::channel::<PumpEvent>(64);
-    // A clone kept for `Connect` to subscribe later subscribers; the pump task
-    // moves `tx` itself below.
-    let sender = tx.clone();
+    let (bus, mut initial) = OutputBus::new();
+    // A clone kept for `Connect` to attach later subscribers; the pump task
+    // moves `bus` itself below.
+    let sender = Arc::clone(&bus);
+    // Duplicates of the output read ends outlive the pump task, so the grace
+    // branch can ask `FIONREAD` whether it abandoned buffered output or simply
+    // stopped a reader that had nothing left. Either duplicate keeps the pipe
+    // (or pty master) open after the pumps drop theirs, which is what makes the
+    // question answerable at all. `dup_owned` owns them so that *every* way out
+    // of the pump task -- either `select!` arm, or the task being dropped before
+    // it runs -- closes them, and its `F_DUPFD_CLOEXEC` keeps them out of the fd
+    // table of every child spawned from then on.
+    let drain_probes: Vec<std::fs::File> = {
+        let mut read_ends: Vec<RawFd> = Vec::new();
+        match &streams {
+            Streams::Pipes { stdout, stderr } => {
+                if let Some(stream) = stdout {
+                    read_ends.push(stream.as_raw_fd());
+                }
+                if let Some(stream) = stderr {
+                    read_ends.push(stream.as_raw_fd());
+                }
+            }
+            Streams::Pty(master) => read_ends.push(master.as_raw_fd()),
+        }
+        read_ends
+            .into_iter()
+            .filter_map(|fd| match dup_owned(fd) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    tracing::debug!("could not duplicate a drain probe: {error}");
+                    None
+                }
+            })
+            .collect()
+    };
     let (completion_tx, completion) = oneshot::channel();
     let terminal = Arc::new(std::sync::Mutex::new(None));
+    // The Start subscription gets the same terminal cache as later `Connect`s,
+    // so a bus that disappears before the terminal event still reports the real
+    // exit instead of an internal error.
+    initial.watch_terminal_cache(Arc::clone(&terminal));
     let terminal_for_pump = terminal.clone();
     let reaped = Arc::new(Notify::new());
     let reaped_for_pump = reaped.clone();
@@ -366,18 +404,29 @@ pub fn spawn(req: Spawn<'_>) -> std::io::Result<SpawnedProcess> {
     let termination_for_pump = termination.clone();
     let cgroup_for_pump = cgroup.clone();
 
+    let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let output_tx = tx.clone();
+        // Keeps the drain stop channel open for as long as the pumps run, so a
+        // closed sender can never be mistaken for "stop reading".
+        let stop_tx = stop_tx;
+        // The pumps get their own handle so the terminal event can still be
+        // published through `bus` once they finish.
+        let output_bus = Arc::clone(&bus);
+        // The pumps own a receiver clone; `stop_rx` stays here so the reap
+        // branch can read whether the grace already stopped them.
+        let output_stop = stop_rx.clone();
         let output = async move {
             match streams {
                 // `try_join!` awaits internally, so the pipe arm yields a
                 // `Result`; the pty arm has to be awaited to match it.
                 Streams::Pipes { stdout, stderr } => tokio::try_join!(
-                    pump_pipe(stdout, output_tx.clone(), false),
-                    pump_pipe(stderr, output_tx.clone(), true)
+                    pump_pipe(stdout, Arc::clone(&output_bus), output_stop.clone(), false),
+                    pump_pipe(stderr, Arc::clone(&output_bus), output_stop.clone(), true)
                 )
                 .map(|_| ()),
-                Streams::Pty(master) => pump_pty(master, output_tx.clone()).await,
+                Streams::Pty(master) => {
+                    pump_pty(master, Arc::clone(&output_bus), output_stop.clone()).await
+                }
             }
         };
         tokio::pin!(output);
@@ -399,25 +448,45 @@ pub fn spawn(req: Spawn<'_>) -> std::io::Result<SpawnedProcess> {
                 }
                 let wait_result = wait.await;
                 reaped_for_pump.notify_one();
+                // The child is reaped: process-table cleanup may proceed now.
+                // Draining the rest of the output stays independent of it.
+                let _ = completion_tx.send(());
                 terminal_after_output(kind, output_result, wait_result)
             }
             wait_result = &mut wait => {
                 reaped_for_pump.notify_one();
-                let output_result = tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut output).await;
-                terminal_after_wait(kind, pid, wait_result, output_result)
+                // The child is reaped: process-table cleanup may proceed now.
+                // Draining the rest of the output stays independent of it.
+                let _ = completion_tx.send(());
+                // Bound only the wait for *new* data. Once the direct child is
+                // reaped its buffered output is read to EOF, so the grace only
+                // decides how long to wait for a descendant that inherited the
+                // pipe; it never cancels a publish that is already in flight.
+                let grace_tx = stop_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(OUTPUT_DRAIN_GRACE).await;
+                    let _ = grace_tx.send(true);
+                });
+                let output_result = (&mut output).await;
+                let stopped = *stop_rx.borrow();
+                // Only a stopped reader can have abandoned anything, and only
+                // when bytes were actually left behind.
+                let abandoned =
+                    stopped && drain_probes.iter().any(|fd| unread_bytes(fd.as_raw_fd()) > 0);
+                terminal_after_wait(kind, pid, wait_result, output_result, stopped, abandoned)
             }
         };
+        // The probes answered the only question they exist for. Dropping them in
+        // one place, after the `select!`, is what keeps the output arm -- where
+        // the pumps finish first -- from leaking them.
+        drop(drain_probes);
         let terminal = decorate_terminal(terminal, &termination_for_pump, &cgroup_for_pump);
         let mut slot = terminal_for_pump
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(terminal.clone());
         drop(slot);
-        let _ = tx.send(terminal);
-        // Signal completion only after the terminal event is cached and
-        // published. This gives the supervisor a race-free handoff point for
-        // process-table removal.
-        let _ = completion_tx.send(());
+        let _ = bus.publish_terminal(terminal);
     });
 
     Ok(SpawnedProcess {
@@ -443,8 +512,13 @@ type ForkedChild = (
     Option<tokio::process::ChildStderr>,
 );
 
-/// A close-on-exec duplicate of `fd`, for the `std::process` fallback, which
-/// has to own one descriptor per standard stream.
+/// A close-on-exec duplicate of `fd`.
+///
+/// `F_DUPFD_CLOEXEC` rather than `dup` plus `fcntl`: envd spawns on many threads,
+/// so the duplicate must be unmistakably close-on-exec the moment it exists, or a
+/// concurrent `execve` inherits it. Both callers -- the `std::process` fallback,
+/// which has to own one descriptor per standard stream, and the drain probes in
+/// [`spawn`], which outlive their command -- rely on that.
 fn dup_owned(fd: RawFd) -> std::io::Result<std::fs::File> {
     // SAFETY: `fcntl` with a valid descriptor and flag; it returns a fresh fd.
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
@@ -501,7 +575,19 @@ fn spawn_forked(req: &Spawn<'_>, stdio: ChildStdio) -> std::io::Result<ForkedChi
 mod tests {
     use super::*;
     use crate::process::engine::tests::current_user;
+    use crate::process::engine::PumpEvent;
     use crate::process::wire::EndEvent;
+
+    /// The descriptor-counting tests below read the process-wide table, so they
+    /// must not run (and leak, if the code regresses) while the other one is
+    /// measuring. Other tests spawning concurrently can add a handful of
+    /// transient descriptors, which is what the tolerance in each assertion is
+    /// for.
+    static DESCRIPTOR_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Descriptors another test may hold open for the duration of one spawn.
+    /// The leak this guards against is two per command, so this cannot mask it.
+    const LEAK_TOLERANCE: usize = 4;
 
     #[tokio::test]
     async fn spawn_captures_stdout_stderr_and_exit() {
@@ -550,6 +636,158 @@ mod tests {
         assert_eq!(end.exit_code, 3);
         assert!(end.exited);
         assert_eq!(end.status, "exit status 3");
+    }
+
+    /// Regression for the drain probes below: they are created before the pumps
+    /// start and consulted only by the grace branch, so the branch where the
+    /// pumps finish first (about half of all short commands) used to drop their
+    /// raw descriptors without closing them -- a long-running daemon loses about
+    /// one per command, and every later child inherits the rest because `dup`
+    /// leaves `FD_CLOEXEC` clear.
+    ///
+    /// Which arm `select!` takes is not forceable from a test, so a run that
+    /// happens to take the wait branch every time passes; over 64 spawns that is
+    /// vanishingly unlikely, and the assertion cannot fail spuriously.
+    #[tokio::test]
+    async fn spawning_many_processes_does_not_leak_descriptors() {
+        let _serialized = DESCRIPTOR_TESTS.lock().await;
+        let user = current_user();
+        let env = HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
+
+        fn open_descriptors() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("/proc/self/fd")
+                .count()
+        }
+
+        async fn run_once(user: &User, env: &HashMap<String, String>) {
+            let mut proc = spawn(Spawn {
+                cmd: "/bin/sh",
+                args: &["-c".into(), "true".into()],
+                env: env.clone(),
+                cwd: "/".into(),
+                user,
+                stdin: false,
+                pty: None,
+                cgroup_fd: None,
+                process_cgroup: None,
+            })
+            .unwrap();
+            loop {
+                match proc.initial.recv().await {
+                    Ok(PumpEvent::End(_)) | Ok(PumpEvent::SpawnError(_)) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        }
+
+        // Warm-up: the first command creates the descriptors the daemon keeps
+        // (epoll, eventfd, the log file), which are not part of the steady state.
+        run_once(&user, &env).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let before = open_descriptors();
+        for _ in 0..64 {
+            run_once(&user, &env).await;
+        }
+        // The pump task closes the probes on its way out, just after it
+        // publishes the end event.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = open_descriptors();
+        assert!(
+            after <= before + LEAK_TOLERANCE,
+            "64 spawns grew the descriptor table from {before} to {after}"
+        );
+    }
+
+    /// The deterministic form of the same regression: a command that closes its
+    /// own `stdout`/`stderr` and then keeps running makes both pumps reach EOF
+    /// while `wait` is still pending, so `select!` takes the output arm *every*
+    /// time -- the arm that used to drop the probes without closing them. The
+    /// second command then shows whether envd's leftovers reached a child.
+    #[tokio::test]
+    async fn the_output_arm_closes_its_drain_probes() {
+        let _serialized = DESCRIPTOR_TESTS.lock().await;
+        let user = current_user();
+        let env = HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
+
+        async fn command(user: &User, env: &HashMap<String, String>, cmd: &str) -> String {
+            let mut proc = spawn(Spawn {
+                cmd: "/bin/sh",
+                args: &["-c".into(), cmd.into()],
+                env: env.clone(),
+                cwd: "/".into(),
+                user,
+                stdin: false,
+                pty: None,
+                cgroup_fd: None,
+                process_cgroup: None,
+            })
+            .unwrap();
+            let mut out = String::new();
+            loop {
+                match proc.initial.recv().await {
+                    Ok(PumpEvent::Data(d)) => {
+                        use base64::Engine;
+                        if let Some(s) = d.stdout {
+                            out.push_str(&String::from_utf8_lossy(
+                                &base64::engine::general_purpose::STANDARD.decode(s).unwrap(),
+                            ));
+                        }
+                    }
+                    Ok(PumpEvent::End(_)) | Ok(PumpEvent::SpawnError(_)) | Err(_) => return out,
+                    Ok(_) => continue,
+                }
+            }
+        }
+
+        // `/proc/self/fd` of the command itself: `ls` inherits its parent's
+        // table, so an inherited probe would be counted here.
+        let descriptors_of_a_command = "ls /proc/self/fd | wc -l";
+        let before: usize = command(&user, &env, descriptors_of_a_command)
+            .await
+            .trim()
+            .parse()
+            .expect("a descriptor count");
+
+        for _ in 0..8 {
+            command(&user, &env, "exec 1>&- 2>&-; sleep 0.05").await;
+        }
+        // The pump task closes the probes just after it publishes the end event.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let after: usize = command(&user, &env, descriptors_of_a_command)
+            .await
+            .trim()
+            .parse()
+            .expect("a descriptor count");
+        assert!(
+            after <= before + LEAK_TOLERANCE,
+            "after 8 output-arm commands a new command saw {after} descriptors, not {before}"
+        );
+    }
+
+    /// The deterministic half of the same bug: whichever arm the race picks, a
+    /// probe duplicate must never be inheritable by the next child.
+    #[test]
+    fn a_duplicated_probe_is_close_on_exec() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just created and are owned from here.
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same descriptors, each taken exactly once.
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let duplicate = dup_owned(read_end.as_raw_fd()).expect("duplicate a read end");
+        // SAFETY: `duplicate` is open and `F_GETFD` only reads flags.
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "a probe duplicate must not survive execve into a child"
+        );
+        drop(write_end);
     }
 
     #[tokio::test]

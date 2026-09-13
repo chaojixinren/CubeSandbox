@@ -223,6 +223,11 @@ pub struct EndEvent {
     pub oom_killed: Option<bool>,
     #[serde(rename = "killedBy", skip_serializing_if = "Option::is_none")]
     pub killed_by: Option<String>,
+    /// Set when the drain grace stopped reading with data still buffered: the
+    /// exit code is real, but the stream must not end as if the output were
+    /// complete.
+    #[serde(rename = "outputTruncated", skip_serializing_if = "is_false")]
+    pub output_truncated: bool,
 }
 
 fn is_zero_i32(v: &i32) -> bool {
@@ -242,6 +247,7 @@ impl EndEvent {
                 signal: None,
                 oom_killed: None,
                 killed_by: None,
+                output_truncated: false,
             }
         } else {
             let signo = status.signal().unwrap_or(0);
@@ -254,6 +260,7 @@ impl EndEvent {
                 signal: Some(signo),
                 oom_killed: None,
                 killed_by: None,
+                output_truncated: false,
             }
         }
     }
@@ -347,6 +354,7 @@ mod tests {
             signal: None,
             oom_killed: None,
             killed_by: None,
+            output_truncated: false,
         };
         let v = serde_json::to_value(EventEnvelope {
             event: Event::End(e),
@@ -383,6 +391,7 @@ mod tests {
             signal: None,
             oom_killed: None,
             killed_by: None,
+            output_truncated: false,
         };
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["exitCode"], 3);
@@ -396,6 +405,7 @@ mod tests {
             signal: Some(9),
             oom_killed: None,
             killed_by: None,
+            output_truncated: false,
         };
         let v = serde_json::to_value(&killed).unwrap();
         assert_eq!(v["exitCode"], -1);
