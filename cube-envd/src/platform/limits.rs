@@ -55,20 +55,33 @@ const DOWNLOAD_MAX_BODIES_ENV: &str = "CUBE_ENVD_DOWNLOAD_MAX_BODIES";
 const DOWNLOAD_MAX_BODIES_CEILING: usize = 1024;
 
 static BLOCKING_THREADS: OnceLock<usize> = OnceLock::new();
+static MAX_BODIES: OnceLock<usize> = OnceLock::new();
+
+/// Adjudicate the command-line flags once, before the runtime is built. The
+/// flags are the entrypoint's documented surface (`ENVD_EXTRA_ARGS` forwards
+/// flags, and only flags cube-envd declares), so they win over the equivalent
+/// environment variables; either way the value is clamped and logged rather
+/// than refused.
+///
+/// Called by `main.rs` exactly once; every accessor falls back to the
+/// environment and then to its default when it has not been called (unit
+/// tests, and any caller that runs before startup).
+pub fn configure(blocking_threads_flag: Option<usize>, max_bodies_flag: Option<usize>) {
+    if let Some(flag) = blocking_threads_flag {
+        let _ = BLOCKING_THREADS.set(clamp_blocking_threads(flag, "flag -blocking-threads"));
+    }
+    if let Some(flag) = max_bodies_flag {
+        // The cap's floor depends on the pool, so resolve the pool first (the
+        // flag above, else the environment, else the default).
+        let pool = blocking_threads();
+        let _ = MAX_BODIES.set(effective_max_bodies(Some(flag), None, pool));
+    }
+}
 
 /// Blocking-pool cap: `CUBE_ENVD_BLOCKING_THREADS`, else the default.
 pub fn blocking_threads() -> usize {
-    *BLOCKING_THREADS.get_or_init(|| {
-        let raw = match std::env::var(BLOCKING_THREADS_ENV) {
-            Ok(raw) => Some(raw),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(e) => {
-                tracing::warn!("limits: cannot read {BLOCKING_THREADS_ENV}: {e}");
-                None
-            }
-        };
-        blocking_threads_from(raw.as_deref())
-    })
+    *BLOCKING_THREADS
+        .get_or_init(|| effective_blocking_threads(None, env_var(BLOCKING_THREADS_ENV).as_deref()))
 }
 
 /// How many `/files` bodies may run the blocking (pool-thread) producer.
@@ -88,16 +101,47 @@ pub fn download_buffered_bodies() -> usize {
 
 /// Global cap on concurrent large `/files` downloads (see the env doc above).
 pub fn download_max_bodies() -> usize {
-    let pool = blocking_threads();
-    let raw = match std::env::var(DOWNLOAD_MAX_BODIES_ENV) {
+    *MAX_BODIES.get_or_init(|| {
+        let pool = blocking_threads();
+        effective_max_bodies(None, env_var(DOWNLOAD_MAX_BODIES_ENV).as_deref(), pool)
+    })
+}
+
+fn env_var(name: &str) -> Option<String> {
+    match std::env::var(name) {
         Ok(raw) => Some(raw),
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => {
-            tracing::warn!("limits: cannot read {DOWNLOAD_MAX_BODIES_ENV}: {e}");
+            tracing::warn!("limits: cannot read {name}: {e}");
             None
         }
-    };
-    download_max_bodies_from(raw.as_deref(), pool)
+    }
+}
+
+/// The flag wins over the environment; both go through the same clamps.
+fn effective_blocking_threads(flag: Option<usize>, env: Option<&str>) -> usize {
+    match flag {
+        Some(n) => clamp_blocking_threads(n, "flag -blocking-threads"),
+        None => blocking_threads_from(env),
+    }
+}
+
+fn clamp_blocking_threads(n: usize, source: &str) -> usize {
+    if (BLOCKING_THREADS_MIN..=BLOCKING_THREADS_MAX).contains(&n) {
+        n
+    } else {
+        let clamped = n.clamp(BLOCKING_THREADS_MIN, BLOCKING_THREADS_MAX);
+        tracing::warn!("limits: {source}={n} is out of range; using {clamped}");
+        clamped
+    }
+}
+
+/// The flag wins over the environment; the floor and ceiling apply to both.
+fn effective_max_bodies(flag: Option<usize>, env: Option<&str>, pool: usize) -> usize {
+    match flag {
+        Some(n) => download_max_bodies_from(Some(&n.to_string()), pool),
+        None => download_max_bodies_from(env, pool),
+    }
 }
 
 fn download_buffered_bodies_at(pool: usize) -> usize {
@@ -113,21 +157,20 @@ fn download_max_bodies_from(raw: Option<&str>, pool: usize) -> usize {
     match raw.parse::<usize>() {
         Ok(0) | Err(_) => {
             tracing::warn!(
-                "limits: ignoring invalid {DOWNLOAD_MAX_BODIES_ENV}={raw:?}; \
+                "limits: ignoring invalid download body cap {raw:?}; \
                  expected a positive body count"
             );
             default
         }
         Ok(n) if n < floor => {
             tracing::warn!(
-                "limits: {DOWNLOAD_MAX_BODIES_ENV}={n} is below what the pipeline needs; \
-                 using the floor {floor}"
+                "limits: download body cap {n} is below what the pipeline needs; using {floor}"
             );
             floor
         }
         Ok(n) if n > DOWNLOAD_MAX_BODIES_CEILING => {
             tracing::warn!(
-                "limits: clamping {DOWNLOAD_MAX_BODIES_ENV}={n} to {DOWNLOAD_MAX_BODIES_CEILING}"
+                "limits: clamping download body cap {n} to {DOWNLOAD_MAX_BODIES_CEILING}"
             );
             DOWNLOAD_MAX_BODIES_CEILING
         }
@@ -220,6 +263,33 @@ mod tests {
         // Smaller pools scale the whole thing down, floor included.
         assert_eq!(download_max_bodies_from(None, 8), 16);
         assert_eq!(download_max_bodies_from(Some("1"), 8), 6);
+    }
+
+    /// A flag beats the environment, and both go through the same clamps.
+    #[test]
+    fn a_flag_wins_over_the_environment() {
+        assert_eq!(effective_blocking_threads(Some(8), Some("32")), 8);
+        assert_eq!(effective_blocking_threads(None, Some("32")), 32);
+        assert_eq!(
+            effective_blocking_threads(Some(1), None),
+            BLOCKING_THREADS_MIN
+        );
+        assert_eq!(
+            effective_blocking_threads(Some(4096), None),
+            BLOCKING_THREADS_MAX
+        );
+
+        assert_eq!(effective_max_bodies(Some(256), Some("64"), 64), 256);
+        assert_eq!(effective_max_bodies(None, Some("64"), 64), 64);
+        assert_eq!(
+            effective_max_bodies(Some(1), None, 64),
+            48,
+            "floor applies to flags too"
+        );
+        assert_eq!(
+            effective_max_bodies(Some(9999), None, 64),
+            DOWNLOAD_MAX_BODIES_CEILING
+        );
     }
 
     #[test]

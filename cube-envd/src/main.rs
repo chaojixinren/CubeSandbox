@@ -38,6 +38,10 @@ fn main() {
         .with_target(false)
         .init();
 
+    // Deployment knobs first (see platform/limits.rs): the flags from
+    // ENVD_EXTRA_ARGS win, the CUBE_ENVD_* variables are the fallback.
+    platform::limits::configure(cli.blocking_threads, cli.download_max_bodies);
+
     // Deployment knob (see platform/limits.rs): 64 is the default, chosen so
     // the pool's worst-case touched RSS (~13KiB/thread) stays inside this
     // in-guest daemon's budget while covering the sandbox's dozens-of-ops

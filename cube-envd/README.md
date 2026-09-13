@@ -277,7 +277,11 @@ There is no direct fallback into the type parent: these parents distribute
 memory/cpu to child leaves and cannot also accept internal processes under
 cgroup v2's no-internal-process constraint. There is no PID-0 migration probe.
 
-Configuration:
+Configuration. Every variable below is read from envd's own environment; the
+two deployment knobs also exist as flags (`-blocking-threads`,
+`-download-max-bodies`) so `ENVD_EXTRA_ARGS` can carry them, and a flag wins
+over the variable. See the "Tuning envd" section of
+`docs/guide/tutorials/bring-your-own-image.md` for the user-facing version.
 
 - `CUBE_ENVD_BLOCKING_THREADS`: blocking-pool thread cap, default `64`,
   clamped to `4..=256` (an invalid value warns and keeps the default rather
