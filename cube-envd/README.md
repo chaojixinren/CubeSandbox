@@ -184,6 +184,18 @@ load-bearing ones, and why cube-envd differs:
   (`upload.go resolvePath`). A second part resolving to the same path is
   rejected with the first write left in place, and a multipart body with no
   `file` part answers `200` with an empty array.
+- **`-version` reports the emulated upstream generation, not the crate
+  version.** Callers gate features on this string: the E2B SDKs compare a
+  sandbox's reported version against per-feature minimums (recursive watch
+  0.1.4, command stdin 0.3.0, default user 0.4.0, closeStdin 0.5.2,
+  octet-stream upload 0.5.7, file metadata 0.6.2, watch `includeEntry` 0.6.3,
+  network mounts 0.6.4), and the platform records it as the template's
+  `envdVersion`. Reporting `0.1.0` made every gate answer "too old", so
+  `-version` prints the generation cube-envd is locked to (`0.5.13`) and the
+  build's real short sha comes from `-commit`, with the implementation version
+  in the startup log. `X-Envd-Version`, the header later E2B daemons answer on
+  `POST /init`, is deliberately absent because the 0.5.13 baseline does not
+  send it.
 - **CLI parsing is stricter than Go's `flag` (documented).** *Unlike the
   upstream Go envd, cube-envd strictly validates every command-line argument:
   an invalid flag, a positional argument or a malformed value terminates

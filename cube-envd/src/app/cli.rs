@@ -9,7 +9,22 @@
 //!
 //! Source: `main.rs`.
 
-pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The upstream envd generation this implementation is protocol-locked to.
+///
+/// Callers *gate features* on this string: the E2B SDKs compare a sandbox's
+/// reported version against per-feature minimums (0.1.4 recursive watch,
+/// 0.3.0 command stdin, 0.4.0 default user, 0.5.2 closeStdin, 0.5.7
+/// octet-stream upload, 0.6.2 file metadata, 0.6.3 watch `includeEntry`,
+/// 0.6.4 network mounts), and the platform records it as the template's
+/// `envdVersion`. Reporting this crate's own version instead makes every one
+/// of those gates answer "too old" and silently disables behaviour that works
+/// here, so `-version` prints the *compatibility* version. Traceability comes
+/// from `-commit` (the build wires `CUBE_ENVD_COMMIT`) and the startup log,
+/// which prints the implementation version as well.
+pub(crate) const VERSION: &str = "0.5.13";
+
+/// This implementation's own version. Diagnostics only: nothing gates on it.
+pub(crate) const IMPL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const COMMIT: &str = match option_env!("CUBE_ENVD_COMMIT") {
     Some(c) => c,
     None => "unknown",
@@ -274,6 +289,15 @@ mod tests {
         // ErrHelp short-circuits during the scan, so help wins either way.
         assert_eq!(exit_code(&["-h", "-version"]), Some(0));
         assert_eq!(exit_code(&["-version", "-h"]), Some(0));
+    }
+
+    #[test]
+    /// Callers gate features on `VERSION`, so it must stay the emulated
+    /// upstream generation rather than the crate version. See the constant's
+    /// doc comment.
+    fn version_reports_the_emulated_upstream_generation() {
+        assert_eq!(VERSION, "0.5.13");
+        assert_ne!(IMPL_VERSION, VERSION);
     }
 
     #[test]
