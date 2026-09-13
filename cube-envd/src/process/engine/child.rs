@@ -39,6 +39,16 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
 
+/// What the child's fds 0/1/2 become before `execve`.
+#[derive(Clone, Copy)]
+pub(super) enum ChildStdio {
+    /// Pipes this module creates; `stdin == false` gives the child `/dev/null`.
+    Pipes { stdin: bool },
+    /// A caller-owned descriptor installed on all three. A pty uses this for
+    /// its slave, and the caller keeps the master it talks to.
+    Inherit(RawFd),
+}
+
 /// How to start one child.
 pub(super) struct ChildSpec<'a> {
     /// The program as the caller named it; `argv[0]` keeps this spelling even
@@ -49,7 +59,7 @@ pub(super) struct ChildSpec<'a> {
     pub(super) env: &'a HashMap<String, String>,
     /// `PATH` for resolving a bare `cmd`, already resolved by the caller.
     pub(super) path: &'a str,
-    pub(super) stdin_enabled: bool,
+    pub(super) stdio: ChildStdio,
     /// Runs in the child before `execve`: cgroup placement, session and process
     /// group, credential drop, `chdir`.
     pub(super) before_exec: &'a mut dyn FnMut() -> std::io::Result<()>,
@@ -396,7 +406,7 @@ pub(super) fn spawn_without_fork(spec: ChildSpec<'_>) -> Result<RawChild, SpawnF
         args,
         env,
         path,
-        stdin_enabled,
+        stdio,
         before_exec,
     } = spec;
     let nul = |what: &str| {
@@ -428,21 +438,44 @@ pub(super) fn spawn_without_fork(spec: ChildSpec<'_>) -> Result<RawChild, SpawnF
     // carries close-on-exec, so execve drops them there. The parent's ends are
     // adopted into tokio before the clone, so a registration failure cannot
     // strand a running child.
-    let (stdin_child, stdin) = if stdin_enabled {
-        let (read, write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
-        let writer = tokio::process::ChildStdin::from_std(ChildStdin::from(write))
-            .map_err(SpawnFailure::Child)?;
-        (Some(read), Some(writer))
-    } else {
-        (Some(open_devnull().map_err(SpawnFailure::Child)?), None)
+    let (stdin_child, stdin, stdout_write, stderr_write, stdout, stderr) = match stdio {
+        ChildStdio::Pipes { stdin: want } => {
+            let (stdin_child, stdin) = if want {
+                let (read, write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
+                let writer = tokio::process::ChildStdin::from_std(ChildStdin::from(write))
+                    .map_err(SpawnFailure::Child)?;
+                (Some(read), Some(writer))
+            } else {
+                (Some(open_devnull().map_err(SpawnFailure::Child)?), None)
+            };
+            let (stdout_read, stdout_write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
+            let (stderr_read, stderr_write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
+            let stdout = tokio::process::ChildStdout::from_std(ChildStdout::from(stdout_read))
+                .map_err(SpawnFailure::Child)?;
+            let stderr = tokio::process::ChildStderr::from_std(ChildStderr::from(stderr_read))
+                .map_err(SpawnFailure::Child)?;
+            (
+                stdin_child,
+                stdin,
+                Some(stdout_write),
+                Some(stderr_write),
+                Some(stdout),
+                Some(stderr),
+            )
+        }
+        // Nothing to create: the caller's descriptor is installed on 0/1/2 by
+        // the child, and the caller keeps whatever it talks to (a pty master).
+        ChildStdio::Inherit(_) => (None, None, None, None, None, None),
     };
-    let (stdout_read, stdout_write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
-    let (stderr_read, stderr_write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
     let (report_read, report_write) = pipe_cloexec().map_err(SpawnFailure::Child)?;
-    let stdout = tokio::process::ChildStdout::from_std(ChildStdout::from(stdout_read))
-        .map_err(SpawnFailure::Child)?;
-    let stderr = tokio::process::ChildStderr::from_std(ChildStderr::from(stderr_read))
-        .map_err(SpawnFailure::Child)?;
+    let (stdin_fd, stdout_fd, stderr_fd) = match stdio {
+        ChildStdio::Pipes { .. } => (
+            stdin_child.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+            stdout_write.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+            stderr_write.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+        ),
+        ChildStdio::Inherit(fd) => (fd, fd, fd),
+    };
 
     // A private stack for the child: see `ChildStack` for why the daemon's own
     // stack cannot be shared. Failing to map it is a resource problem, not a
@@ -453,9 +486,9 @@ pub(super) fn spawn_without_fork(spec: ChildSpec<'_>) -> Result<RawChild, SpawnF
         argv: &argv_ptrs,
         envp: &envp_ptrs,
         before_exec,
-        stdin_fd: stdin_child.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
-        stdout_fd: stdout_write.as_raw_fd(),
-        stderr_fd: stderr_write.as_raw_fd(),
+        stdin_fd,
+        stdout_fd,
+        stderr_fd,
         report_fd: report_write.as_raw_fd(),
     };
 
@@ -521,8 +554,8 @@ pub(super) fn spawn_without_fork(spec: ChildSpec<'_>) -> Result<RawChild, SpawnF
         pid,
         pidfd: pidfd_open(pid),
         stdin,
-        stdout: Some(stdout),
-        stderr: Some(stderr),
+        stdout,
+        stderr,
     })
 }
 
@@ -571,7 +604,7 @@ mod tests {
             args: &[],
             env: &env,
             path: "/usr/bin:/bin",
-            stdin_enabled: false,
+            stdio: ChildStdio::Pipes { stdin: false },
             before_exec: &mut before_exec,
         }) {
             Ok(_) => panic!("a failing setup must fail the spawn"),

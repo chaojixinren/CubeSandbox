@@ -30,22 +30,59 @@ pub fn kill_process_group(pid: u32, signo: i32) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::process::engine::tests::current_user;
-    use crate::process::engine::{spawn_with_cgroup, PumpEvent};
+    use crate::process::engine::{spawn, PumpEvent, Spawn};
     use std::collections::HashMap;
 
     #[tokio::test]
     async fn signal_end_event_shape() {
         let user = current_user();
-        let mut proc = spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 30".into()],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            false,
-            None,
-            None,
-        )
+        let mut proc = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 30".into()],
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        kill_process_group(proc.pid, libc::SIGKILL).unwrap();
+        let mut end = None;
+        loop {
+            match proc.initial.recv().await {
+                Ok(PumpEvent::End(e)) => {
+                    end = Some(e);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let end = end.unwrap();
+        assert_eq!(end.exit_code, -1);
+        assert!(!end.exited);
+        assert_eq!(end.status, "signal: killed");
+    }
+
+    /// The pty path reaps and decorates its terminal event the same way pipes
+    /// do, including when the process group is killed from outside.
+    #[tokio::test]
+    async fn signal_end_event_shape_for_a_pty() {
+        let user = current_user();
+        let mut proc = spawn(Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 30".into()],
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            pty: Some((80, 24)),
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         kill_process_group(proc.pid, libc::SIGKILL).unwrap();

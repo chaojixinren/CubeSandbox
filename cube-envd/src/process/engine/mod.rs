@@ -9,8 +9,10 @@
 //! `exec.Cmd` behaviours it mirrors (session/controlling terminal, credential
 //! drop, process-group and cgroup placement, output draining).
 //!
-//! Existing `engine::*` entry points remain available while spawn configuration,
-//! PTY setup, IO and process-group cleanup live in private submodules.
+//! Layout: `spawn` holds the single entry point, command configuration and
+//! privilege setup; `pty` allocates the terminal pair and resizes it; `io` owns
+//! the output pumps and the terminal policy; `cleanup` tears process groups
+//! down; `child` is the clone/exec mechanism underneath all of them.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,11 +26,8 @@ mod spawn;
 
 pub use cleanup::kill_process_group;
 pub use io::{write_pty, InputHandle, InputWriter, PumpEvent};
-pub use pty::{resize_pty, spawn_pty_with_cgroup};
-pub use spawn::{merged_env, resolve_cwd, spawn_with_cgroup};
-
-#[cfg(test)]
-pub use pty::spawn_pty;
+pub use pty::resize_pty;
+pub use spawn::{merged_env, resolve_cwd, spawn, Spawn};
 
 #[derive(Debug)]
 pub struct SpawnedProcess {

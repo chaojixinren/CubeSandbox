@@ -1,23 +1,13 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! PTY allocation, controlling-terminal process creation and window resizing.
+//! PTY allocation and window resizing.
+//!
+//! Creating the process on the other end of the pty is [`super::spawn`]'s job:
+//! it asks for a pty through `Spawn::pty` and hands the slave to the mechanism
+//! as `ChildStdio::Inherit`, so both kinds of command share one spawn path.
 
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-
-use tokio::io::unix::AsyncFd;
-use tokio::sync::{broadcast, oneshot, Notify};
-
-use crate::platform::identity::User;
-
-use super::io::{
-    decorate_terminal, pump_pty, terminal_after_output, terminal_after_wait, OUTPUT_DRAIN_GRACE,
-};
-use super::spawn::child_pre_exec;
-use super::{InputWriter, PumpEvent, SpawnedProcess};
+use std::os::fd::{AsRawFd, FromRawFd};
 
 /// Allocate a pty pair the portable, non-libutil way and return `(master,
 /// slave)`.
@@ -30,7 +20,7 @@ use super::{InputWriter, PumpEvent, SpawnedProcess};
 /// and musl (this is also the sequence upstream `creack/pty` uses). Both fds
 /// carry `O_CLOEXEC` so the master never leaks into the child's fd table and
 /// keeps the pty open past the child's exit.
-fn open_pty(cols: u16, rows: u16) -> std::io::Result<(std::fs::File, std::fs::File)> {
+pub(super) fn open_pty(cols: u16, rows: u16) -> std::io::Result<(std::fs::File, std::fs::File)> {
     let master = unsafe {
         libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK)
     };
@@ -53,6 +43,8 @@ fn open_pty(cols: u16, rows: u16) -> std::io::Result<(std::fs::File, std::fs::Fi
     }
     let path = std::ffi::CString::new(format!("/dev/pts/{minor}"))
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pty path"))?;
+    // Close-on-exec: 0/1/2 keep it across `execve` (dup2 clears the flag), and
+    // the child does not inherit a stray fourth reference to its own terminal.
     let slave = unsafe {
         libc::open(
             path.as_ptr(),
@@ -106,152 +98,30 @@ pub fn resize_pty(master: &std::fs::File, cols: u16, rows: u16) -> std::io::Resu
     }
 }
 
-/// Spawn a command with its stdio attached to a freshly allocated pty.
-///
-/// The slave becomes the child's stdin/stdout/stderr (so stdout and stderr
-/// merge into the single master, and later `SendInput` writes the master); the
-/// master is what the pump reads the child's output from. A pty keeps its
-/// default line discipline (ONLCR on), so the child's `\n` reaches the master
-/// as `\r\n` — the baseline `data.pty` payload is CRLF-translated.
-///
-/// `cols`/`rows` seed the window size at allocation (`TIOCSWINSZ`); zero values
-/// are passed through, matching upstream's empty `pty.Winsize{}`.
-#[cfg(test)]
-pub fn spawn_pty(
-    cmd: &str,
-    args: &[String],
-    env: HashMap<String, String>,
-    cwd: String,
-    user: &User,
-    size: (u16, u16),
-    cgroup_fd: Option<RawFd>,
-) -> std::io::Result<SpawnedProcess> {
-    spawn_pty_with_cgroup(cmd, args, env, cwd, user, size, cgroup_fd, None)
-}
-
-/// PTY variant of [`super::spawn_with_cgroup`].
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_pty_with_cgroup(
-    cmd: &str,
-    args: &[String],
-    env: HashMap<String, String>,
-    cwd: String,
-    user: &User,
-    size: (u16, u16),
-    cgroup_fd: Option<RawFd>,
-    process_cgroup: Option<Arc<crate::process::cgroup::ProcessCgroup>>,
-) -> std::io::Result<SpawnedProcess> {
-    // `open_pty` returns (master, slave); `Stdio::from(File)` dups the slave
-    // fd onto 0/1/2 in the child, needing three handles because `Stdio::from`
-    // consumes its `File` (the original is the one consumed last).
-    let (cols, rows) = size;
-    let (master_file, slave_file) = open_pty(cols, rows)?;
-    // Separate dups are retained for Update and input; the pump task owns the
-    // original below. Input writes are serialized by the process-owned mutex.
-    let resize_master = master_file.try_clone()?;
-    let input_master = master_file.try_clone()?;
-    // Register both async master handles before spawning. If registration
-    // fails, no child exists yet and all PTY descriptors are dropped cleanly.
-    let master = AsyncFd::new(master_file)?;
-    let input = Arc::new(tokio::sync::Mutex::new(InputWriter::Pty(AsyncFd::new(
-        input_master,
-    )?)));
-
-    let mut command = tokio::process::Command::new(cmd);
-    command
-        .args(args)
-        .env_clear()
-        .envs(&env)
-        .stdin(Stdio::from(slave_file.try_clone()?))
-        .stdout(Stdio::from(slave_file.try_clone()?))
-        .stderr(Stdio::from(slave_file))
-        .kill_on_drop(false);
-    unsafe {
-        command.pre_exec(child_pre_exec(user, &cwd, cgroup_fd, true)?);
-    }
-
-    let mut child = command.spawn()?;
-    let pid = child.id().unwrap_or_default();
-
-    let (tx, initial) = broadcast::channel::<PumpEvent>(64);
-    // A clone kept for `Connect` to subscribe later subscribers; the pump task
-    // moves `tx` itself below.
-    let sender = tx.clone();
-    let (completion_tx, completion) = oneshot::channel();
-    let terminal = Arc::new(std::sync::Mutex::new(None));
-    let terminal_for_pump = terminal.clone();
-    let reaped = Arc::new(Notify::new());
-    let reaped_for_pump = reaped.clone();
-    let termination = Arc::new(Mutex::new(None));
-    let cgroup = Arc::new(Mutex::new(process_cgroup));
-    let termination_for_pump = termination.clone();
-    let cgroup_for_pump = cgroup.clone();
-
-    tokio::spawn(async move {
-        let output = pump_pty(master, tx.clone());
-        tokio::pin!(output);
-        let wait = child.wait();
-        tokio::pin!(wait);
-
-        let terminal = tokio::select! {
-            output_result = &mut output => {
-                if let Err(error) = &output_result {
-                    tracing::warn!(pid, "error reading from pty: {error}");
-                }
-                let wait_result = wait.await;
-                reaped_for_pump.notify_one();
-                terminal_after_output("pty", output_result, wait_result)
-            }
-            wait_result = &mut wait => {
-                reaped_for_pump.notify_one();
-                let output_result = tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut output).await;
-                terminal_after_wait("pty", pid, wait_result, output_result)
-            }
-        };
-        let terminal = decorate_terminal(terminal, &termination_for_pump, &cgroup_for_pump);
-        let mut slot = terminal_for_pump
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(terminal.clone());
-        drop(slot);
-        let _ = tx.send(terminal);
-        let _ = completion_tx.send(());
-    });
-
-    Ok(SpawnedProcess {
-        pid,
-        initial,
-        sender,
-        pty_master: Some(resize_master),
-        input,
-        completion,
-        terminal,
-        reaped,
-        termination,
-        cgroup,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::process::engine::spawn::DEFAULT_PATH;
     use crate::process::engine::tests::current_user;
+    use crate::process::engine::{spawn, PumpEvent, Spawn};
     use crate::process::wire::EndEvent;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn spawn_pty_captures_output_and_exit() {
         let user = current_user();
         let env = HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
-        let mut proc = spawn_pty(
-            "/bin/sh",
-            &["-c".into(), "echo pty-test".into()],
+        let mut proc = spawn(Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &["-c".into(), "echo pty-test".into()],
             env,
-            "/".into(),
-            &user,
-            (80, 24),
-            None,
-        )
+            cwd: "/".into(),
+            user: &user,
+            pty: Some((80, 24)),
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         assert!(proc.pid > 0);
 
@@ -298,18 +168,20 @@ mod tests {
         }
 
         let user = current_user();
-        let mut proc = spawn_pty(
-            "/bin/sh",
-            &[
+        let mut proc = spawn(Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &[
                 "-c".into(),
                 "setsid /bin/sh -c 'trap \"\" HUP; sleep 10' & echo DESC:$!; exit 0".into(),
             ],
-            HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]),
-            "/".into(),
-            &user,
-            (80, 24),
-            None,
-        )
+            env: HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]),
+            cwd: "/".into(),
+            user: &user,
+            pty: Some((80, 24)),
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let direct_pid = proc.pid;
         let mut output = Vec::new();
@@ -397,18 +269,20 @@ mod tests {
         use base64::Engine;
 
         let user = current_user();
-        let mut proc = spawn_pty(
-            "/bin/sh",
-            &[
+        let mut proc = spawn(Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &[
                 "-c".into(),
                 "if { : </dev/tty; } 2>/dev/null; then echo DEVTTY=yes; else echo DEVTTY=no; fi; ps -o pid= -o sid= -o pgid= -o tpgid= -p $$".into(),
             ],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            (80, 24),
-            None,
-        )
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            pty: Some((80, 24)),
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let pid = proc.pid;
 
@@ -459,19 +333,21 @@ mod tests {
         use base64::Engine;
 
         let user = current_user();
-        let mut proc = spawn_pty(
-            "/bin/sh",
-            &[
+        let mut proc = spawn(Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &[
                 "-c".into(),
                 "trap 'echo WINCH; stty size; exit 0' WINCH; echo READY; while :; do sleep 1; done"
                     .into(),
             ],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            (80, 24),
-            None,
-        )
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            pty: Some((80, 24)),
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let resize_master = proc.pty_master.take().expect("PTY resize fd");
         let mut output = Vec::new();

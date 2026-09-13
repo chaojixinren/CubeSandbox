@@ -113,8 +113,8 @@ pub fn start(
     let cwd = match engine::resolve_cwd(req.process.cwd.as_deref(), &user) {
         Ok(c) => c,
         Err(msg) => {
-            // Invalid working directory: reject like upstream instead of
-            // silently running in `/` (#1227: no silent success).
+            // Invalid working directory: reject like upstream rather than
+            // silently running in `/`.
             return stream_error_response(ConnectError::new(ConnectCode::InvalidArgument, msg));
         }
     };
@@ -136,35 +136,25 @@ pub fn start(
     // downstream (broadcast pump → drive_stream) is identical because the pty
     // master publishes the same `DataEvent { pty }` onto the same bus.
     let spawn_once = |cgroup_fd, cgroup_for_spawn: Option<Arc<cgroup::ProcessCgroup>>| {
-        if let Some(pty) = &req.pty {
-            let (cols, rows) = pty
-                .size
-                .as_ref()
-                .map(|s| (s.cols as u16, s.rows as u16))
-                .unwrap_or((0, 0));
-            engine::spawn_pty_with_cgroup(
-                &wrapper_cmd,
-                &wrapper_args,
-                env.clone(),
-                cwd.clone(),
-                &user,
-                (cols, rows),
-                cgroup_fd,
-                cgroup_for_spawn,
+        let pty = req.pty.as_ref().map(|pty| {
+            let size = pty.size.as_ref();
+            (
+                size.map(|s| s.cols as u16).unwrap_or(0),
+                size.map(|s| s.rows as u16).unwrap_or(0),
             )
-        } else {
+        });
+        engine::spawn(engine::Spawn {
+            cmd: &wrapper_cmd,
+            args: &wrapper_args,
+            env: env.clone(),
+            cwd: cwd.clone(),
+            user: &user,
             // Backwards compatibility: an omitted Start.stdin defaults to true.
-            engine::spawn_with_cgroup(
-                &wrapper_cmd,
-                &wrapper_args,
-                env.clone(),
-                cwd.clone(),
-                &user,
-                req.stdin.unwrap_or(true),
-                cgroup_fd,
-                cgroup_for_spawn,
-            )
-        }
+            stdin: req.stdin.unwrap_or(true),
+            pty,
+            cgroup_fd,
+            process_cgroup: cgroup_for_spawn,
+        })
     };
     let spawn_result = spawn_once(
         process_cgroup.as_deref().map(cgroup::ProcessCgroup::fd),
@@ -893,16 +883,17 @@ mod tests {
         use base64::Engine;
 
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/cat",
-            &[],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            true,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/cat",
+            args: &[],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: true,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, mut events, _completion, _sender, _reaped, _termination) =
             insert_spawned(&table, spawned);
@@ -959,18 +950,20 @@ mod tests {
         use base64::Engine;
 
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        let spawned = engine::spawn_pty(
-            "/bin/sh",
-            &[
+        let spawned = engine::spawn(engine::Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &[
                 "-c".into(),
                 "read line; printf 'got:%s\\n' \"$line\"; read rest".into(),
             ],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            (80, 24),
-            None,
-        )
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            pty: Some((80, 24)),
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, mut events, _completion, _sender, _reaped, _termination) =
             insert_spawned(&table, spawned);
@@ -1062,16 +1055,17 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 1".into()],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            false,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 1".into()],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
             insert_spawned(&table, spawned);
@@ -1111,16 +1105,17 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 1".into()],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            false,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 1".into()],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
             insert_spawned(&table, spawned);
@@ -1181,16 +1176,17 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 1".into()],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            false,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 1".into()],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
             insert_spawned(&table, spawned);
@@ -1235,16 +1231,17 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 30".into()],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            false,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 30".into()],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
             insert_spawned(&table, spawned);
@@ -1293,16 +1290,17 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 1 & exit 0".into()],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            false,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 1 & exit 0".into()],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
             insert_spawned(&table, spawned);
@@ -1358,16 +1356,17 @@ mod tests {
         let table = Arc::new(ProcessTable::new(Arc::new(
             crate::process::cgroup::NoopManager,
         )));
-        let spawned = engine::spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "while :; do printf 1234567890; done".into()],
-            std::collections::HashMap::new(),
-            "/".into(),
-            &current_user(),
-            false,
-            None,
-            None,
-        )
+        let spawned = engine::spawn(engine::Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "while :; do printf 1234567890; done".into()],
+            env: std::collections::HashMap::new(),
+            cwd: "/".into(),
+            user: &current_user(),
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let (pid, handle, events, completion, sender, reaped, termination) =
             insert_spawned(&table, spawned);
