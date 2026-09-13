@@ -49,7 +49,7 @@ cube-envd/                            the component directory; everything below 
 │   │   ├── http/                     content_disposition, encoding, httpdate, preconditions, ranges
 │   │   ├── watch/                    inotify.rs, pump.rs, tree.rs
 │   │   ├── data_plane_tests.rs       data-plane tests
-│   │   ├── download.rs
+│   │   ├── download/                 mod.rs (ServeContent stages, Range/conditionals), body.rs (pipeline: pool, budgets, shapes), tests.rs
 │   │   ├── entry.rs                  disk metadata -> EntryInfo
 │   │   ├── errors.rs                 error -> gRPC status mapping
 │   │   ├── mod.rs                    stat / listDir / makeDir / move / remove
@@ -92,6 +92,13 @@ in. Every path in the block resolves, and leaf directories with one uniform
 purpose are summarised in the annotation rather than expanded. Not listed: `target/`
 (cargo's build directory, ignored by `cube-envd/.gitignore`), `.gitignore`
 itself, and this README.
+
+A file is split when its **non-test** code passes 800 lines *and* it holds two
+responsibility areas that share no state. Both conditions matter: `command.rs` is
+1,644 lines but 1,084 of them are tests, and `handlers.rs` is 521 lines of one
+responsibility. `download.rs` (945 non-test lines: the ServeContent stage machine
+plus the body pipeline, which owns its own pool and budgets) met both and is now
+`download.rs` + `download/body.rs` + `download/tests.rs`.
 
 `filesystem/` and `process/` never reference each other, and nothing below
 `app/` reaches back into it. That is enforced rather than merely intended:

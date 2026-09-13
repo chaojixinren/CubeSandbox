@@ -15,11 +15,9 @@
 use std::sync::OnceLock;
 
 /// Blocking-pool thread cap (`max_blocking_threads`). 64 keeps the pool's
-/// worst-case touched RSS (~13 KiB/thread) inside this daemon's budget while
-/// leaving headroom for the sandbox's dozens-of-ops workload; over the cap,
-/// work queues instead of erroring. It is a *deployment* property — a guest
-/// with a larger memory budget, or a platform that expects many concurrent
-/// downloads and uploads, may legitimately want more — so it is configurable.
+/// worst-case touched RSS (~13 KiB/thread) inside this daemon's budget; over the
+/// cap, work queues instead of erroring. A *deployment* property, so it is
+/// configurable.
 pub const DEFAULT_BLOCKING_THREADS: usize = 64;
 const BLOCKING_THREADS_ENV: &str = "CUBE_ENVD_BLOCKING_THREADS";
 /// Below this the pool cannot serve the daemon's own concurrent work; above it
@@ -27,30 +25,22 @@ const BLOCKING_THREADS_ENV: &str = "CUBE_ENVD_BLOCKING_THREADS";
 const BLOCKING_THREADS_MIN: usize = 4;
 const BLOCKING_THREADS_MAX: usize = 256;
 
-/// `/files` may pin at most `pool / this` blocking threads on producers.
-/// Downloads are the only user that holds a pool thread for the whole duration
-/// of a client stall, so they get a quarter of the pool and everything else
-/// (process reaping, uploads, filesystem RPCs) keeps the rest. Derived, never
-/// configured on its own: a budget larger than the pool would reintroduce
-/// exactly the starvation it exists to bound.
+/// `/files` may pin at most `pool / this` blocking threads: downloads are the
+/// only user that holds a pool thread for a whole client stall, so they get a
+/// quarter of the pool. Derived, never configured alone — a budget above the
+/// pool would reintroduce the starvation it exists to bound.
 const DOWNLOAD_BLOCKING_DIVISOR: usize = 4;
 
-/// `/files` may have at most `pool / this` bodies *buffering ahead* (1 MiB
-/// slices plus read-ahead, ~4.5 MiB each while a client stalls). A body that
-/// cannot get a slot streams 256 KiB slices without read-ahead instead, which
-/// is what keeps a storm of stalled downloads from growing the daemon's memory
-/// with the connection count — the thread budget bounds threads, this bounds
-/// memory. Also derived, for the same reason.
+/// `/files` may have at most `pool / this` bodies *buffering ahead* (~4.5 MiB
+/// each while a client stalls); the rest stream 256 KiB slices without
+/// read-ahead. The thread budget bounds threads, this one bounds memory.
 const DOWNLOAD_BUFFERED_DIVISOR: usize = 2;
 
 /// How many *large* downloads may be in flight at once, globally. A request over
-/// the cap is refused (503), never queued: a stalled client holding a slot must
-/// not put every later download behind it, which is the failure mode the tier
-/// budgets exist to remove. The default is twice the pool, so the cap scales
-/// with the deployment, and it can also be set explicitly — but never below
-/// what the pipeline itself needs (all blocking producers plus all buffered
-/// bodies), so a small value cannot undercut the tiers, and never above a
-/// ceiling that would make it meaningless.
+/// the cap is refused (`503`), never queued — a stalled client holding a slot
+/// must not put every later download behind it. The default is twice the pool;
+/// an explicit value is clamped to `[floor, ceiling]`, where the floor is what
+/// the pipeline itself needs (blocking producers plus buffered bodies).
 const DOWNLOAD_MAX_BODIES_ENV: &str = "CUBE_ENVD_DOWNLOAD_MAX_BODIES";
 const DOWNLOAD_MAX_BODIES_CEILING: usize = 1024;
 
