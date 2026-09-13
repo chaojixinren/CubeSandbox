@@ -16,6 +16,7 @@ mod cgroup2;
 mod noop;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -314,7 +315,11 @@ pub(crate) fn read_mem_total_kib(path: &Path) -> std::io::Result<u64> {
 /// failure log the reason and fall back to `NoopManager`. All-or-nothing:
 /// a partially built subtree set is dropped inside `new` and never kept.
 /// `main.rs` calls this exactly once; the choice is then fixed.
-pub fn init() -> Arc<dyn Manager> {
+///
+/// `root_override` is upstream's `-cgroup-root` (main.go:281-282). Upstream
+/// applies it only when non-empty and so does this; `CUBE_ENVD_CGROUP_ROOT`
+/// remains the environment form and the flag wins over it.
+pub fn init(root_override: Option<&str>) -> Arc<dyn Manager> {
     let configured = match std::env::var(MEMORY_MAX_ENV) {
         Ok(raw) => match raw.parse::<u64>() {
             Ok(0) | Err(_) => {
@@ -331,11 +336,18 @@ pub fn init() -> Arc<dyn Manager> {
             None
         }
     };
-    let root = std::env::var_os(CGROUP_ROOT_ENV)
-        .filter(|value| !value.as_os_str().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+    let root = resolve_root(root_override, std::env::var_os(CGROUP_ROOT_ENV));
     init_at(&root, Path::new("/proc/meminfo"), configured)
+}
+
+/// Root precedence: the flag, then the environment, then the cgroup2 default.
+/// An empty value counts as "not set" in both forms, exactly like upstream's
+/// `if cgroupRoot != ""` (main.go:281).
+fn resolve_root(flag: Option<&str>, env: Option<OsString>) -> PathBuf {
+    flag.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env.filter(|value| !value.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"))
 }
 
 fn init_at(root: &Path, meminfo: &Path, configured: Option<u64>) -> Arc<dyn Manager> {
@@ -531,6 +543,31 @@ mod tests {
         assert_eq!(
             compute_limits(five_twelve_mib_kib),
             five_twelve_mib_bytes - five_twelve_mib_bytes / 8
+        );
+    }
+
+    /// The flag is upstream's root override and must win over the environment;
+    /// empty values fall through, like Go's `if cgroupRoot != ""`.
+    #[test]
+    fn resolve_root_prefers_the_flag_then_the_environment() {
+        let env = Some(OsString::from("/sys/fs/cgroup/env"));
+        assert_eq!(
+            resolve_root(Some("/flag"), env.clone()),
+            PathBuf::from("/flag")
+        );
+        assert_eq!(
+            resolve_root(Some(""), env.clone()),
+            PathBuf::from("/sys/fs/cgroup/env")
+        );
+        assert_eq!(resolve_root(None, env), PathBuf::from("/sys/fs/cgroup/env"));
+        assert_eq!(
+            resolve_root(Some(""), Some(OsString::new())),
+            PathBuf::from("/sys/fs/cgroup")
+        );
+        assert_eq!(resolve_root(None, None), PathBuf::from("/sys/fs/cgroup"));
+        assert_eq!(
+            resolve_root(None, Some(OsString::new())),
+            PathBuf::from("/sys/fs/cgroup")
         );
     }
 

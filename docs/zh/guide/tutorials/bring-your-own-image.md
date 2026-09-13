@@ -171,9 +171,14 @@ make cubemastercli ENVD_LOCAL_PATH=/path/to/envd
 | 变量               | 默认值              | 说明                                                   |
 | ------------------ | ------------------- | ------------------------------------------------------ |
 | `ENVD_PORT`        | `49983`             | envd 监听的端口                                        |
-| `ENVD_EXTRA_ARGS`  | *(空)*              | 追加到 `-port` 之后的额外参数。若未包含 `-isnotfc`，脚本会自动追加以跳过 Firecracker MMDS 查询。只接受 cube-envd 已声明的 flag，其它参数（含拼写错误）会让 envd 启动即 exit 2，而不是静默回退默认值；`-cmd` 与 `-cgroup-root` 已识别但未实现，仅警告并跳过。 |
+| `ENVD_EXTRA_ARGS`  | *(空)*              | 追加到 `-port` 之后的额外参数。若未包含 `-isnotfc`，脚本会自动追加以跳过 Firecracker MMDS 查询。只接受 cube-envd 已声明的 flag，其它参数（含拼写错误）会让 envd 启动即 exit 2，而不是静默回退默认值；`-cgroup-root` 已实现（cgroup v2 根目录覆盖；优先于 `CUBE_ENVD_CGROUP_ROOT`）；`-cmd` 已识别但未实现，仅警告并跳过。 |
 | `ENVD_LOG_FILE`    | `/var/log/envd.log` | envd stdout/stderr 落盘位置；设为 `-` 则继承容器 stdio |
 | `ENVD_BIN`         | `/usr/bin/envd`     | 当 envd 安装在别处时覆盖                               |
+
+另有两个旋钮不是 flag，而是从 envd 自身的进程环境读取：`CUBE_ENVD_CGROUP_ROOT`
+（cgroup v2 根目录，默认 `/sys/fs/cgroup`；上面的 `-cgroup-root` flag 等价且优先）
+与 `CUBE_ENVD_CGROUP_MEMORY_MAX_BYTES`（daemon 管理的内存预算，单位字节）。
+完整清单见 `cube-envd/README.md`。
 
 ### 自己手动拉起 envd
 

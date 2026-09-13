@@ -20,20 +20,19 @@ const DEFAULT_PORT: u16 = 49983;
 /// recognized — so a trailing bare value is never mistaken for a positional
 /// argument — then warned about and ignored.
 ///
-/// -cgroup-root is a deliberate non-feature: upstream's root override only
-/// matters when the daemon runs nested under another cgroup root, and there is
-/// no such consumer today. Add it if a nested conformance comparison ever needs
-/// it; `Cgroup2Manager::new` already takes the root it would pass.
-///
 /// -cmd is upstream's "run this command at daemon start" hook for template
 /// builds (`main.go:206-226`, `InitializeStartProcess`). Upstream itself marks
 /// it `TODO: Not used anymore in template build`, and the CubeSandbox template
 /// path never passes it. It stays unimplemented (see README "Compatibility
 /// scope").
-const UNIMPLEMENTED: &[&str] = &["cmd", "cgroup-root"];
+const UNIMPLEMENTED: &[&str] = &["cmd"];
 
 pub(crate) struct Cli {
     pub(crate) port: u16,
+    /// `-cgroup-root`: upstream's cgroup v2 root override (main.go:281-282),
+    /// applied only when non-empty. `process/cgroup/mod.rs` resolves it against
+    /// `CUBE_ENVD_CGROUP_ROOT`, with the flag winning.
+    pub(crate) cgroup_root: Option<String>,
 }
 
 /// Exit status carried by `parse_cli`'s `Err` variant — a process exit code,
@@ -50,6 +49,7 @@ type ExitCode = i32;
 /// and ignore them, which is the silent degradation this parser refuses.
 pub(crate) fn parse_cli(args: &[String]) -> Result<Cli, ExitCode> {
     let mut port = DEFAULT_PORT;
+    let mut cgroup_root = None;
     let mut version = false;
     let mut commit = false;
     let mut rest = args;
@@ -126,6 +126,22 @@ pub(crate) fn parse_cli(args: &[String]) -> Result<Cli, ExitCode> {
                     ))
                 })?;
             }
+            // Upstream's cgroup root override. Like Go, only a non-empty value
+            // counts (main.go:281-282); the trailing flag-after-value case is
+            // handled by the same rule as -port below.
+            "cgroup-root" => {
+                let raw = match inline {
+                    Some(v) => v,
+                    None => {
+                        let (v, tail) = rest
+                            .split_first()
+                            .ok_or_else(|| fail("flag needs an argument: -cgroup-root"))?;
+                        rest = tail;
+                        v
+                    }
+                };
+                cgroup_root = (!raw.is_empty()).then(|| raw.to_string());
+            }
             // Known but unimplemented: soak up a trailing bare value so it is
             // not taken for a positional argument. A '-'-prefixed token is
             // left for the next iteration, so a real flag after it still
@@ -150,7 +166,7 @@ pub(crate) fn parse_cli(args: &[String]) -> Result<Cli, ExitCode> {
         println!("{text}");
         return Err(0);
     }
-    Ok(Cli { port })
+    Ok(Cli { port, cgroup_root })
 }
 
 /// Version/commit adjudication. Extracted so a unit test can pin the order.
@@ -197,7 +213,8 @@ fn print_usage() {
   -cmd string
         NOT IMPLEMENTED: command to run on daemon start
   -cgroup-root string
-        NOT IMPLEMENTED: cgroup root directory
+        cgroup v2 root directory (upstream flag; default /sys/fs/cgroup, and it
+        overrides CUBE_ENVD_CGROUP_ROOT)
   -version
         print the version
   -commit
@@ -230,23 +247,39 @@ mod tests {
         assert_eq!(port(&["--port=8080"]), Ok(8080));
     }
 
-    /// `-cgroup-root` / `-cmd` are upstream flags cube-envd does not implement
-    /// yet: recognized, warned about and skipped, so a flag after them still
-    /// takes effect. (The test name predates that distinction.)
+    fn cgroup_root(items: &[&str]) -> Option<String> {
+        parse_cli(&args(items))
+            .map(|c| c.cgroup_root)
+            .ok()
+            .flatten()
+    }
+
+    /// `-cgroup-root` is a real flag now (upstream honours it, so ignoring it
+    /// was a behavioural difference), while `-cmd` stays recognized-but-skipped.
     #[test]
-    fn cli_unknown_flags_ignored() {
+    fn cli_cgroup_root_is_parsed_and_cmd_is_still_skipped() {
         assert_eq!(
-            port(&["-cgroup-root", "/sys/fs/cgroup", "-port", "7000"]),
+            cgroup_root(&["-cgroup-root", "/sys/fs/cgroup/sub"]).as_deref(),
+            Some("/sys/fs/cgroup/sub")
+        );
+        assert_eq!(
+            cgroup_root(&["-cgroup-root=/sys/fs/cgroup/sub2"]).as_deref(),
+            Some("/sys/fs/cgroup/sub2")
+        );
+        // Go applies the override only when the value is non-empty.
+        assert_eq!(cgroup_root(&["-cgroup-root", ""]), None);
+        // The value is required, and a flag after it still takes effect.
+        assert_eq!(exit_code(&["-cgroup-root"]), Some(2));
+        assert_eq!(
+            port(&["-cgroup-root", "/sys/fs/cgroup/sub", "-port", "7000"]),
             Ok(7000)
         );
+        // `-cmd` keeps the old skip-with-warning behaviour.
         assert_eq!(port(&["-cmd", "/bin/sh", "-port", "7000"]), Ok(7000));
-        // A '-'-prefixed token is never swallowed as an unimplemented flag's
-        // value: Go would eat it and silently drop the following flag.
-        assert_eq!(port(&["-cgroup-root", "-port", "7000"]), Ok(7000));
-        // Trailing position: split_first() yields None, which must not panic.
-        assert_eq!(port(&["-cgroup-root"]), Ok(DEFAULT_PORT));
         assert_eq!(port(&["-cmd"]), Ok(DEFAULT_PORT));
-        assert_eq!(port(&["-cmd", "-cgroup-root"]), Ok(DEFAULT_PORT));
+        // `-cmd` no longer swallows the now-real root flag, so a trailing
+        // `-cgroup-root` is the usual missing-value usage error.
+        assert_eq!(exit_code(&["-cmd", "-cgroup-root"]), Some(2));
     }
 
     /// Flag names are matched exactly, like Go's `flag` — no abbreviation and

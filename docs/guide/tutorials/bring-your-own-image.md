@@ -178,9 +178,15 @@ Environment variables:
 | Variable           | Default             | Purpose                                              |
 | ------------------ | ------------------- | ---------------------------------------------------- |
 | `ENVD_PORT`        | `49983`             | Port `envd` listens on.                              |
-| `ENVD_EXTRA_ARGS`  | *(empty)*           | Extra flags passed after `-port`. `-isnotfc` is appended automatically if not already present, to skip Firecracker MMDS lookup. Only flags cube-envd declares are accepted — anything else (including a typo) makes envd exit 2 at startup instead of silently running on defaults. `-cmd` and `-cgroup-root` are recognized but not implemented yet: they are warned about and skipped. |
+| `ENVD_EXTRA_ARGS`  | *(empty)*           | Extra flags passed after `-port`. `-isnotfc` is appended automatically if not already present, to skip Firecracker MMDS lookup. Only flags cube-envd declares are accepted — anything else (including a typo) makes envd exit 2 at startup instead of silently running on defaults. `-cgroup-root` is implemented (cgroup v2 root override; it wins over `CUBE_ENVD_CGROUP_ROOT`); `-cmd` is recognized but not implemented yet, so it is warned about and skipped. |
 | `ENVD_LOG_FILE`    | `/var/log/envd.log` | File that captures envd stdout/stderr. Use `-` to inherit the container stdio. |
 | `ENVD_BIN`         | `/usr/bin/envd`     | Override if you install envd elsewhere.              |
+
+Two more knobs are read from envd's own environment rather than passed as
+flags: `CUBE_ENVD_CGROUP_ROOT` (cgroup v2 root, default `/sys/fs/cgroup`; the
+`-cgroup-root` flag above sets the same thing and wins) and
+`CUBE_ENVD_CGROUP_MEMORY_MAX_BYTES` (the memory budget the daemon manages, in
+bytes). `cube-envd/README.md` documents the full list.
 
 ### Starting envd manually
 
