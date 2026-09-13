@@ -831,11 +831,6 @@ mod download_tests {
 }
 
 /// POST /files shapes where upstream's rule and a "reasonable" reading differ.
-/// Each case here was measured against the Go daemons before it was written
-/// (see `docs/cube-envd/sdk-call-sites-issues-zh.md`): the `?path` query wins,
-/// only parts named `file` are files, and an unsupported Content-Type is a 400
-/// that never touches the body.
-#[cfg(test)]
 /// POST /files shapes where upstream's rule and a "reasonable" reading differ.
 /// Every case here was measured against the Go daemons before it was written
 /// (see `docs/cube-envd/sdk-call-sites-issues-zh.md`): the `?path` query wins,
