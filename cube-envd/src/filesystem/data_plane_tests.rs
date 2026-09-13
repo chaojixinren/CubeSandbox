@@ -901,6 +901,111 @@ mod upload_semantics_tests {
         (parts.status, String::from_utf8_lossy(&body).into_owned())
     }
 
+    /// A part built with arbitrary header text, so a test can say exactly what
+    /// the `Content-Disposition` looks like (`multipart_body` always writes the
+    /// canonical lowercase form). `None` omits the header entirely.
+    fn multipart_body_raw(boundary: &str, parts: &[(Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (disposition, data) in parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            if let Some(disposition) = disposition {
+                body.extend_from_slice(
+                    format!("Content-Disposition: {disposition}\r\n").as_bytes(),
+                );
+            }
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Go's MIME parser treats *parameter names* case-insensitively, so
+    /// `NAME="file"` is a file part upstream; `multer`'s accessor compared it
+    /// case-sensitively and the upload was dropped with a 200 `[]`.
+    #[tokio::test]
+    async fn an_uppercase_name_parameter_is_still_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("upper.bin");
+        let boundary = "X";
+        let disposition = format!(
+            "FORM-DATA; NAME=\"file\"; FILENAME=\"{}\"",
+            target.display()
+        );
+        let body = multipart_body_raw(boundary, &[(Some(&disposition), b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("upper.bin"), "{text}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    /// The `filename` parameter name is case-insensitive too (Go lowercases the
+    /// map keys), and its value is used verbatim.
+    #[tokio::test]
+    async fn an_uppercase_filename_parameter_is_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("upper-filename.bin");
+        let boundary = "X";
+        let disposition = format!(
+            "form-data; name=\"file\"; FILENAME=\"{}\"",
+            target.display()
+        );
+        let body = multipart_body_raw(boundary, &[(Some(&disposition), b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("upper-filename.bin"), "{text}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    /// `FormName()` returns "" unless the disposition type is `form-data`, so a
+    /// part that carries a filename under `attachment` is a form field.
+    #[tokio::test]
+    async fn a_non_form_data_disposition_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("attachment.bin");
+        let boundary = "X";
+        let disposition = format!(
+            "attachment; name=\"file\"; filename=\"{}\"",
+            target.display()
+        );
+        let body = multipart_body_raw(boundary, &[(Some(&disposition), b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "[]");
+        assert!(!target.exists());
+    }
+
+    /// A part with no `Content-Disposition` at all is not `form-data` either.
+    #[tokio::test]
+    async fn a_part_without_a_content_disposition_is_skipped() {
+        let boundary = "X";
+        let body = multipart_body_raw(boundary, &[(None, b"payload")]);
+        let (status, text) = post(
+            &[],
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "[]");
+    }
+
     #[tokio::test]
     async fn query_path_wins_over_the_part_filename() {
         let dir = tempfile::tempdir().unwrap();

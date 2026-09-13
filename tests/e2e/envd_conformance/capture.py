@@ -366,6 +366,29 @@ def cap_rest():
         "POST", "/files?username=user", part,
         {"Content-Type": f"multipart/form-data; boundary={boundary}"}))
     # download ok / relative path
+    # Parameter *names* in Content-Disposition are case-insensitive upstream
+    # (`mime.ParseMediaType` lowercases them); a case-sensitive accessor dropped
+    # this upload with a 200 instead of writing the file.
+    record("rest_files_upload_multipart_uppercase_name", http_req(
+        "POST", "/files?username=user",
+        ("--upper\r\n"
+         'Content-Disposition: FORM-DATA; NAME="file"; FILENAME="/home/user/upper_name.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\n").encode() + b"upper-name" +
+        b"\r\n--upper--\r\n",
+        {"Content-Type": "multipart/form-data; boundary=upper"}))
+    record("rest_files_download_uppercase_name_target", http_req(
+        "GET", "/files?path=/home/user/upper_name.bin&username=user"))
+    # A non-`form-data` disposition is a plain form field upstream: skipped even
+    # though it carries a filename.
+    record("rest_files_upload_multipart_attachment_disposition", http_req(
+        "POST", "/files?username=user",
+        ("--attach\r\n"
+         'Content-Disposition: attachment; name="file"; filename="/home/user/attachment_skip.bin"\r\n'
+         "Content-Type: application/octet-stream\r\n\r\n").encode() + b"ignored" +
+        b"\r\n--attach--\r\n",
+        {"Content-Type": "multipart/form-data; boundary=attach"}))
+    record("rest_files_download_attachment_disposition_absent", http_req(
+        "GET", "/files?path=/home/user/attachment_skip.bin&username=user"))
     # multipart where ?path and the part filename disagree: upstream uses ?path
     record("rest_files_upload_multipart_query_path_wins", http_req(
         "POST", "/files?path=/home/user/base_c.bin&username=user",

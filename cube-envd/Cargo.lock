@@ -116,6 +116,7 @@ dependencies = [
  "bytes",
  "futures",
  "libc",
+ "mime",
  "multer",
  "serde",
  "serde_json",

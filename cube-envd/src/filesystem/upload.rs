@@ -165,6 +165,73 @@ pub(crate) fn parse_boundary(content_type: &str) -> Option<String> {
     .filter(|b| !b.is_empty())
 }
 
+/// The part's `Content-Disposition`, parsed the way upstream reads it.
+///
+/// Go's `mime.ParseMediaType` lowercases the disposition type and every
+/// *parameter name* while leaving values alone, and `Part.FormName()` returns
+/// the empty string unless the type is exactly `form-data`. `multer`'s own
+/// `name()`/`file_name()` compare parameter names case-sensitively, so a valid
+/// `NAME="file"` part was skipped and the upload was silently dropped; parse the
+/// header here instead.
+fn part_disposition(field: &multer::Field<'_>) -> Option<mime::Mime> {
+    let raw = field
+        .headers()
+        .get(axum::http::header::CONTENT_DISPOSITION)?;
+    // A Content-Disposition value is a *bare* disposition (`form-data; …`), which
+    // `mime` refuses to parse because it wants `type/subtype`. Prefix a throwaway
+    // type so the real parser handles quoting, escapes and case-insensitive
+    // parameter names, then compare the lowercased essence the way Go's
+    // ParseMediaType + FormName() do.
+    let parsed: mime::Mime = format!("text/{}", raw.to_str().ok()?).parse().ok()?;
+    (parsed.essence_str() == "text/form-data").then_some(parsed)
+}
+
+/// A `Content-Disposition` parameter by (case-insensitive) name, accepting the
+/// RFC 2231 `key*=charset'lang'value` form the way Go's parser does for the
+/// usual `filename*=utf-8''name` shape.
+fn disposition_param(parsed: &mime::Mime, key: &str) -> Option<String> {
+    if let Some(value) = parsed.get_param(key) {
+        return Some(value.as_str().to_string());
+    }
+    for (name, value) in parsed.params() {
+        let name = name.as_str();
+        if name.len() != key.len() + 1 || !name.ends_with('*') {
+            continue;
+        }
+        if !name[..key.len()].eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let value = value.as_str();
+        let encoded = match (value.find('\''), value.rfind('\'')) {
+            (Some(first), Some(second)) if first < second => &value[second + 1..],
+            _ => value,
+        };
+        return Some(percent_decode(encoded));
+    }
+    None
+}
+
+/// RFC 2231 values are percent-encoded; `%` not followed by two hex digits is
+/// left as-is, like Go's `unescape` fallback.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The lowercased `type/subtype` of a Content-Type value, parameters stripped —
 /// the shape Go's `mime.ParseMediaType` yields for upstream's dispatch switch.
 /// `None` when the value carries no media type at all, which upstream then
@@ -198,21 +265,26 @@ async fn upload_multipart(
     let mut entries: Vec<UploadEntry> = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(map_multipart_error)? {
         // Upstream treats a part as a file only when its *field name* is
-        // exactly `file`: Go's `FormName()` returns the `name` parameter with
-        // no default (it is `""` for an absent one, and `""` for a disposition
-        // that is not `form-data`), and `handlePart` skips anything that is not
-        // `"file"` — so a part carrying a filename but no name is a form field,
-        // not an upload.
-        if field.name() != Some("file") {
+        // exactly `file`: Go's `FormName()` returns the empty string unless the
+        // disposition type is `form-data`, and returns the `name` parameter with
+        // no default, so `handlePart` skips a part with no name, with a
+        // different name, or with a non-`form-data` disposition — even when it
+        // carries a filename. (`multer`'s accessors compare the parameter *name*
+        // case-sensitively, so `NAME="file"` used to be dropped silently.)
+        let Some(disposition) = part_disposition(&field) else {
             continue;
+        };
+        match disposition_param(&disposition, "name") {
+            Some(name) if name == "file" => {}
+            _ => continue,
         }
         // The `?path` query wins when it is present; the part's filename is
         // only the fallback, and it is used verbatim — path separators and
         // all, not `filepath.Base` (`upload.go` resolvePath).
         let target = match query_path {
             Some(path) => path.to_string(),
-            None => match field.file_name() {
-                Some(name) => name.to_string(),
+            None => match disposition_param(&disposition, "filename") {
+                Some(name) => name,
                 None => {
                     return Err(RestError::new(
                         StatusCode::BAD_REQUEST,
