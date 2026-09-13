@@ -175,12 +175,14 @@ pub fn spawn_pty_with_cgroup(
     let mut child = command.spawn()?;
     let pid = child.id().unwrap_or_default();
 
-    let (bus, initial) = OutputBus::new();
+    let (bus, mut initial) = OutputBus::new();
     // A clone kept for `Connect` to attach later subscribers; the pump task
     // moves `bus` itself below.
     let sender = Arc::clone(&bus);
     let (completion_tx, completion) = oneshot::channel();
     let terminal = Arc::new(std::sync::Mutex::new(None));
+    // See the pipe-spawn path: the Start subscription shares the cache too.
+    initial.watch_terminal_cache(Arc::clone(&terminal));
     let terminal_for_pump = terminal.clone();
     let reaped = Arc::new(Notify::new());
     let reaped_for_pump = reaped.clone();

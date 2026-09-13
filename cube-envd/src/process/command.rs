@@ -233,12 +233,11 @@ pub fn start(
         .await;
     });
 
-    // Frames channel: the HTTP body reads from `rx`. The driver never waits
-    // for capacity here: a slow client must not prevent deadline handling or
-    // process reaping.
-    // Keep one slot reserved for an EndStream frame. At most 64 ordinary
-    // frames may be queued, so a client that falls behind still receives an
-    // explicit resource_exhausted trailer once it resumes reading.
+    // The HTTP body reads from `rx`. The driver waits for a *data* slot when
+    // the client is behind — that wait is what backpressures the child — but it
+    // keeps one slot reserved for the terminal frame, and the eviction latch
+    // plus the connection deadline stay pollable while it waits, so a slow
+    // client can neither block deadline handling nor leak the reservation.
     let (body, rx) = body_channel();
     tokio::spawn(async move {
         drive_stream(pid, initial, body, keepalive_interval, None).await;
@@ -277,8 +276,7 @@ pub fn connect(
         Err(_) => return stream_error_response(not_found(pid, tag.as_deref())),
     };
 
-    // The fresh receiver starts at the current ring head, so history is not
-    // replayed.
+    // The fresh subscription starts empty, so history is not replayed.
     let (body, rx) = body_channel();
     tokio::spawn(async move {
         drive_stream(pid, events, body, keepalive_interval, stream_deadline).await;
@@ -1659,5 +1657,93 @@ mod tests {
                 "a slow but live subscriber must not be cut off"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_evicted_connection_ends_with_resource_exhausted() {
+        // One data slot and a short eviction window: with the body channel full
+        // and the client never reading, the publisher wedges, so the connection
+        // must be evicted and say so on the wire instead of stalling forever.
+        let (pub_tx, events) =
+            crate::process::OutputBus::with_limits(2, std::time::Duration::from_millis(60), 8);
+        let (body, mut rx) = crate::process::bus::body_channel();
+        let driver = tokio::spawn(drive_stream(
+            42,
+            events,
+            body,
+            std::time::Duration::from_secs(30),
+            None,
+        ));
+        let publisher = tokio::spawn({
+            let pub_tx = Arc::clone(&pub_tx);
+            async move {
+                for _ in 0..40 {
+                    pub_tx
+                        .publish_data(engine::PumpEvent::Data(crate::process::wire::DataEvent {
+                            stdout: Some("eA==".into()),
+                            ..Default::default()
+                        }))
+                        .await;
+                }
+            }
+        });
+        // Read only after the eviction window has passed.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let mut frames = Vec::new();
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while let Ok(Some(frame)) = tokio::time::timeout_at(until, rx.recv()).await {
+            frames.push(frame);
+        }
+        publisher.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .expect("the driver returns once the connection is evicted")
+            .unwrap();
+
+        let last = frames.last().expect("terminal frame");
+        assert_eq!(last[0], crate::protocol::frames::END_STREAM_FLAG);
+        let payload: serde_json::Value = serde_json::from_slice(&last[5..]).unwrap();
+        assert_eq!(payload["error"]["code"], "resource_exhausted");
+    }
+
+    #[tokio::test]
+    async fn a_connection_deadline_fires_while_the_client_is_behind() {
+        // The writer is waiting for a data slot (the client is not reading), so
+        // the deadline must still fire: it is polled before the data arm.
+        let (pub_tx, events) = crate::process::OutputBus::new();
+        let (body, mut rx) = crate::process::bus::body_channel();
+        let driver = tokio::spawn(drive_stream(
+            42,
+            events,
+            body,
+            std::time::Duration::from_secs(30),
+            Some(std::time::Duration::from_millis(50)),
+        ));
+        let publisher = tokio::spawn({
+            let pub_tx = Arc::clone(&pub_tx);
+            async move {
+                for _ in 0..20 {
+                    pub_tx
+                        .publish_data(engine::PumpEvent::Data(crate::process::wire::DataEvent {
+                            stdout: Some("eA==".into()),
+                            ..Default::default()
+                        }))
+                        .await;
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let mut frames = Vec::new();
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while let Ok(Some(frame)) = tokio::time::timeout_at(until, rx.recv()).await {
+            frames.push(frame);
+        }
+        let _ = publisher.await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver).await;
+
+        let last = frames.last().expect("terminal frame");
+        assert_eq!(last[0], crate::protocol::frames::END_STREAM_FLAG);
+        let payload: serde_json::Value = serde_json::from_slice(&last[5..]).unwrap();
+        assert_eq!(payload["error"]["code"], "deadline_exceeded");
     }
 }

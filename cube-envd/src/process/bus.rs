@@ -197,30 +197,44 @@ impl OutputBus {
             evict_after,
             max_subscribers,
         });
+        // The first attachment is created after the child has been spawned, so
+        // it must never be refused: failing here would leave an orphan process
+        // behind. It still counts against the global budget, which self
+        // corrects when it is dropped.
         let subscription = bus
-            .attach(capacity)
-            .expect("the first attachment is always within the limit");
+            .attach(capacity, false)
+            .expect("a fresh bus always accepts its first attachment");
         bus.spawn_reaper();
         (bus, subscription)
     }
 
-    fn attach(self: &Arc<Self>, capacity: usize) -> Result<Subscription, BusError> {
-        if lock(&self.subscribers).len() >= self.max_subscribers {
+    fn attach(
+        self: &Arc<Self>,
+        capacity: usize,
+        enforce_limits: bool,
+    ) -> Result<Subscription, BusError> {
+        // One critical section for check-and-push, so concurrent `Connect`s
+        // cannot both pass the per-process check.
+        let mut subscribers = lock(&self.subscribers);
+        if enforce_limits && subscribers.len() >= self.max_subscribers {
             return Err(BusError::TooManySubscribers);
         }
-        if GLOBAL_SUBSCRIBERS.fetch_add(1, Ordering::AcqRel) >= MAX_SUBSCRIBERS_GLOBAL {
+        if GLOBAL_SUBSCRIBERS.fetch_add(1, Ordering::AcqRel) >= MAX_SUBSCRIBERS_GLOBAL
+            && enforce_limits
+        {
             GLOBAL_SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
             return Err(BusError::TooManySubscribers);
         }
         let (q, rx) = TerminalChannel::new(capacity);
         let (evicted_tx, evicted_rx) = watch::channel(false);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        lock(&self.subscribers).push(Arc::new(Subscriber {
+        subscribers.push(Arc::new(Subscriber {
             id,
             q,
             stalled_since: Mutex::new(None),
             evicted: evicted_tx,
         }));
+        drop(subscribers);
         Ok(Subscription {
             bus: Arc::downgrade(self),
             id,
@@ -233,7 +247,7 @@ impl OutputBus {
 
     /// Attach another subscription (a later `Connect`).
     pub fn subscribe(self: &Arc<Self>) -> Result<Subscription, BusError> {
-        self.attach(SUBSCRIBER_QUEUE_CAPACITY)
+        self.attach(SUBSCRIBER_QUEUE_CAPACITY, true)
     }
 
     /// A subscription that yields exactly one cached event and then closes.
@@ -585,6 +599,30 @@ mod tests {
             OutputBus::with_limits(SUBSCRIBER_QUEUE_CAPACITY, Duration::from_secs(60), 2);
         let _second = bus.subscribe().unwrap();
         assert_eq!(bus.subscribe().unwrap_err(), BusError::TooManySubscribers);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_reserve_does_not_leak_a_slot() {
+        // One data slot: fill it, start (and cancel) a waiter, then confirm the
+        // freed slot is usable again. A leaked permit would hang the last call.
+        let (q, mut body) = TerminalChannel::<u8>::new(2);
+        let permit = q.reserve_data().await.unwrap();
+        permit.send(1);
+        {
+            let waiter = q.reserve_data();
+            tokio::pin!(waiter);
+            assert!(
+                futures::poll!(&mut waiter).is_pending(),
+                "the queue must be full before the wait"
+            );
+            // Dropping the future cancels the wait.
+        }
+        assert_eq!(body.recv().await, Some(1));
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), q.reserve_data())
+            .await
+            .expect("a cancelled reserve leaked its slot");
+        permit.unwrap().send(2);
+        assert_eq!(body.recv().await, Some(2));
     }
 
     #[tokio::test]

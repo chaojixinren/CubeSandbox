@@ -47,7 +47,7 @@ pub struct ProcEntry {
     pub termination: Arc<std::sync::Mutex<Option<String>>>,
     /// Terminal event published by the output pump. This closes the small
     /// Connect-vs-exit race where a subscriber could otherwise attach after
-    /// the broadcast terminal event and wait forever for a channel close.
+    /// the terminal event and wait forever for a channel close.
     pub terminal: Arc<Mutex<Option<engine::PumpEvent>>>,
 }
 
@@ -194,9 +194,9 @@ impl ProcessTable {
     }
 
     /// Resolve a selector to a live process and subscribe to its output bus.
-    /// `Connect` attaches this way: the fresh `broadcast::Receiver` starts at
-    /// the moment it attaches, so it sees only events published after that
-    /// (no replay of history). Resolution mirrors `find_pid` — an
+    /// `Connect` attaches this way: the fresh subscription starts empty at the
+    /// moment it attaches, so it sees only events published after that (no
+    /// replay of history). Resolution mirrors `find_pid` — an
     /// explicit pid wins, otherwise the most recent tag match.
     pub fn subscribe(
         &self,
@@ -332,7 +332,7 @@ mod tests {
             })
         };
         // An event published before the attach is history: a Connect subscriber
-        // starts at the current ring head and must not see it.
+        // starts with an empty queue and must not see it.
         tx.publish_data(data("before")).await;
 
         s.insert_process(ProcEntry {

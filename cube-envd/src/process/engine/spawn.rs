@@ -278,18 +278,21 @@ pub fn spawn_with_cgroup(
     let pid = child.id().unwrap_or_default();
 
     // The per-process output bus (see `process::bus`): the pump publishes here
-    // and each connection holds a subscription. Overflow policy is unchanged in
-    // this commit — a subscriber that falls behind is told on its next `recv`
-    // (`Lagged`) instead of backpressuring the pump — and a later commit turns
-    // that into backpressure plus progress-based eviction.
+    // and each connection holds a subscription. A subscriber that falls behind
+    // backpressures the pump rather than losing data, and one that makes no
+    // progress for the eviction window is disconnected on its own.
     // `initial` is created *before* the pump task so the first subscription
     // never misses an early event.
-    let (bus, initial) = OutputBus::new();
+    let (bus, mut initial) = OutputBus::new();
     // A clone kept for `Connect` to attach later subscribers; the pump task
     // moves `bus` itself below.
     let sender = Arc::clone(&bus);
     let (completion_tx, completion) = oneshot::channel();
     let terminal = Arc::new(std::sync::Mutex::new(None));
+    // The Start subscription gets the same terminal cache as later `Connect`s,
+    // so a bus that disappears before the terminal event still reports the real
+    // exit instead of an internal error.
+    initial.watch_terminal_cache(Arc::clone(&terminal));
     let terminal_for_pump = terminal.clone();
     let reaped = Arc::new(Notify::new());
     let reaped_for_pump = reaped.clone();

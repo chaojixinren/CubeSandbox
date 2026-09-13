@@ -1,11 +1,13 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared Connect stream delivery, independent of service events and state.
+//! Shared Connect stream framing, independent of service events and state.
 //!
-//! One response queue slot is reserved for a terminal item. Producers never
-//! await response capacity, and dropping the HTTP body wakes an idle driver.
-//! Callers retain ownership of service lifetimes and terminal-event policy.
+//! This module owns the wire shapes (`message_frame`, `terminal_frame`,
+//! `end_stream_*`) and the response constructor (`frame_stream_response`).
+//! Queueing and backpressure live with the producer — per-process output in
+//! `process::bus`, filesystem watch in `filesystem::watch` — and callers retain
+//! ownership of service lifetimes and terminal-event policy.
 
 use bytes::Bytes;
 
@@ -40,8 +42,8 @@ pub fn empty_stream_response() -> axum::response::Response {
     frame_stream_response(futures::stream::iter([terminal_frame(message, trailer)]))
 }
 
-/// Construct the bounded queue shared by Connect response producers.
-/// Data delivery must use try_send_data_frame to preserve the terminal slot.
+/// Wrap an event and its EndStream trailer in a single queue item, so a sender
+/// that reserves one slot can always deliver both.
 pub(crate) fn terminal_frame(message: Bytes, trailer: Bytes) -> Bytes {
     let mut frames = Vec::with_capacity(message.len() + trailer.len());
     frames.extend_from_slice(&message);
