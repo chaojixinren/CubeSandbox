@@ -20,8 +20,8 @@ use crate::platform::identity::User;
 use super::child::{spawn_without_fork, ChildHandle, ChildSpec, ChildStdio, SpawnFailure};
 use super::cleanup::kill_process_group;
 use super::io::{
-    decorate_terminal, pump_pipe, pump_pty, terminal_after_output, terminal_after_wait, OutputKind,
-    OUTPUT_DRAIN_GRACE,
+    decorate_terminal, pump_pipe, pump_pty, terminal_after_output, terminal_after_wait,
+    unread_bytes, OutputKind, OUTPUT_DRAIN_GRACE,
 };
 use super::{InputHandle, InputWriter, SpawnedProcess};
 
@@ -358,6 +358,33 @@ pub fn spawn(req: Spawn<'_>) -> std::io::Result<SpawnedProcess> {
     // A clone kept for `Connect` to attach later subscribers; the pump task
     // moves `bus` itself below.
     let sender = Arc::clone(&bus);
+    // Duplicates of the output read ends outlive the pump task, so the grace
+    // branch can ask `FIONREAD` whether it abandoned buffered output or simply
+    // stopped a reader that had nothing left. Either duplicate keeps the pipe
+    // (or pty master) open after the pumps drop theirs, which is what makes the
+    // question answerable at all.
+    let drain_probes: Vec<RawFd> = {
+        let mut read_ends: Vec<RawFd> = Vec::new();
+        match &streams {
+            Streams::Pipes { stdout, stderr } => {
+                if let Some(stream) = stdout {
+                    read_ends.push(stream.as_raw_fd());
+                }
+                if let Some(stream) = stderr {
+                    read_ends.push(stream.as_raw_fd());
+                }
+            }
+            Streams::Pty(master) => read_ends.push(master.as_raw_fd()),
+        }
+        read_ends
+            .into_iter()
+            .filter_map(|fd| {
+                // SAFETY: `fd` is an open read end; dup returns a fresh one.
+                let duplicate = unsafe { libc::dup(fd) };
+                (duplicate >= 0).then_some(duplicate)
+            })
+            .collect()
+    };
     let (completion_tx, completion) = oneshot::channel();
     let terminal = Arc::new(std::sync::Mutex::new(None));
     // The Start subscription gets the same terminal cache as later `Connect`s,
@@ -437,7 +464,15 @@ pub fn spawn(req: Spawn<'_>) -> std::io::Result<SpawnedProcess> {
                 });
                 let output_result = (&mut output).await;
                 let stopped = *stop_rx.borrow();
-                terminal_after_wait(kind, pid, wait_result, output_result, stopped)
+                // Only a stopped reader can have abandoned anything, and only
+                // when bytes were actually left behind.
+                let abandoned = stopped && drain_probes.iter().any(|fd| unread_bytes(*fd) > 0);
+                for fd in &drain_probes {
+                    // SAFETY: each duplicate was created above and is not used
+                    // again after this point.
+                    unsafe { libc::close(*fd) };
+                }
+                terminal_after_wait(kind, pid, wait_result, output_result, stopped, abandoned)
             }
         };
         let terminal = decorate_terminal(terminal, &termination_for_pump, &cgroup_for_pump);

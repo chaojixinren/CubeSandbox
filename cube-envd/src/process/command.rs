@@ -1498,6 +1498,7 @@ mod tests {
                 signal: None,
                 oom_killed: None,
                 killed_by: None,
+                output_truncated: false,
             }))
         );
         driver.await.unwrap();
@@ -1635,6 +1636,7 @@ mod tests {
                     signal: None,
                     oom_killed: None,
                     killed_by: None,
+                    output_truncated: false,
                 }));
             }
         });

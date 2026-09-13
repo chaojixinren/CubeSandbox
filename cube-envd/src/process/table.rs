@@ -398,6 +398,7 @@ mod tests {
             signal: None,
             oom_killed: None,
             killed_by: None,
+            output_truncated: false,
         });
         s.mark_terminal(handle, terminal.clone());
 

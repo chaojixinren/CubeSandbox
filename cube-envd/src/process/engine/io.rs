@@ -85,6 +85,27 @@ impl OutputKind {
     }
 }
 
+/// Bytes still buffered on a pipe or pty read end, via `FIONREAD`.
+///
+/// The drain grace stops reading when a descendant keeps the pipe open; this
+/// tells "there was nothing left" from "output was abandoned", and only the
+/// latter may end the stream with an error.
+pub(super) fn unread_bytes(fd: std::os::fd::RawFd) -> usize {
+    let mut pending: libc::c_int = 0;
+    // SAFETY: `fd` is an open descriptor and FIONREAD writes one `c_int`.
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } < 0 {
+        return 0;
+    }
+    pending.max(0) as usize
+}
+
+/// The `End` for a reaped child, marked when the grace abandoned output.
+fn end_event(status: std::process::ExitStatus, abandoned: bool) -> EndEvent {
+    let mut event = EndEvent::from_exit_status(status);
+    event.output_truncated = abandoned;
+    event
+}
+
 pub(super) fn decorate_terminal(
     event: PumpEvent,
     termination: &Arc<Mutex<Option<String>>>,
@@ -151,21 +172,23 @@ pub(super) fn terminal_after_output(
 
 /// Build the terminal event once the direct child has been reaped.
 ///
-/// Known deviation, deliberate: when `stopped_by_grace` is set, whatever is
-/// still in the pipe is dropped and the stream ends with a normal `End` that
-/// carries the child's real exit status. The original drain design asked for an
-/// error trailer whenever data is abandoned. It stays a normal end because the
-/// usual cause is a descendant that inherited the pipe (`cmd &`), and turning a
-/// command that succeeded into an RPC error is worse than losing the tail of
-/// its output; the loss is bounded by one read chunk plus the pipe capacity and
-/// is logged below. A reader that needs the error instead has to decide what
-/// `sh -c 'daemon & echo done'` should return first.
+/// `abandoned` is true when the grace stopped reading with bytes still buffered
+/// (the caller probes the pipe with `FIONREAD`), and it is what keeps this from
+/// being a silent truncation: the event keeps the child's real exit status, and
+/// the trailer turns into an error (see `process::pump::end_trailer`).
+///
+/// The distinction matters because the usual cause of a stop is a descendant
+/// that inherited the pipe (`sh -c 'daemon & echo done'`), whose output is
+/// already complete: that case has nothing buffered, ends normally, and must
+/// not be turned into an RPC error. Only output that was really left behind is
+/// reported as truncated.
 pub(super) fn terminal_after_wait(
     kind: OutputKind,
     pid: u32,
     wait_result: std::io::Result<std::process::ExitStatus>,
     output_result: std::io::Result<()>,
     stopped_by_grace: bool,
+    abandoned: bool,
 ) -> PumpEvent {
     let output_name = kind.label();
     let status = match wait_result {
@@ -179,10 +202,10 @@ pub(super) fn terminal_after_wait(
         );
     }
     match output_result {
-        Ok(()) => PumpEvent::End(EndEvent::from_exit_status(status)),
+        Ok(()) => PumpEvent::End(end_event(status, abandoned)),
         Err(read_error) if !kind.read_error_is_fatal() => {
             tracing::warn!(pid, "error reading from pty: {read_error}");
-            PumpEvent::End(EndEvent::from_exit_status(status))
+            PumpEvent::End(end_event(status, abandoned))
         }
         Err(read_error) => {
             PumpEvent::SpawnError(format!("{output_name} read failed: {read_error}"))
@@ -401,6 +424,7 @@ mod tests {
             42,
             Ok(std::process::ExitStatus::from_raw(libc::SIGTERM)),
             Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            false,
             false,
         );
         let PumpEvent::End(end) = terminal else {

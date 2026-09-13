@@ -48,6 +48,15 @@ fn end_trailer(end: &EndEvent) -> Bytes {
             ConnectCode::DeadlineExceeded,
             "context deadline exceeded",
         ))
+    } else if end.output_truncated {
+        // The drain grace stopped with bytes still buffered: the exit code is
+        // real, but the output before this `End` is not complete, and reporting
+        // that as a clean end is exactly the silent truncation this stream must
+        // never produce.
+        protocol::end_stream_error(&ConnectError::new(
+            ConnectCode::ResourceExhausted,
+            "output truncated: the drain grace expired with data still buffered",
+        ))
     } else {
         protocol::end_stream_ok()
     }
@@ -174,5 +183,50 @@ pub(crate) async fn drive_stream(
                 pending = Some(event_frame(Event::KeepAlive(serde_json::Map::new())));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn end_event() -> EndEvent {
+        EndEvent {
+            exit_code: 0,
+            exited: true,
+            status: "exit status 0".into(),
+            error: None,
+            signal: None,
+            oom_killed: None,
+            killed_by: None,
+            output_truncated: false,
+        }
+    }
+
+    /// Abandoned output must not be reported as a clean end; a complete drain
+    /// still must be.
+    #[test]
+    fn abandoned_output_is_never_reported_as_a_clean_end() {
+        let trailer = end_trailer(&end_event());
+        assert_eq!(trailer, protocol::end_stream_ok());
+
+        let mut truncated = end_event();
+        truncated.output_truncated = true;
+        let trailer = end_trailer(&truncated);
+        assert_ne!(trailer, protocol::end_stream_ok());
+        let text = String::from_utf8_lossy(&trailer);
+        assert!(text.contains("resource_exhausted"), "{text}");
+        assert!(text.contains("truncated"), "{text}");
+    }
+
+    /// The deadline trailer keeps priority: a timed-out stream says so.
+    #[test]
+    fn a_timeout_still_reports_deadline_exceeded() {
+        let mut end = end_event();
+        end.killed_by = Some("timeout".into());
+        end.output_truncated = true;
+        let trailer = end_trailer(&end);
+        let text = String::from_utf8_lossy(&trailer);
+        assert!(text.contains("deadline_exceeded"), "{text}");
     }
 }
