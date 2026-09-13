@@ -42,7 +42,7 @@ pub(crate) async fn supervise_process(
                     );
                     table.mark_terminal(handle, error.clone());
                     table.remove_process(handle);
-                    let _ = sender.publish(error);
+                    let _ = sender.publish_terminal(error);
                 } else {
                     table.remove_process(handle);
                 }
@@ -61,7 +61,7 @@ pub(crate) async fn supervise_process(
                 // runtime worker; ordering this event first guarantees every
                 // still-attached stream observes deadline_exceeded rather than
                 // a misleading normal End.
-                let _ = sender.publish(engine::PumpEvent::DeadlineExceeded);
+                let _ = sender.publish_control(engine::PumpEvent::DeadlineExceeded);
                 // Keep the timeout marker and kill syscall atomic with
                 // respect to EndEvent decoration and SendSignal.
                 let kill_result =
@@ -96,7 +96,7 @@ pub(crate) async fn supervise_process(
             );
             table.mark_terminal(handle, error.clone());
             table.remove_process(handle);
-            let _ = sender.publish(error);
+            let _ = sender.publish_terminal(error);
         } else {
             table.remove_process(handle);
         }

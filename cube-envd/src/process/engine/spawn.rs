@@ -8,7 +8,7 @@ use std::os::fd::RawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 
 use crate::process::OutputBus;
 
@@ -298,11 +298,15 @@ pub fn spawn_with_cgroup(
     let termination_for_pump = termination.clone();
     let cgroup_for_pump = cgroup.clone();
 
+    let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
+        // Keeps the drain stop channel open for as long as the pumps run, so a
+        // closed sender can never be mistaken for "stop reading".
+        let stop_tx = stop_tx;
         let output = async {
             tokio::try_join!(
-                pump_pipe(stdout, Arc::clone(&bus), false),
-                pump_pipe(stderr, Arc::clone(&bus), true)
+                pump_pipe(stdout, Arc::clone(&bus), stop_rx.clone(), false),
+                pump_pipe(stderr, Arc::clone(&bus), stop_rx.clone(), true)
             )
             .map(|_| ())
         };
@@ -321,12 +325,28 @@ pub fn spawn_with_cgroup(
                 }
                 let wait_result = wait.await;
                 reaped_for_pump.notify_one();
+                // The child is reaped: process-table cleanup may proceed now.
+                // Draining the rest of the output stays independent of it.
+                let _ = completion_tx.send(());
                 terminal_after_output("process output", output_result, wait_result)
             }
             wait_result = &mut wait => {
                 reaped_for_pump.notify_one();
-                let output_result = tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut output).await;
-                terminal_after_wait("process output", pid, wait_result, output_result)
+                // The child is reaped: process-table cleanup may proceed now.
+                // Draining the rest of the output stays independent of it.
+                let _ = completion_tx.send(());
+                // Bound only the wait for *new* data. Once the direct child is
+                // reaped its buffered output is read to EOF, so the grace only
+                // decides how long to wait for a descendant that inherited the
+                // pipe; it never cancels a publish that is already in flight.
+                let grace_tx = stop_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(OUTPUT_DRAIN_GRACE).await;
+                    let _ = grace_tx.send(true);
+                });
+                let output_result = (&mut output).await;
+                let stopped = *stop_rx.borrow();
+                terminal_after_wait("process output", pid, wait_result, output_result, stopped)
             }
         };
         let terminal = decorate_terminal(terminal, &termination_for_pump, &cgroup_for_pump);
@@ -335,11 +355,7 @@ pub fn spawn_with_cgroup(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(terminal.clone());
         drop(slot);
-        let _ = bus.publish(terminal);
-        // Signal completion only after the terminal event is cached and
-        // published. This gives the supervisor a race-free handoff point for
-        // process-table removal.
-        let _ = completion_tx.send(());
+        let _ = bus.publish_terminal(terminal);
     });
 
     Ok(SpawnedProcess {

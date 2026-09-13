@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
 
 use crate::process::wire::{DataEvent, EndEvent};
 use crate::process::OutputBus;
@@ -106,27 +107,27 @@ pub(super) fn terminal_after_wait(
     output_name: &str,
     pid: u32,
     wait_result: std::io::Result<std::process::ExitStatus>,
-    output_result: Result<std::io::Result<()>, tokio::time::error::Elapsed>,
+    output_result: std::io::Result<()>,
+    stopped_by_grace: bool,
 ) -> PumpEvent {
     let status = match wait_result {
         Ok(status) => status,
         Err(wait_error) => return PumpEvent::SpawnError(format!("wait failed: {wait_error}")),
     };
+    if stopped_by_grace {
+        tracing::warn!(
+            "pid {pid}: {output_name} remained open after the direct child exited; stopped reading after {:?}",
+            OUTPUT_DRAIN_GRACE
+        );
+    }
     match output_result {
-        Ok(Ok(())) => PumpEvent::End(EndEvent::from_exit_status(status)),
-        Ok(Err(read_error)) if output_name == "pty" => {
+        Ok(()) => PumpEvent::End(EndEvent::from_exit_status(status)),
+        Err(read_error) if output_name == "pty" => {
             tracing::warn!(pid, "error reading from pty: {read_error}");
             PumpEvent::End(EndEvent::from_exit_status(status))
         }
-        Ok(Err(read_error)) => {
+        Err(read_error) => {
             PumpEvent::SpawnError(format!("{output_name} read failed: {read_error}"))
-        }
-        Err(_) => {
-            tracing::warn!(
-                "pid {pid}: {output_name} remained open after the direct child exited; closing it after {:?}",
-                OUTPUT_DRAIN_GRACE
-            );
-            PumpEvent::End(EndEvent::from_exit_status(status))
         }
     }
 }
@@ -137,12 +138,20 @@ pub(super) fn terminal_after_wait(
 pub(super) async fn pump_pty(
     master: AsyncFd<std::fs::File>,
     bus: Arc<OutputBus>,
+    mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     use base64::Engine;
     use std::io::Read;
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        let mut readiness = master.readable().await?;
+        // The drain grace only *stops reading*: a publish that is already in
+        // flight still runs to completion, so bytes read from the child are
+        // never dropped because the grace expired.
+        let mut readiness = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            readiness = master.readable() => readiness?,
+        };
         match readiness.try_io(|inner| inner.get_ref().read(&mut buf)) {
             Ok(Ok(0)) => return Ok(()),
             Ok(Err(e)) if is_pty_eof(&e) => return Ok(()),
@@ -161,7 +170,7 @@ pub(super) async fn pump_pty(
                     pty: Some(b64),
                     ..Default::default()
                 };
-                bus.publish(PumpEvent::Data(event));
+                bus.publish_data(PumpEvent::Data(event)).await;
             }
         }
     }
@@ -200,6 +209,7 @@ fn is_pty_eof(error: &std::io::Error) -> bool {
 pub(super) async fn pump_pipe<R>(
     pipe: Option<R>,
     bus: Arc<OutputBus>,
+    mut stop: watch::Receiver<bool>,
     is_stderr: bool,
 ) -> std::io::Result<()>
 where
@@ -209,7 +219,12 @@ where
     let Some(mut pipe) = pipe else { return Ok(()) };
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        match pipe.read(&mut buf).await {
+        let read = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            read = pipe.read(&mut buf) => read,
+        };
+        match read {
             Ok(0) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
@@ -229,7 +244,7 @@ where
                         ..Default::default()
                     }
                 };
-                bus.publish(PumpEvent::Data(event));
+                bus.publish_data(PumpEvent::Data(event)).await;
             }
         }
     }
@@ -293,7 +308,8 @@ mod tests {
             "pty",
             42,
             Ok(std::process::ExitStatus::from_raw(libc::SIGTERM)),
-            Ok(Err(std::io::Error::from_raw_os_error(libc::EBADF))),
+            Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            false,
         );
         let PumpEvent::End(end) = terminal else {
             panic!("PTY drain failure replaced child exit status: {terminal:?}");
@@ -323,7 +339,7 @@ mod tests {
         let sender = proc.sender.clone();
         drop(proc.initial);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut attached = sender.subscribe();
+        let mut attached = sender.subscribe().expect("attach within the limit");
         let mut output = Vec::new();
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(3), attached.recv())

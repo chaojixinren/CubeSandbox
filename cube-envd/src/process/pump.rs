@@ -4,13 +4,12 @@
 //! Process event encoding and attachment termination policy.
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
 
-use crate::process::bus::{next_delivery, BusError, Delivery};
+use crate::process::bus::{BusError, TerminalChannel};
 use crate::process::engine;
-use crate::process::wire::{Event, EventEnvelope, StartEvent};
+use crate::process::wire::{EndEvent, Event, EventEnvelope, StartEvent};
 use crate::protocol;
-use crate::protocol::stream::{terminal_frame, try_send_data_frame, try_send_terminal_frame};
+use crate::protocol::stream::terminal_frame;
 use crate::protocol::{ConnectCode, ConnectError};
 
 pub use crate::protocol::stream::{
@@ -23,23 +22,54 @@ fn event_frame(event: Event) -> Bytes {
     protocol::message_frame(&value)
 }
 
-/// Deliver process events without owning the supervised process lifetime.
+/// Queue a terminal frame in the connection's reserved slot. The reservation is
+/// what makes this possible while every data slot is full, so it never waits.
+fn emit_terminal_frame(body: &TerminalChannel<Bytes>, message: Bytes, trailer: Bytes) {
+    if !body.send_terminal(terminal_frame(message, trailer)) {
+        tracing::warn!("process stream: terminal frame already sent, dropping the duplicate");
+    }
+}
+
+/// End the stream with an error and no `End` event.
+fn emit_error(body: &TerminalChannel<Bytes>, code: ConnectCode, message: impl Into<String>) {
+    if !body.send_terminal(protocol::end_stream_error(&ConnectError::new(
+        code, message,
+    ))) {
+        tracing::warn!("process stream: terminal frame already sent, dropping the duplicate");
+    }
+}
+
+/// The EndStream trailer for a process that finished.
+///
+/// A process killed by its deadline is recognised **out-of-band**, from the
+/// decoration the supervisor already applied (`killed_by = "timeout"`), so the
+/// trailer never depends on the best-effort `DeadlineExceeded` hint arriving.
+fn end_trailer(end: &EndEvent) -> Bytes {
+    if end.killed_by.as_deref() == Some("timeout") {
+        protocol::end_stream_error(&ConnectError::new(
+            ConnectCode::DeadlineExceeded,
+            "context deadline exceeded",
+        ))
+    } else {
+        protocol::end_stream_ok()
+    }
+}
+
+/// Deliver process events for one attachment.
+///
+/// Everything a connection needs — the `Start` marker, data, keepalives and the
+/// terminal frame with its trailer — is produced here, so the shared bus stays
+/// unaware of per-connection framing. `body` holds one slot reserved for the
+/// terminal frame, which guarantees an `End` even when the client is behind;
+/// waiting for a data slot is what backpressures the child.
 pub(crate) async fn drive_stream(
     pid: u32,
     mut events: crate::process::Subscription,
-    tx: mpsc::Sender<Bytes>,
+    body: TerminalChannel<Bytes>,
     keepalive_interval: std::time::Duration,
     stream_deadline: Option<std::time::Duration>,
 ) {
-    // The producer is dropped immediately on backpressure or disconnect.
-    // Process lifetime is owned by the separate supervisor, so this task
-    // never needs to retain a dead HTTP client's output subscription.
-    let mut output = Some(tx);
-    let mut deadline_seen = false;
-    if !try_send_data_frame(&mut output, event_frame(Event::Start(StartEvent { pid }))) {
-        return;
-    }
-
+    let mut evicted = events.eviction();
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.reset(); // first tick fires after one period, not immediately
     let deadline = async move {
@@ -50,101 +80,100 @@ pub(crate) async fn drive_stream(
     };
     tokio::pin!(deadline);
 
+    let mut pending: Option<Bytes> = Some(event_frame(Event::Start(StartEvent { pid })));
+    let mut deadline_seen = false;
+    // The eviction latch closes when the bus goes away. That is not an
+    // eviction: stop watching it and let `events.recv()` drain whatever is
+    // already queued before it reports the close.
+    let mut eviction_latch_closed = false;
+
     loop {
-        let close_signal = output.as_ref().cloned().expect("output sender is live");
-        match next_delivery(
-            &mut events,
-            &close_signal,
-            &mut keepalive,
-            &mut deadline,
-            !deadline_seen,
-        )
-        .await
-        {
-            Delivery::Disconnected => return,
-            Delivery::Event(ev) => match ev {
-                Ok(engine::PumpEvent::Data(d)) => {
-                    keepalive.reset();
-                    if !try_send_data_frame(&mut output, event_frame(Event::Data(d))) {
-                        return;
-                    }
-                }
-                Ok(engine::PumpEvent::End(end)) => {
-                    // One queue slot carries both terminal envelopes. This
-                    // prevents a nearly-full queue from exposing End without
-                    // the required EndStream trailer.
-                    let event = event_frame(Event::End(end));
-                    let trailer = if deadline_seen {
-                        protocol::end_stream_error(&ConnectError::new(
-                            ConnectCode::DeadlineExceeded,
-                            "context deadline exceeded",
-                        ))
-                    } else {
-                        protocol::end_stream_ok()
-                    };
-                    try_send_terminal_frame(&mut output, terminal_frame(event, trailer));
+        let deadline_enabled = stream_deadline.is_some() && !deadline_seen;
+        tokio::select! {
+            biased;
+            // The client is gone: nothing can be delivered, and dropping the
+            // connection releases its reserved slot.
+            _ = body.closed() => return,
+            // A Connect deadline bounds *this attachment only*. The process
+            // belongs to its Start supervisor and stays available for List,
+            // input and a later Connect.
+            _ = &mut deadline, if deadline_enabled => {
+                emit_error(&body, ConnectCode::DeadlineExceeded, "context deadline exceeded");
+                return;
+            }
+            // The subscriber made no progress for the eviction window. Report
+            // it instead of letting it pin the pump — this arm is also what
+            // abandons a blocked `reserve_data` below.
+            latch = evicted.changed(), if !eviction_latch_closed => {
+                if latch.is_ok() && *evicted.borrow() {
+                    emit_error(
+                        &body,
+                        ConnectCode::ResourceExhausted,
+                        "output consumer too slow: no progress",
+                    );
                     return;
                 }
-                Ok(engine::PumpEvent::SpawnError(msg)) => {
-                    try_send_terminal_frame(
-                        &mut output,
-                        protocol::end_stream_error(&ConnectError::new(ConnectCode::Internal, msg)),
-                    );
+                eviction_latch_closed = true;
+                continue;
+            }
+            // Flattened on purpose: this arm only *reserves*, so the frame stays
+            // in `pending` while it waits. A helper that moved the frame into
+            // itself would lose it whenever another arm wins the select.
+            permit = body.reserve_data(), if pending.is_some() => match permit {
+                Ok(permit) => {
+                    permit.send(pending.take().expect("arm gated on pending.is_some()"));
+                }
+                Err(_) => return,
+            },
+            event = events.recv(), if pending.is_none() => match event {
+                Ok(engine::PumpEvent::Data(data)) => {
+                    keepalive.reset();
+                    pending = Some(event_frame(Event::Data(data)));
+                }
+                Ok(engine::PumpEvent::End(end)) => {
+                    let trailer = end_trailer(&end);
+                    emit_terminal_frame(&body, event_frame(Event::End(end)), trailer);
+                    return;
+                }
+                Ok(engine::PumpEvent::SpawnError(message)) => {
+                    emit_error(&body, ConnectCode::Internal, message);
                     return;
                 }
                 Ok(engine::PumpEvent::DeadlineExceeded) => {
-                    // The supervisor has recorded the timeout and started
-                    // killing the process. Keep this attachment alive until
-                    // the pump publishes the real EndEvent, so clients get
-                    // both the actual signal and `killedBy: "timeout"`.
+                    // The supervisor recorded the timeout and started killing
+                    // the process. Keep this attachment alive until the pump
+                    // publishes the real EndEvent, so the client receives both
+                    // the actual signal and `killedBy: "timeout"`.
                     deadline_seen = true;
                 }
-                Err(BusError::Lagged(n)) => {
-                    try_send_terminal_frame(
-                        &mut output,
-                        protocol::end_stream_error(&ConnectError::new(
-                            ConnectCode::ResourceExhausted,
-                            format!("output consumer too slow: {n} events dropped"),
-                        )),
-                    );
+                Err(BusError::Evicted) => {
+                    emit_error(&body, ConnectCode::ResourceExhausted, "output consumer too slow: no progress");
                     return;
                 }
-                Err(BusError::Closed) | Err(BusError::Evicted) => {
-                    let (code, message) = if deadline_seen {
-                        (ConnectCode::DeadlineExceeded, "context deadline exceeded")
-                    } else {
-                        (
+                // The bus went away without a terminal event. The process
+                // table's cache usually still holds the real exit.
+                Err(_) => {
+                    match events.terminal_event() {
+                        Some(engine::PumpEvent::End(end)) => {
+                            let trailer = end_trailer(&end);
+                            emit_terminal_frame(&body, event_frame(Event::End(end)), trailer);
+                        }
+                        Some(engine::PumpEvent::SpawnError(message)) => {
+                            emit_error(&body, ConnectCode::Internal, message);
+                        }
+                        _ => emit_error(
+                            &body,
                             ConnectCode::Internal,
                             "process output stream closed before a terminal event",
-                        )
-                    };
-                    try_send_terminal_frame(
-                        &mut output,
-                        protocol::end_stream_error(&ConnectError::new(code, message)),
-                    );
+                        ),
+                    }
                     return;
                 }
             },
-            Delivery::Keepalive => {
-                if !try_send_data_frame(
-                    &mut output,
-                    event_frame(Event::KeepAlive(serde_json::Map::new())),
-                ) {
-                    return;
-                }
-            }
-            Delivery::Deadline => {
-                // A Connect timeout bounds this attachment only. The process
-                // belongs to its Start supervisor and must remain available
-                // for List, input and a later Connect.
-                try_send_terminal_frame(
-                    &mut output,
-                    protocol::end_stream_error(&ConnectError::new(
-                        ConnectCode::DeadlineExceeded,
-                        "context deadline exceeded",
-                    )),
-                );
-                return;
+            // Only while idle: `biased` keeps queued data ahead of this arm, so
+            // a keepalive never jumps in front of output.
+            _ = keepalive.tick(), if pending.is_none() => {
+                pending = Some(event_frame(Event::KeepAlive(serde_json::Map::new())));
             }
         }
     }

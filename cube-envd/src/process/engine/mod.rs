@@ -50,10 +50,11 @@ pub struct SpawnedProcess {
     pub pty_master: Option<std::fs::File>,
     /// Writable stdin/pty endpoint retained for the input RPC family.
     pub input: InputHandle,
-    /// Resolves after the direct child has been reaped and the terminal event
-    /// has been cached/published. The process service owns this receiver so
-    /// deadline cancellation and table cleanup follow the child's real
-    /// lifetime, not HTTP response backpressure.
+    /// Resolves as soon as the direct child has been reaped. The process
+    /// service owns this receiver so deadline cancellation and table cleanup
+    /// follow the child's real lifetime: draining the remaining output and
+    /// publishing the terminal event stay independent of it, so a subscriber
+    /// that is not reading can never delay reaping.
     pub completion: oneshot::Receiver<()>,
     /// Terminal event cache shared with the process table. A Connect racing
     /// with terminal publication can use this cache to receive the complete

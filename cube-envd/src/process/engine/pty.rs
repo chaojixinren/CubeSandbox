@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 
 use crate::process::OutputBus;
 
@@ -189,8 +189,12 @@ pub fn spawn_pty_with_cgroup(
     let termination_for_pump = termination.clone();
     let cgroup_for_pump = cgroup.clone();
 
+    let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let output = pump_pty(master, Arc::clone(&bus));
+        // Keeps the drain stop channel open for as long as the pump runs, so a
+        // closed sender can never be mistaken for "stop reading".
+        let stop_tx = stop_tx;
+        let output = pump_pty(master, Arc::clone(&bus), stop_rx.clone());
         tokio::pin!(output);
         let wait = child.wait();
         tokio::pin!(wait);
@@ -202,12 +206,26 @@ pub fn spawn_pty_with_cgroup(
                 }
                 let wait_result = wait.await;
                 reaped_for_pump.notify_one();
+                // The child is reaped: process-table cleanup may proceed now.
+                // Draining the rest of the output stays independent of it.
+                let _ = completion_tx.send(());
                 terminal_after_output("pty", output_result, wait_result)
             }
             wait_result = &mut wait => {
                 reaped_for_pump.notify_one();
-                let output_result = tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut output).await;
-                terminal_after_wait("pty", pid, wait_result, output_result)
+                // The child is reaped: process-table cleanup may proceed now.
+                // Draining the rest of the output stays independent of it.
+                let _ = completion_tx.send(());
+                // See the pipe-spawn path: the grace stops reading, it never
+                // cancels a publish already in flight.
+                let grace_tx = stop_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(OUTPUT_DRAIN_GRACE).await;
+                    let _ = grace_tx.send(true);
+                });
+                let output_result = (&mut output).await;
+                let stopped = *stop_rx.borrow();
+                terminal_after_wait("pty", pid, wait_result, output_result, stopped)
             }
         };
         let terminal = decorate_terminal(terminal, &termination_for_pump, &cgroup_for_pump);
@@ -216,8 +234,7 @@ pub fn spawn_pty_with_cgroup(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(terminal.clone());
         drop(slot);
-        let _ = bus.publish(terminal);
-        let _ = completion_tx.send(());
+        let _ = bus.publish_terminal(terminal);
     });
 
     Ok(SpawnedProcess {
