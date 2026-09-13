@@ -283,8 +283,11 @@ Configuration:
   clamped to `4..=256` (an invalid value warns and keeps the default rather
   than failing startup). The pool serves process reaping, upload writers,
   filesystem RPCs and the `/files` body pipeline; platform/limits.rs derives
-  the latter's prefetch budget as a quarter of it, so lowering the cap lowers
-  that budget too. Raise it on guests with a larger memory budget (~13 KiB
+  that pipeline's two budgets from it — at most `pool / 4` blocking producers
+  (threads pinned for a stalled body) and at most `pool / 2` bodies buffering
+  ahead with 1 MiB slices; a body that gets neither streams 256 KiB slices
+  without read-ahead, so a storm of stalled downloads cannot grow the daemon's
+  memory with the connection count. Lowering the cap lowers both budgets. Raise it on guests with a larger memory budget (~13 KiB
   touched RSS per thread), lower it under memory pressure.
 - `CUBE_ENVD_CGROUP_ROOT`: cgroup v2 root, default `/sys/fs/cgroup`; nested
   daemon membership is resolved when visible below that root.

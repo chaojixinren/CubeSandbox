@@ -27,13 +27,21 @@ const BLOCKING_THREADS_ENV: &str = "CUBE_ENVD_BLOCKING_THREADS";
 const BLOCKING_THREADS_MIN: usize = 4;
 const BLOCKING_THREADS_MAX: usize = 256;
 
-/// `/files` may pin at most `pool / this` blocking threads on prefetch
-/// producers. Downloads are the only user that holds a pool thread for the
-/// whole duration of a client stall, so they get a quarter of the pool and
-/// everything else (process reaping, uploads, filesystem RPCs) keeps the rest.
-/// Derived, never configured on its own: a budget larger than the pool would
-/// reintroduce exactly the starvation it exists to bound.
-const DOWNLOAD_PREFETCH_DIVISOR: usize = 4;
+/// `/files` may pin at most `pool / this` blocking threads on producers.
+/// Downloads are the only user that holds a pool thread for the whole duration
+/// of a client stall, so they get a quarter of the pool and everything else
+/// (process reaping, uploads, filesystem RPCs) keeps the rest. Derived, never
+/// configured on its own: a budget larger than the pool would reintroduce
+/// exactly the starvation it exists to bound.
+const DOWNLOAD_BLOCKING_DIVISOR: usize = 4;
+
+/// `/files` may have at most `pool / this` bodies *buffering ahead* (1 MiB
+/// slices plus read-ahead, ~4.5 MiB each while a client stalls). A body that
+/// cannot get a slot streams 256 KiB slices without read-ahead instead, which
+/// is what keeps a storm of stalled downloads from growing the daemon's memory
+/// with the connection count — the thread budget bounds threads, this bounds
+/// memory. Also derived, for the same reason.
+const DOWNLOAD_BUFFERED_DIVISOR: usize = 2;
 
 static BLOCKING_THREADS: OnceLock<usize> = OnceLock::new();
 
@@ -52,9 +60,23 @@ pub fn blocking_threads() -> usize {
     })
 }
 
-/// Prefetch budget for the `/files` body pipeline, derived from the pool size.
-pub fn download_prefetch() -> usize {
-    prefetch_from(blocking_threads())
+/// How many `/files` bodies may run the blocking (pool-thread) producer.
+pub fn download_blocking_producers() -> usize {
+    download_blocking_producers_at(blocking_threads())
+}
+
+fn download_blocking_producers_at(pool: usize) -> usize {
+    (pool / DOWNLOAD_BLOCKING_DIVISOR).max(1)
+}
+
+/// How many `/files` bodies may buffer ahead at all (1 MiB slices); the rest
+/// stream 256 KiB slices without read-ahead.
+pub fn download_buffered_bodies() -> usize {
+    download_buffered_bodies_at(blocking_threads())
+}
+
+fn download_buffered_bodies_at(pool: usize) -> usize {
+    (pool / DOWNLOAD_BUFFERED_DIVISOR).max(1)
 }
 
 /// Adjudicate a configured value: unset or unparsable falls back to the
@@ -82,10 +104,6 @@ fn blocking_threads_from(raw: Option<&str>) -> usize {
     }
 }
 
-fn prefetch_from(pool: usize) -> usize {
-    (pool / DOWNLOAD_PREFETCH_DIVISOR).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,13 +128,21 @@ mod tests {
         assert_eq!(blocking_threads_from(Some("100000")), BLOCKING_THREADS_MAX);
     }
 
-    /// The budget is derived, so lowering the pool lowers it too: that is the
-    /// invariant that keeps downloads from pinning the whole pool.
+    /// Both budgets are derived, so lowering the pool lowers them too: that is
+    /// the invariant that keeps downloads from pinning the whole pool or from
+    /// buffering without bound.
     #[test]
-    fn the_prefetch_budget_is_a_quarter_of_the_pool_and_never_zero() {
-        assert_eq!(prefetch_from(DEFAULT_BLOCKING_THREADS), 16);
-        assert_eq!(prefetch_from(8), 2);
-        assert_eq!(prefetch_from(1), 1);
-        assert_eq!(prefetch_from(0), 1);
+    fn the_download_budgets_follow_the_pool_and_never_reach_zero() {
+        assert_eq!(download_blocking_producers_at(DEFAULT_BLOCKING_THREADS), 16);
+        assert_eq!(download_buffered_bodies_at(DEFAULT_BLOCKING_THREADS), 32);
+        assert_eq!(download_blocking_producers_at(8), 2);
+        assert_eq!(download_buffered_bodies_at(8), 4);
+        assert_eq!(download_blocking_producers_at(1), 1);
+        assert_eq!(download_buffered_bodies_at(1), 1);
+        // The blocking sub-tier can never exceed the buffered one at any pool
+        // size the parser admits.
+        for pool in (BLOCKING_THREADS_MIN..=BLOCKING_THREADS_MAX).step_by(7) {
+            assert!(download_blocking_producers_at(pool) <= download_buffered_bodies_at(pool));
+        }
     }
 }

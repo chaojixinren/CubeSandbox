@@ -55,7 +55,8 @@ fn main() {
     // actually got instead of inferring it from the environment.
     tracing::info!(
         blocking_threads,
-        download_prefetch = platform::limits::download_prefetch(),
+        download_blocking_producers = platform::limits::download_blocking_producers(),
+        download_buffered_bodies = platform::limits::download_buffered_bodies(),
         "runtime limits"
     );
 
