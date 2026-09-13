@@ -17,9 +17,7 @@ pub use crate::protocol::stream::{
 };
 
 fn event_frame(event: Event) -> Bytes {
-    let value =
-        serde_json::to_value(EventEnvelope { event }).unwrap_or_else(|_| serde_json::json!({}));
-    protocol::message_frame(&value)
+    protocol::json_message_frame(&EventEnvelope { event })
 }
 
 /// Queue a terminal frame in the connection's reserved slot. The reservation is

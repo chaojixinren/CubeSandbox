@@ -22,8 +22,8 @@ pub mod timeout;
 
 pub use error::{ConnectCode, ConnectError, RestError};
 pub use frames::{
-    check_json_codec, decode_single_envelope, end_stream_error, end_stream_ok, message_frame,
-    EnvelopeDecoder, MAX_ENVELOPE_SIZE, MAX_UNARY_BODY, STREAM_CONTENT_TYPE,
+    check_json_codec, decode_single_envelope, end_stream_error, end_stream_ok, json_message_frame,
+    message_frame, EnvelopeDecoder, MAX_ENVELOPE_SIZE, MAX_UNARY_BODY, STREAM_CONTENT_TYPE,
 };
 pub use keepalive::keepalive_interval_from_headers;
 pub use timeout::timeout_from_headers;

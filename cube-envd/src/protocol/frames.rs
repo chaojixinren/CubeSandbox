@@ -17,6 +17,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::protocol::error::{ConnectCode, ConnectError};
 
 pub const END_STREAM_FLAG: u8 = 0x02;
+/// `[flags:1B][len:u32 BE]` — the prefix in front of every envelope payload.
+pub const FRAME_HEADER_LEN: usize = 5;
 pub const COMPRESSED_FLAG: u8 = 0x01;
 /// Same cap the SDKs enforce on their side.
 pub const MAX_ENVELOPE_SIZE: usize = 64 * 1024 * 1024;
@@ -32,7 +34,7 @@ pub const STREAM_CONTENT_TYPE: &str = "application/connect+json";
 
 /// Encode one Connect streaming envelope.
 pub fn encode_envelope(flags: u8, payload: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + payload.len());
+    let mut buf = BytesMut::with_capacity(FRAME_HEADER_LEN + payload.len());
     buf.put_u8(flags);
     buf.put_u32(payload.len() as u32);
     buf.put_slice(payload);
@@ -41,6 +43,29 @@ pub fn encode_envelope(flags: u8, payload: &[u8]) -> Bytes {
 
 pub fn message_frame(value: &serde_json::Value) -> Bytes {
     encode_envelope(0, value.to_string().as_bytes())
+}
+
+/// Frame one JSON message without building a `Value` tree or an intermediate
+/// string: the envelope header is written first and `serde_json` streams the
+/// value directly behind it, so a large payload is copied once instead of
+/// three times. Errors cannot be reported here (the caller has no way to
+/// answer mid-stream), so a serialization failure ends the message short and
+/// the trailer still follows.
+pub fn json_message_frame<T: serde::Serialize>(value: &T) -> Bytes {
+    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + 1024);
+    buf.extend_from_slice(&[0; FRAME_HEADER_LEN]);
+    match serde_json::to_writer(&mut buf, value) {
+        Ok(()) => {
+            let len = (buf.len() - FRAME_HEADER_LEN) as u32;
+            buf[1..FRAME_HEADER_LEN].copy_from_slice(&len.to_be_bytes());
+        }
+        Err(e) => {
+            tracing::warn!("message_frame: could not serialize the envelope: {e}");
+            buf.truncate(FRAME_HEADER_LEN);
+            buf[1..FRAME_HEADER_LEN].copy_from_slice(&0u32.to_be_bytes());
+        }
+    }
+    Bytes::from(buf)
 }
 
 pub fn end_stream_ok() -> Bytes {

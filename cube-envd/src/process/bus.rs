@@ -35,9 +35,16 @@ use tokio::sync::{mpsc, watch};
 use crate::process::engine::PumpEvent;
 
 /// Subscriber-queue capacity: data slots plus the reserved terminal slot.
-pub(crate) const SUBSCRIBER_QUEUE_CAPACITY: usize = 24;
+///
+/// One slot holds one read chunk (128 KiB decoded, ~175 KiB framed), and the
+/// per-attach memory budget that these slots dominate is ~1 MiB, so a deep
+/// queue would cost megabytes per attachment. Depth only buys slack for a
+/// client that reads in bursts — the throughput floor is one frame per
+/// eviction window either way — and this sandbox's handoff cost makes a *few
+/// large* frames much cheaper than many small ones.
+pub(crate) const SUBSCRIBER_QUEUE_CAPACITY: usize = 4;
 /// Per-connection response queue: data slots plus the reserved terminal slot.
-pub(crate) const BODY_QUEUE_CAPACITY: usize = 8;
+pub(crate) const BODY_QUEUE_CAPACITY: usize = 4;
 /// No progress for this long while waiting means the subscriber is stalled.
 pub(crate) const DEFAULT_EVICT_AFTER: Duration = Duration::from_secs(300);
 /// Attachments allowed per process, including its `Start` subscription.
@@ -101,6 +108,12 @@ impl<T> TerminalChannel<T> {
         self.tx.reserve().await.map_err(|_| BusError::Closed)
     }
 
+    /// Take a data slot without waiting. `Err` means the queue is full or the
+    /// receiver is gone; the caller decides which of the two it is.
+    pub fn try_reserve_data(&self) -> Result<mpsc::Permit<'_, T>, BusError> {
+        self.tx.try_reserve().map_err(|_| BusError::Closed)
+    }
+
     /// Queue the terminal frame in its reserved slot. Never blocks.
     pub fn send_terminal(&self, value: T) -> bool {
         match lock(&self.terminal).take() {
@@ -129,14 +142,45 @@ impl<T> TerminalChannel<T> {
 struct Subscriber {
     id: u64,
     q: TerminalChannel<PumpEvent>,
-    /// Set *before* a publisher starts waiting and cleared once a send
-    /// succeeds. The reaper evicts a subscriber whose marker is older than
-    /// `evict_after`; because the marker is set before the wait, a subscriber
-    /// that never returns from `reserve_data` is still visible to it.
+    /// Publishers currently waiting for a data slot. A data pump publishes for
+    /// the *same* subscriber as its sibling (stdout and stderr share a bus), so
+    /// the marker below must outlive every waiter, not just the last one to
+    /// send: it is raised by the first waiter and lowered by the last one.
+    stalled: AtomicUsize,
+    /// Set while `stalled` is non-zero. The reaper evicts a subscriber whose
+    /// marker is older than `evict_after`; because the marker is set before the
+    /// wait, a subscriber that never returns from `reserve_data` is still
+    /// visible to it.
     stalled_since: Mutex<Option<Instant>>,
     /// Eviction latch: set by the reaper, awaited by the publisher and by the
     /// connection driving this subscription.
     evicted: watch::Sender<bool>,
+}
+
+impl Subscriber {
+    /// Record this publisher as waiting for a data slot. The guard clears the
+    /// marker when the last waiter leaves — on success, on failure and on
+    /// cancellation alike — so no other publisher can erase a stall that is
+    /// still in progress, and a dropped wait cannot leave a stale marker behind
+    /// for the reaper to evict a healthy subscriber with.
+    fn begin_wait(self: &Arc<Self>) -> StallWait<'_> {
+        if self.stalled.fetch_add(1, Ordering::AcqRel) == 0 {
+            *lock(&self.stalled_since) = Some(Instant::now());
+        }
+        StallWait { subscriber: self }
+    }
+}
+
+struct StallWait<'a> {
+    subscriber: &'a Subscriber,
+}
+
+impl Drop for StallWait<'_> {
+    fn drop(&mut self) {
+        if self.subscriber.stalled.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *lock(&self.subscriber.stalled_since) = None;
+        }
+    }
 }
 
 /// One attachment's view of the bus. Dropping it detaches immediately.
@@ -231,6 +275,7 @@ impl OutputBus {
         subscribers.push(Arc::new(Subscriber {
             id,
             q,
+            stalled: AtomicUsize::new(0),
             stalled_since: Mutex::new(None),
             evicted: evicted_tx,
         }));
@@ -277,6 +322,19 @@ impl OutputBus {
     /// what backpressures the child.
     pub async fn publish_data(&self, event: PumpEvent) {
         for subscriber in self.snapshot() {
+            // Fast path: room is available, so this publish neither waits nor
+            // can be evicted mid-flight. It skips the eviction receiver, the
+            // stall marker and the select entirely — the cost of those per
+            // frame is what the sandbox's handoff overhead makes visible.
+            if let Ok(permit) = subscriber.q.try_reserve_data() {
+                permit.send(event.clone());
+                // A publish that never waited also proves any earlier marker is
+                // stale — but only when nobody is waiting right now.
+                if subscriber.stalled.load(Ordering::Acquire) == 0 {
+                    let _ = lock(&subscriber.stalled_since).take();
+                }
+                continue;
+            }
             let mut evicted = subscriber.evicted.subscribe();
             if *evicted.borrow() {
                 continue;
@@ -284,10 +342,8 @@ impl OutputBus {
             // Mark the stall *before* waiting. A genuinely stuck subscriber
             // never returns from `reserve_data`, so this marker is the only
             // thing the reaper can act on.
-            if lock(&subscriber.stalled_since).is_none() {
-                *lock(&subscriber.stalled_since) = Some(Instant::now());
-            }
-            let sent = tokio::select! {
+            let waiting = subscriber.begin_wait();
+            let _sent = tokio::select! {
                 biased;
                 _ = evicted.changed() => false,
                 permit = subscriber.q.reserve_data() => match permit {
@@ -298,9 +354,7 @@ impl OutputBus {
                     Err(_) => false,
                 },
             };
-            if sent {
-                *lock(&subscriber.stalled_since) = None;
-            }
+            drop(waiting);
         }
     }
 
@@ -546,6 +600,25 @@ mod tests {
         assert_eq!(outcome, "published");
         assert_eq!(bus.subscriber_count(), 0, "the stalled subscriber is gone");
         assert!(subscription.is_evicted());
+    }
+
+    /// A dropped wait must not leave a marker behind: the reaper would evict a
+    /// subscriber that is reading normally, `evict_after` later.
+    #[tokio::test]
+    async fn cancelling_a_wait_clears_the_stall_marker() {
+        let (bus, _sub) = bus_with(2, Duration::from_secs(60));
+        bus.publish_data(event()).await; // fills the only data slot
+        let mut blocked = Box::pin(bus.publish_data(event()));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        assert!(
+            lock(&bus.snapshot()[0].stalled_since).is_some(),
+            "a waiting publisher must be visible to the reaper"
+        );
+        drop(blocked);
+        assert!(
+            lock(&bus.snapshot()[0].stalled_since).is_none(),
+            "cancelling the wait clears the marker"
+        );
     }
 
     #[tokio::test]

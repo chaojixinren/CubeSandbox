@@ -12,7 +12,27 @@ use tokio::sync::watch;
 use crate::process::wire::{DataEvent, EndEvent};
 use crate::process::OutputBus;
 
-const READ_CHUNK: usize = 32 * 1024;
+/// One read from a child's pipe or pty. Every frame costs a fixed amount of
+/// cross-task work (a queue slot, a wakeup, a base64 string, a JSON envelope),
+/// and this sandbox's cost per handoff dominates the per-byte cost, so the
+/// chunk is sized to what a pipe can carry in one go: the pipe capacity below
+/// is raised to match, and a `cat`-style writer fills it.
+const READ_CHUNK: usize = 128 * 1024;
+
+/// Ask the kernel for a child pipe large enough to fill `READ_CHUNK` in one
+/// read. Linux caps this at `/proc/sys/fs/pipe-max-size` (1 MiB by default), so
+/// the request is best effort and a refusal only means smaller reads.
+pub(super) fn widen_pipe<F: std::os::fd::AsRawFd>(pipe: &F, name: &str) {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: `fd` is an open pipe read end owned by the caller.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, READ_CHUNK as libc::c_int) };
+    if result < 0 {
+        tracing::debug!(
+            "{name}: could not widen the pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
 /// Once the direct child has been reaped, inherited stdout/stderr or PTY
 /// slave descriptors must not keep the process entry alive forever. Normal
 /// exits reach EOF immediately; this grace period only catches background or
@@ -142,6 +162,7 @@ pub(super) async fn pump_pty(
 ) -> std::io::Result<()> {
     use base64::Engine;
     use std::io::Read;
+    widen_pipe(&master, "pty");
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
         // The drain grace only *stops reading*: a publish that is already in
@@ -213,10 +234,11 @@ pub(super) async fn pump_pipe<R>(
     is_stderr: bool,
 ) -> std::io::Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + std::os::fd::AsRawFd,
 {
     use base64::Engine;
     let Some(mut pipe) = pipe else { return Ok(()) };
+    widen_pipe(&pipe, if is_stderr { "stderr" } else { "stdout" });
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
         let read = tokio::select! {
