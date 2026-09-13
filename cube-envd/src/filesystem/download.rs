@@ -646,8 +646,8 @@ impl ReadPool {
     }
 }
 
-/// Prefetch budget: `DOWNLOAD_PREFETCH` permits shared by every in-flight large
-/// body (a follow-up derives this from the configurable pool size). A permit buys the *blocking* producer — one
+/// Prefetch budget: `platform::limits::download_prefetch()` permits shared by
+/// every in-flight large body. A permit buys the *blocking* producer — one
 /// pool crossing for the whole body, which is the fast shape — and is held
 /// until that body ends, so at most that many blocking threads can ever be
 /// pinned by downloads, leaving the rest of the pool to process reaping,
@@ -658,15 +658,13 @@ impl ReadPool {
 static PREFETCH_BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::OnceLock::new();
 
-/// How many bodies may use the blocking producer. A quarter of the default
-/// 64-thread pool: downloads are the only user that holds a pool thread for the
-/// whole duration of a client stall, so everything else (`spawn` reaping,
-/// uploads, filesystem RPCs) keeps the rest.
-const DOWNLOAD_PREFETCH: usize = 16;
-
 fn prefetch_budget() -> std::sync::Arc<tokio::sync::Semaphore> {
     PREFETCH_BUDGET
-        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_PREFETCH)))
+        .get_or_init(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::platform::limits::download_prefetch(),
+            ))
+        })
         .clone()
 }
 

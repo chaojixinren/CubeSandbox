@@ -279,6 +279,13 @@ cgroup v2's no-internal-process constraint. There is no PID-0 migration probe.
 
 Configuration:
 
+- `CUBE_ENVD_BLOCKING_THREADS`: blocking-pool thread cap, default `64`,
+  clamped to `4..=256` (an invalid value warns and keeps the default rather
+  than failing startup). The pool serves process reaping, upload writers,
+  filesystem RPCs and the `/files` body pipeline; platform/limits.rs derives
+  the latter's prefetch budget as a quarter of it, so lowering the cap lowers
+  that budget too. Raise it on guests with a larger memory budget (~13 KiB
+  touched RSS per thread), lower it under memory pressure.
 - `CUBE_ENVD_CGROUP_ROOT`: cgroup v2 root, default `/sys/fs/cgroup`; nested
   daemon membership is resolved when visible below that root.
 - `CUBE_ENVD_CGROUP_MEMORY_MAX_BYTES`: positive requested memory cap, clamped

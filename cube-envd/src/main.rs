@@ -38,20 +38,26 @@ fn main() {
         .with_target(false)
         .init();
 
+    // Deployment knob (see platform/limits.rs): 64 is the default, chosen so
+    // the pool's worst-case touched RSS (~13KiB/thread) stays inside this
+    // in-guest daemon's budget while covering the sandbox's dozens-of-ops
+    // workload. Deliberate divergence from the unbounded-goroutine baseline:
+    // over the cap, requests queue (never error).
+    let blocking_threads = platform::limits::blocking_threads();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        // Blocking pool (see app/pool.rs): the default 512 threads at
-        // ~13KiB touched RSS each is a ~6.6MiB worst case — larger than the
-        // whole memory budget for this in-guest daemon. 64 leaves ample
-        // headroom for the sandbox's dozens-of-ops workload. Deliberate
-        // divergence from the unbounded-goroutine baseline: over the cap,
-        // requests queue (never error). `thread_keep_alive` is tokio's 10s
-        // default, written out so the burst-reuse behavior is explicit.
-        .max_blocking_threads(64)
+        .max_blocking_threads(blocking_threads)
         .thread_keep_alive(std::time::Duration::from_secs(10))
         .enable_all()
         .build()
         .expect("build tokio runtime");
+    // Effective limits, once, so an operator can see what the deployment
+    // actually got instead of inferring it from the environment.
+    tracing::info!(
+        blocking_threads,
+        download_prefetch = platform::limits::download_prefetch(),
+        "runtime limits"
+    );
 
     runtime.block_on(async move {
         let state = Arc::new(app::state::AppState::new().with_cgroup(process::cgroup::init()));

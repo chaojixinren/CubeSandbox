@@ -4,9 +4,11 @@
 //! Shared facilities consumed by more than one domain, with no wire contract
 //! of their own.
 //!
-//! Members: `identity` (request user/group resolution and path anchoring) and
+//! Members: `identity` (request user/group resolution and path anchoring),
 //! `config` (env vars, default user/workdir, access token, /init timestamp
-//! gate). Both are read from L3 domains, so they must sit below them.
+//! gate) and `limits` (startup deployment knobs: blocking-pool size and the
+//! download prefetch budget derived from it). All are read from L3 domains, so
+//! they must sit below them.
 //!
 //! Not here: `cgroup/` is a single-domain resource boundary (process only) and
 //! lives in `process/cgroup/`; `auth` is the only OS-facing surface today.
@@ -15,4 +17,5 @@
 
 pub mod config;
 pub mod identity;
+pub mod limits;
 pub mod lock;
