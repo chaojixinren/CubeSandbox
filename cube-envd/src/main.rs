@@ -38,20 +38,32 @@ fn main() {
         .with_target(false)
         .init();
 
+    // Deployment knobs first (see platform/limits.rs): the flags from
+    // ENVD_EXTRA_ARGS win, the CUBE_ENVD_* variables are the fallback.
+    platform::limits::configure(cli.blocking_threads, cli.download_max_bodies);
+
+    // Deployment knob (see platform/limits.rs): 64 is the default, chosen so
+    // the pool's worst-case touched RSS (~13KiB/thread) stays inside this
+    // in-guest daemon's budget while covering the sandbox's dozens-of-ops
+    // workload. Deliberate divergence from the unbounded-goroutine baseline:
+    // over the cap, requests queue (never error).
+    let blocking_threads = platform::limits::blocking_threads();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        // Blocking pool (see app/pool.rs): the default 512 threads at
-        // ~13KiB touched RSS each is a ~6.6MiB worst case — larger than the
-        // whole memory budget for this in-guest daemon. 64 leaves ample
-        // headroom for the sandbox's dozens-of-ops workload. Deliberate
-        // divergence from the unbounded-goroutine baseline: over the cap,
-        // requests queue (never error). `thread_keep_alive` is tokio's 10s
-        // default, written out so the burst-reuse behavior is explicit.
-        .max_blocking_threads(64)
+        .max_blocking_threads(blocking_threads)
         .thread_keep_alive(std::time::Duration::from_secs(10))
         .enable_all()
         .build()
         .expect("build tokio runtime");
+    // Effective limits, once, so an operator can see what the deployment
+    // actually got instead of inferring it from the environment.
+    tracing::info!(
+        blocking_threads,
+        download_blocking_producers = platform::limits::download_blocking_producers(),
+        download_buffered_bodies = platform::limits::download_buffered_bodies(),
+        download_max_bodies = platform::limits::download_max_bodies(),
+        "runtime limits"
+    );
 
     runtime.block_on(async move {
         let state = Arc::new(app::state::AppState::new().with_cgroup(process::cgroup::init()));
@@ -65,7 +77,11 @@ fn main() {
             }
         };
         tracing::info!("cube-envd {VERSION} ({COMMIT}) listening on {addr}");
-        if let Err(e) = axum::serve(listener, app).await {
+        // Nagle is on by default and costs a full delayed-ACK round trip on
+        // any response whose head and body leave as separate small writes:
+        // a 4 KiB `/files` download measured 44 ms against 1.6 ms for 1 MiB,
+        // while the Go baseline's `net/http` sets TCP_NODELAY itself.
+        if let Err(e) = axum::serve(listener, app).tcp_nodelay(true).await {
             tracing::error!("server error: {e}");
             std::process::exit(1);
         }

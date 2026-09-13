@@ -15,12 +15,19 @@ suite gates cube-envd changes, `ENVD_REF` bumps, and SDK-matrix updates.
 | `lifecycle_smoke.go` | Assertion-based black-box regression for interactive input and slow-client process cleanup against one live envd; these checks complement, but do not replace, Go-vs-Rust fixture capture |
 | `perf.py` | Startup-to-/health latency, RSS, and command round-trip comparison |
 | `termination_e2e.py` | Real cgroupfs OOM, fail-closed allocation/recovery, escaped descendants, wire metadata and Python SDK checks in an isolated Linux/QEMU guest |
+| `entrypoint_knobs_e2e.py` | Runs `docker/cube-entrypoint.sh` with `ENVD_EXTRA_ARGS` and asserts the deployment path can tune envd: the knobs reach the daemon, a flag beats the equivalent environment variable, the configured cap is enforced (N served, one `503`) and small bodies stay exempt |
 | `test_conformance.py` | Unit coverage ensuring extension normalization does not hide unrelated wire differences |
 
 ## Running
 
 Requires Docker, Python 3.10+ (stdlib only), and the cube-envd musl binary
 (`make cube-envd` → `_output/bin/cube-envd`).
+
+```bash
+# The deployment/entrypoint path: knobs through ENVD_EXTRA_ARGS, asserted from
+# the daemon's startup line and from the cap's behaviour. Needs no guest.
+python3 entrypoint_knobs_e2e.py /path/to/cube-envd
+```
 
 ```bash
 BASE_IMAGE=ghcr.io/tencentcloud/cubesandbox-base:2026.16

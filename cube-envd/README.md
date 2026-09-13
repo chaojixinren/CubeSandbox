@@ -49,7 +49,7 @@ cube-envd/                            the component directory; everything below 
 │   │   ├── http/                     content_disposition, encoding, httpdate, preconditions, ranges
 │   │   ├── watch/                    inotify.rs, pump.rs, tree.rs
 │   │   ├── data_plane_tests.rs       data-plane tests
-│   │   ├── download.rs
+│   │   ├── download/                 mod.rs (ServeContent stages, Range/conditionals), body.rs (pipeline: pool, budgets, shapes), tests.rs
 │   │   ├── entry.rs                  disk metadata -> EntryInfo
 │   │   ├── errors.rs                 error -> gRPC status mapping
 │   │   ├── mod.rs                    stat / listDir / makeDir / move / remove
@@ -92,6 +92,13 @@ in. Every path in the block resolves, and leaf directories with one uniform
 purpose are summarised in the annotation rather than expanded. Not listed: `target/`
 (cargo's build directory, ignored by `cube-envd/.gitignore`), `.gitignore`
 itself, and this README.
+
+A file is split when its **non-test** code passes 800 lines *and* it holds two
+responsibility areas that share no state. Both conditions matter: `command.rs` is
+1,644 lines but 1,084 of them are tests, and `handlers.rs` is 521 lines of one
+responsibility. `download.rs` (945 non-test lines: the ServeContent stage machine
+plus the body pipeline, which owns its own pool and budgets) met both and is now
+`download.rs` + `download/body.rs` + `download/tests.rs`.
 
 `filesystem/` and `process/` never reference each other, and nothing below
 `app/` reaches back into it. That is enforced rather than merely intended:
@@ -277,8 +284,33 @@ There is no direct fallback into the type parent: these parents distribute
 memory/cpu to child leaves and cannot also accept internal processes under
 cgroup v2's no-internal-process constraint. There is no PID-0 migration probe.
 
-Configuration:
+Configuration. Every variable below is read from envd's own environment; the
+two deployment knobs also exist as flags (`-blocking-threads`,
+`-download-max-bodies`) so `ENVD_EXTRA_ARGS` can carry them, and a flag wins
+over the variable (`tests/e2e/envd_conformance/entrypoint_knobs_e2e.py` runs the
+entrypoint and asserts exactly that). See the "Tuning envd" section of
+`docs/guide/tutorials/bring-your-own-image.md` for the user-facing version.
 
+- `CUBE_ENVD_BLOCKING_THREADS`: blocking-pool thread cap, default `64`,
+  clamped to `4..=256` (an invalid value warns and keeps the default rather
+  than failing startup). The pool serves process reaping, upload writers,
+  filesystem RPCs and the `/files` body pipeline; `platform/limits.rs` derives
+  that pipeline's budgets from it: at most `pool / 2` bodies may buffer ahead
+  (1 MiB slices with read-ahead), of which at most `pool / 4` may also hold a
+  pool thread, and a body that gets neither streams 256 KiB slices without
+  read-ahead, so a storm of stalled downloads cannot grow the daemon's memory
+  with the connection count. Lowering the cap lowers all of them. Raise it on
+  guests with a larger memory budget (~13 KiB touched RSS per thread), lower it
+  under memory pressure.
+- `CUBE_ENVD_DOWNLOAD_MAX_BODIES`: global cap on concurrent *large* `/files`
+  downloads (a body that fits in one chunk is exempt), default twice the pool
+  size (`128` at the default pool), never below what the pipeline itself needs
+  (all blocking producers plus all buffered bodies, `48` at the default) and
+  never above `1024`. A request over the cap is refused with `503` instead of
+  being queued, because a stalled client holding a slot must not put later
+  downloads behind it. Lower it to bound the daemon's memory harder. The Go
+  baseline has no such cap, so a client that opens more concurrent large
+  downloads than this sees `503` where Go would keep going.
 - `CUBE_ENVD_CGROUP_ROOT`: cgroup v2 root, default `/sys/fs/cgroup`; nested
   daemon membership is resolved when visible below that root.
 - `CUBE_ENVD_CGROUP_MEMORY_MAX_BYTES`: positive requested memory cap, clamped

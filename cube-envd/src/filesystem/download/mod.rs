@@ -8,11 +8,17 @@ use std::collections::HashMap;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
-use super::errors::{check_token_rest, resolve_request_user};
+use crate::filesystem::errors::{check_token_rest, resolve_request_user};
 use crate::filesystem::http::{content_disposition, encoding, httpdate, preconditions, ranges};
 use crate::platform::config::Config;
 use crate::platform::identity;
 use crate::protocol::RestError;
+
+mod body;
+#[cfg(test)]
+mod tests;
+
+use body::{acquire_in_flight, in_flight_budget, reader_stream};
 
 /// GET /files — stream a file back with upstream `http.ServeContent`
 /// semantics: Last-Modified, conditional requests (If-Match / If-Unmodified-
@@ -135,7 +141,23 @@ pub async fn download(
     if let Some(len) = body_len {
         b = b.header(axum::http::header::CONTENT_LENGTH, len);
     }
-    let stream = reader_stream(file, stream_limit);
+    // Global cap on concurrent large bodies: a stalled client must not be able
+    // to grow the daemon's memory with the connection count, and a request that
+    // does not get a slot is refused rather than queued (see acquire_in_flight).
+    let in_flight = match acquire_in_flight(stream_limit, &in_flight_budget()) {
+        Ok(permit) => permit,
+        Err(()) => {
+            return RestError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "too many concurrent file downloads (limit {}); retry when some finish",
+                    crate::platform::limits::download_max_bodies()
+                ),
+            )
+            .into_response();
+        }
+    };
+    let stream = reader_stream(file, stream_limit, in_flight).await;
     b.body(axum::body::Body::from_stream(stream))
         .expect("build download response")
 }
@@ -543,33 +565,4 @@ async fn sniff_content_type(f: &mut tokio::fs::File) -> std::io::Result<&'static
     } else {
         Ok("application/octet-stream")
     }
-}
-
-/// Chunked reader stream (64 KiB) without pulling in tokio-util. `limit`
-/// bounds the total bytes produced (single-range 206 bodies); `None` streams
-/// to EOF.
-fn reader_stream(
-    file: tokio::fs::File,
-    limit: Option<u64>,
-) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
-    use tokio::io::AsyncReadExt;
-    futures::stream::unfold((file, limit), |(mut file, mut remaining)| async move {
-        let want = match remaining {
-            Some(0) => return None,
-            Some(r) => r.min(64 * 1024) as usize,
-            None => 64 * 1024,
-        };
-        let mut buf = vec![0u8; want];
-        match file.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                if let Some(r) = remaining.as_mut() {
-                    *r -= n as u64;
-                }
-                Some((Ok(bytes::Bytes::from(buf)), (file, remaining)))
-            }
-            Err(e) => Some((Err(e), (file, remaining))),
-        }
-    })
 }
