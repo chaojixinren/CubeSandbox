@@ -172,11 +172,18 @@ def install_test_daemon(sandbox, binary):
 
     def serve():
         try:
+            # The cgroup variables are the deployment-side knobs that predate
+            # this test; the /files budgets are exercised the same way, and with
+            # deliberately different values in the environment and on the
+            # command line, so the run would fail loudly if the flag stopped
+            # winning (the effective values are asserted by
+            # entrypoint_knobs_e2e.py, which also runs the real entrypoint).
             bootstrap.run(
                 "mkdir -p /sys/fs/cgroup/candidate-review; "
                 "CUBE_ENVD_CGROUP_ROOT=/sys/fs/cgroup/candidate-review "
                 "CUBE_ENVD_CGROUP_MEMORY_MAX_BYTES=134217728 "
-                f"exec {target} -port 49984",
+                "CUBE_ENVD_BLOCKING_THREADS=32 "
+                f"exec {target} -port 49984 -blocking-threads 8 -download-max-bodies 64",
                 timeout=240,
             )
         except Exception as error:

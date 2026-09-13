@@ -280,7 +280,8 @@ cgroup v2's no-internal-process constraint. There is no PID-0 migration probe.
 Configuration. Every variable below is read from envd's own environment; the
 two deployment knobs also exist as flags (`-blocking-threads`,
 `-download-max-bodies`) so `ENVD_EXTRA_ARGS` can carry them, and a flag wins
-over the variable. See the "Tuning envd" section of
+over the variable (`tests/e2e/envd_conformance/entrypoint_knobs_e2e.py` runs the
+entrypoint and asserts exactly that). See the "Tuning envd" section of
 `docs/guide/tutorials/bring-your-own-image.md` for the user-facing version.
 
 - `CUBE_ENVD_BLOCKING_THREADS`: blocking-pool thread cap, default `64`,
