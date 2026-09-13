@@ -289,6 +289,15 @@ Configuration:
   without read-ahead, so a storm of stalled downloads cannot grow the daemon's
   memory with the connection count. Lowering the cap lowers both budgets. Raise it on guests with a larger memory budget (~13 KiB
   touched RSS per thread), lower it under memory pressure.
+- `CUBE_ENVD_DOWNLOAD_MAX_BODIES`: global cap on concurrent *large* `/files`
+  downloads (a body that fits in one chunk is exempt), default twice the pool
+  size (`128` at the default pool), never below what the pipeline itself needs
+  (all blocking producers plus all buffered bodies, `48` at the default) and
+  never above `1024`. A request over the cap is refused with `503` instead of
+  being queued, because a stalled client holding a slot must not put later
+  downloads behind it. Lower it to bound the daemon's memory harder. The Go
+  baseline has no such cap, so a client that opens more concurrent large
+  downloads than this sees `503` where Go would keep going.
 - `CUBE_ENVD_CGROUP_ROOT`: cgroup v2 root, default `/sys/fs/cgroup`; nested
   daemon membership is resolved when visible below that root.
 - `CUBE_ENVD_CGROUP_MEMORY_MAX_BYTES`: positive requested memory cap, clamped

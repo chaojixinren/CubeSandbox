@@ -43,6 +43,17 @@ const DOWNLOAD_BLOCKING_DIVISOR: usize = 4;
 /// memory. Also derived, for the same reason.
 const DOWNLOAD_BUFFERED_DIVISOR: usize = 2;
 
+/// How many *large* downloads may be in flight at once, globally. A request over
+/// the cap is refused (503), never queued: a stalled client holding a slot must
+/// not put every later download behind it, which is the failure mode the tier
+/// budgets exist to remove. The default is twice the pool, so the cap scales
+/// with the deployment, and it can also be set explicitly — but never below
+/// what the pipeline itself needs (all blocking producers plus all buffered
+/// bodies), so a small value cannot undercut the tiers, and never above a
+/// ceiling that would make it meaningless.
+const DOWNLOAD_MAX_BODIES_ENV: &str = "CUBE_ENVD_DOWNLOAD_MAX_BODIES";
+const DOWNLOAD_MAX_BODIES_CEILING: usize = 1024;
+
 static BLOCKING_THREADS: OnceLock<usize> = OnceLock::new();
 
 /// Blocking-pool cap: `CUBE_ENVD_BLOCKING_THREADS`, else the default.
@@ -75,8 +86,53 @@ pub fn download_buffered_bodies() -> usize {
     download_buffered_bodies_at(blocking_threads())
 }
 
+/// Global cap on concurrent large `/files` downloads (see the env doc above).
+pub fn download_max_bodies() -> usize {
+    let pool = blocking_threads();
+    let raw = match std::env::var(DOWNLOAD_MAX_BODIES_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => {
+            tracing::warn!("limits: cannot read {DOWNLOAD_MAX_BODIES_ENV}: {e}");
+            None
+        }
+    };
+    download_max_bodies_from(raw.as_deref(), pool)
+}
+
 fn download_buffered_bodies_at(pool: usize) -> usize {
     (pool / DOWNLOAD_BUFFERED_DIVISOR).max(1)
+}
+
+fn download_max_bodies_from(raw: Option<&str>, pool: usize) -> usize {
+    let floor = download_blocking_producers_at(pool) + download_buffered_bodies_at(pool);
+    let default = (pool * 2).max(floor);
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.parse::<usize>() {
+        Ok(0) | Err(_) => {
+            tracing::warn!(
+                "limits: ignoring invalid {DOWNLOAD_MAX_BODIES_ENV}={raw:?}; \
+                 expected a positive body count"
+            );
+            default
+        }
+        Ok(n) if n < floor => {
+            tracing::warn!(
+                "limits: {DOWNLOAD_MAX_BODIES_ENV}={n} is below what the pipeline needs; \
+                 using the floor {floor}"
+            );
+            floor
+        }
+        Ok(n) if n > DOWNLOAD_MAX_BODIES_CEILING => {
+            tracing::warn!(
+                "limits: clamping {DOWNLOAD_MAX_BODIES_ENV}={n} to {DOWNLOAD_MAX_BODIES_CEILING}"
+            );
+            DOWNLOAD_MAX_BODIES_CEILING
+        }
+        Ok(n) => n,
+    }
 }
 
 /// Adjudicate a configured value: unset or unparsable falls back to the
@@ -131,6 +187,41 @@ mod tests {
     /// Both budgets are derived, so lowering the pool lowers them too: that is
     /// the invariant that keeps downloads from pinning the whole pool or from
     /// buffering without bound.
+    /// The download cap never drops below the pipeline's own concurrency and
+    /// never exceeds the ceiling, whatever the environment says.
+    #[test]
+    fn the_download_cap_is_floored_by_the_pipeline_and_capped() {
+        let floor = download_blocking_producers_at(DEFAULT_BLOCKING_THREADS)
+            + download_buffered_bodies_at(DEFAULT_BLOCKING_THREADS);
+        assert_eq!(
+            download_max_bodies_from(None, DEFAULT_BLOCKING_THREADS),
+            128
+        );
+        assert_eq!(
+            download_max_bodies_from(Some("256"), DEFAULT_BLOCKING_THREADS),
+            256
+        );
+        assert_eq!(
+            download_max_bodies_from(Some("8"), DEFAULT_BLOCKING_THREADS),
+            floor,
+            "a value below the floor is raised to it"
+        );
+        assert_eq!(
+            download_max_bodies_from(Some("100000"), DEFAULT_BLOCKING_THREADS),
+            DOWNLOAD_MAX_BODIES_CEILING
+        );
+        for raw in ["", "abc", "0", "-4"] {
+            assert_eq!(
+                download_max_bodies_from(Some(raw), DEFAULT_BLOCKING_THREADS),
+                128,
+                "{raw:?} must fall back to the default"
+            );
+        }
+        // Smaller pools scale the whole thing down, floor included.
+        assert_eq!(download_max_bodies_from(None, 8), 16);
+        assert_eq!(download_max_bodies_from(Some("1"), 8), 6);
+    }
+
     #[test]
     fn the_download_budgets_follow_the_pool_and_never_reach_zero() {
         assert_eq!(download_blocking_producers_at(DEFAULT_BLOCKING_THREADS), 16);

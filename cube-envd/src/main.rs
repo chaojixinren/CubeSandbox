@@ -57,6 +57,7 @@ fn main() {
         blocking_threads,
         download_blocking_producers = platform::limits::download_blocking_producers(),
         download_buffered_bodies = platform::limits::download_buffered_bodies(),
+        download_max_bodies = platform::limits::download_max_bodies(),
         "runtime limits"
     );
 

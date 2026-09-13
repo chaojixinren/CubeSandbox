@@ -135,7 +135,23 @@ pub async fn download(
     if let Some(len) = body_len {
         b = b.header(axum::http::header::CONTENT_LENGTH, len);
     }
-    let stream = reader_stream(file, stream_limit).await;
+    // Global cap on concurrent large bodies: a stalled client must not be able
+    // to grow the daemon's memory with the connection count, and a request that
+    // does not get a slot is refused rather than queued (see acquire_in_flight).
+    let in_flight = match acquire_in_flight(stream_limit, &in_flight_budget()) {
+        Ok(permit) => permit,
+        Err(()) => {
+            return RestError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "too many concurrent file downloads (limit {}); retry when some finish",
+                    crate::platform::limits::download_max_bodies()
+                ),
+            )
+            .into_response();
+        }
+    };
+    let stream = reader_stream(file, stream_limit, in_flight).await;
     b.body(axum::body::Body::from_stream(stream))
         .expect("build download response")
 }
@@ -670,11 +686,46 @@ struct Budgets {
 
 /// Permits held by one body's producer; dropping them returns the budgets.
 struct BudgetGuard {
+    _in_flight: Option<tokio::sync::OwnedSemaphorePermit>,
     _blocking: Option<tokio::sync::OwnedSemaphorePermit>,
     _buffered: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 static BUDGETS: std::sync::OnceLock<Budgets> = std::sync::OnceLock::new();
+
+/// Global cap on concurrent large downloads (`platform/limits.rs`). Unlike the
+/// tier budgets this one is acquired by the *handler*, because a request over
+/// the cap must be refused with a status code the body stream cannot produce.
+static IN_FLIGHT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn in_flight_budget() -> std::sync::Arc<tokio::sync::Semaphore> {
+    IN_FLIGHT
+        .get_or_init(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::platform::limits::download_max_bodies(),
+            ))
+        })
+        .clone()
+}
+
+/// Take a global slot for a body that is *not* a single read.
+///
+/// `Ok(None)` means the body is small enough not to count (a body that fits in
+/// one chunk costs a single read, so it is exempt), `Ok(Some(permit))` holds a
+/// slot until the body ends, and `Err(())` means the request must be refused —
+/// never queued, because queueing would put this download behind the stalled
+/// one that is holding the slots.
+#[allow(clippy::result_unit_err)] // `()` is the whole verdict; the caller owns the 503 shape
+fn acquire_in_flight(
+    limit: Option<u64>,
+    budget: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    if matches!(limit, Some(n) if n <= DOWNLOAD_CHUNK as u64) {
+        return Ok(None);
+    }
+    budget.clone().try_acquire_owned().map(Some).map_err(|_| ())
+}
 
 fn budgets() -> Budgets {
     BUDGETS
@@ -695,8 +746,9 @@ fn budgets() -> Budgets {
 async fn reader_stream(
     file: tokio::fs::File,
     limit: Option<u64>,
+    in_flight: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
-    reader_stream_with(budgets(), file, limit).await
+    reader_stream_with(budgets(), file, limit, in_flight).await
 }
 
 /// The body pipeline, with the budgets passed in so tests can drive the tiers
@@ -724,6 +776,7 @@ async fn reader_stream_with(
     budgets: Budgets,
     mut file: tokio::fs::File,
     limit: Option<u64>,
+    in_flight: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
     use futures::StreamExt;
     use tokio::io::AsyncReadExt;
@@ -768,6 +821,7 @@ async fn reader_stream_with(
                 tx,
                 DOWNLOAD_STREAM_SLICE,
                 BudgetGuard {
+                    _in_flight: in_flight,
                     _blocking: None,
                     _buffered: None,
                 },
@@ -786,6 +840,7 @@ async fn reader_stream_with(
             // from here the producer owns the fd and does plain blocking reads.
             let std_file = file.into_std().await;
             let guard = BudgetGuard {
+                _in_flight: in_flight,
                 _blocking: Some(blocking),
                 _buffered: Some(buffered),
             };
@@ -795,6 +850,7 @@ async fn reader_stream_with(
         }
         Err(_) => {
             let guard = BudgetGuard {
+                _in_flight: in_flight,
                 _blocking: None,
                 _buffered: Some(buffered),
             };
@@ -897,11 +953,22 @@ mod tests {
         std::fs::write(path, data).unwrap();
     }
 
+    /// Generous budgets, injected so no test depends on the process-wide ones.
+    fn test_budgets() -> Budgets {
+        Budgets {
+            blocking: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            buffered: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
+        }
+    }
+
     async fn collect(
         file: tokio::fs::File,
         limit: Option<u64>,
     ) -> Vec<Result<bytes::Bytes, std::io::Error>> {
-        reader_stream(file, limit).await.collect().await
+        reader_stream_with(budgets(), file, limit, None)
+            .await
+            .collect()
+            .await
     }
 
     /// The same, through the unbuffered tier: no permits, so the body streams
@@ -914,7 +981,7 @@ mod tests {
             blocking: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
             buffered: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
         };
-        reader_stream_with(budgets, file, limit)
+        reader_stream_with(budgets, file, limit, None)
             .await
             .collect()
             .await
@@ -1048,6 +1115,7 @@ mod tests {
             tx,
             DOWNLOAD_CHUNK,
             BudgetGuard {
+                _in_flight: None,
                 _blocking: None,
                 _buffered: None,
             },
@@ -1103,6 +1171,7 @@ mod tests {
             budgets.clone(),
             tokio::fs::File::open(&path).await.unwrap(),
             Some(size as u64),
+            None,
         )
         .await;
         assert_eq!(budgets.blocking.available_permits(), 0);
@@ -1117,6 +1186,7 @@ mod tests {
             budgets.clone(),
             tokio::fs::File::open(&path).await.unwrap(),
             Some(size as u64),
+            None,
         )
         .await;
         assert_eq!(budgets.buffered.available_permits(), 0);
@@ -1127,6 +1197,7 @@ mod tests {
             budgets.clone(),
             tokio::fs::File::open(&path).await.unwrap(),
             Some(size as u64),
+            None,
         )
         .await;
         let chunks = unbuffered.collect::<Vec<_>>().await;
@@ -1168,6 +1239,63 @@ mod tests {
             2,
             "buffered permits came back"
         );
+    }
+
+    /// The global cap is what keeps a storm of stalled downloads from growing
+    /// the daemon's memory with the connection count: a body that is not a
+    /// single read holds a slot for its whole life, a small body never takes
+    /// one, and a request that misses out is refused instead of queued.
+    #[tokio::test]
+    async fn the_global_cap_refuses_rather_than_queues_and_small_bodies_are_exempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let size = DOWNLOAD_CHUNK * (DOWNLOAD_READ_AHEAD + 4);
+        write_pattern(&path, size);
+
+        let cap = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        // A small body is exempt even with the cap fully taken.
+        let held = cap.clone().try_acquire_owned().unwrap();
+        assert!(matches!(acquire_in_flight(Some(4096), &cap), Ok(None)));
+        assert!(matches!(acquire_in_flight(Some(0), &cap), Ok(None)));
+        drop(held);
+        assert!(matches!(
+            acquire_in_flight(Some(size as u64), &cap),
+            Ok(Some(_))
+        ));
+
+        // A large body gets the last slot...
+        let permit = match acquire_in_flight(Some(size as u64), &cap) {
+            Ok(Some(permit)) => permit,
+            _ => panic!("the last slot should have been available"),
+        };
+        // ... and the next one is refused, not queued.
+        assert!(acquire_in_flight(Some(size as u64), &cap).is_err());
+        assert!(
+            acquire_in_flight(None, &cap).is_err(),
+            "EOF bodies count too"
+        );
+
+        // The slot is held for the body's life and comes back with it.
+        let body = reader_stream_with(
+            test_budgets(),
+            tokio::fs::File::open(&path).await.unwrap(),
+            Some(size as u64),
+            Some(permit),
+        )
+        .await;
+        assert!(
+            acquire_in_flight(Some(size as u64), &cap).is_err(),
+            "still held"
+        );
+        assert_eq!(total(&body.collect::<Vec<_>>().await), size);
+        for _ in 0..200 {
+            if acquire_in_flight(Some(size as u64), &cap).is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the global slot never came back");
     }
 
     /// The unbuffered tier is only about footprint: the bytes are the same and
