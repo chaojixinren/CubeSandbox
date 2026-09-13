@@ -290,6 +290,33 @@ mod tests {
     use crate::process::engine::tests::current_user;
     use std::collections::HashMap;
 
+    /// `widen_pipe` is best effort by design (the kernel caps the request at
+    /// `pipe-max-size`), so what matters is that the fd it touched still works
+    /// as a pipe afterwards: a wrong fd or a bad argument would break output.
+    #[test]
+    fn widening_a_pipe_keeps_it_usable() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just created and are owned from here.
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same descriptors, each taken exactly once.
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        widen_pipe(&read_end, "test");
+        // SAFETY: `read_end` is an open pipe whose size is queried read-only.
+        let size = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        assert!(size > 0, "a pipe keeps a positive size, got {size}");
+
+        (&write_end).write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        (&read_end).read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
     #[test]
     fn oom_metadata_requires_sigkill_and_preserves_recorded_causes() {
         use std::os::unix::process::ExitStatusExt;

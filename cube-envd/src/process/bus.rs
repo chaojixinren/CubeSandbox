@@ -194,8 +194,10 @@ pub struct Subscription {
     /// ends without a terminal event (the bus disappeared first) can still
     /// report the real exit instead of an internal error.
     terminal: Option<Arc<Mutex<Option<PumpEvent>>>>,
-    /// Counted against [`MAX_SUBSCRIBERS_GLOBAL`]; false for cached one-shots.
-    counted: bool,
+    /// The budget this attachment was counted against, if any. A cached
+    /// one-shot carries `None`; everything else points at the process-wide
+    /// counter (or, in a test, at a private one).
+    counter: Option<&'static AtomicUsize>,
 }
 
 impl Drop for Subscription {
@@ -203,8 +205,8 @@ impl Drop for Subscription {
         if let Some(bus) = self.bus.upgrade() {
             bus.detach(self.id);
         }
-        if self.counted {
-            GLOBAL_SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+        if let Some(counter) = self.counter {
+            counter.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -216,6 +218,12 @@ pub struct OutputBus {
     next_id: AtomicU64,
     evict_after: Duration,
     max_subscribers: usize,
+    /// Budget that attachments of this bus are counted against, and its
+    /// ceiling. Production always uses [`GLOBAL_SUBSCRIBERS`] and
+    /// [`MAX_SUBSCRIBERS_GLOBAL`]; they are fields because a test has to drive
+    /// the global limit without racing every other test in the same binary.
+    global: &'static AtomicUsize,
+    max_global: usize,
 }
 
 impl OutputBus {
@@ -235,11 +243,31 @@ impl OutputBus {
         evict_after: Duration,
         max_subscribers: usize,
     ) -> (Arc<Self>, Subscription) {
+        Self::with_global_limits(
+            capacity,
+            evict_after,
+            max_subscribers,
+            &GLOBAL_SUBSCRIBERS,
+            MAX_SUBSCRIBERS_GLOBAL,
+        )
+    }
+
+    /// [`OutputBus::with_limits`] with the global budget injected, so a test can
+    /// exhaust it deterministically.
+    pub(crate) fn with_global_limits(
+        capacity: usize,
+        evict_after: Duration,
+        max_subscribers: usize,
+        global: &'static AtomicUsize,
+        max_global: usize,
+    ) -> (Arc<Self>, Subscription) {
         let bus = Arc::new(Self {
             subscribers: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             evict_after,
             max_subscribers,
+            global,
+            max_global,
         });
         // The first attachment is created after the child has been spawned, so
         // it must never be refused: failing here would leave an orphan process
@@ -263,10 +291,8 @@ impl OutputBus {
         if enforce_limits && subscribers.len() >= self.max_subscribers {
             return Err(BusError::TooManySubscribers);
         }
-        if GLOBAL_SUBSCRIBERS.fetch_add(1, Ordering::AcqRel) >= MAX_SUBSCRIBERS_GLOBAL
-            && enforce_limits
-        {
-            GLOBAL_SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+        if self.global.fetch_add(1, Ordering::AcqRel) >= self.max_global && enforce_limits {
+            self.global.fetch_sub(1, Ordering::AcqRel);
             return Err(BusError::TooManySubscribers);
         }
         let (q, rx) = TerminalChannel::new(capacity);
@@ -286,7 +312,7 @@ impl OutputBus {
             rx,
             evicted: evicted_rx,
             terminal: None,
-            counted: true,
+            counter: Some(self.global),
         })
     }
 
@@ -309,7 +335,7 @@ impl OutputBus {
             rx,
             evicted: evicted_rx,
             terminal: None,
-            counted: false,
+            counter: None,
         }
     }
 
@@ -665,6 +691,176 @@ mod tests {
 
         assert_eq!(subscriber.stalled.load(Ordering::Acquire), 0);
         assert!(lock(&subscriber.stalled_since).is_none());
+    }
+
+    /// Ignored benchmark: what one frame costs in *handoffs* alone, which is
+    /// what a sandbox magnifies - the numbers behind this branch's throughput
+    /// work. Run with
+    ///
+    /// ```text
+    /// cargo test --release --bin cube-envd -- --ignored --nocapture frame_path
+    /// ```
+    ///
+    /// `one_hop` is publisher -> subscriber queue -> connection task, which is
+    /// what the production path does per frame; `two_hop` adds the per-connection
+    /// body queue the driver writes into. The gap is the upper bound on what
+    /// collapsing the driver into the response stream could buy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn frame_path_cost() {
+        const FRAMES: usize = 1000;
+        let payload = "x".repeat(128 * 1024);
+
+        let time = |label: &str, elapsed: std::time::Duration| {
+            println!(
+                "{label:10} {:?}/frame  {:.1} MB/s of read bytes",
+                elapsed / FRAMES as u32,
+                (128 * 1024 * FRAMES) as f64 / elapsed.as_secs_f64() / 1e6
+            );
+        };
+
+        // One hop: the bus hands the frame straight to the connection task.
+        {
+            let (bus, mut sub) = bus_with(SUBSCRIBER_QUEUE_CAPACITY, Duration::from_secs(60));
+            let event = PumpEvent::Data(crate::process::wire::DataEvent {
+                stdout: Some(payload.clone()),
+                ..Default::default()
+            });
+            let consumer = tokio::spawn(async move {
+                let mut seen = 0usize;
+                while let Ok(_event) = sub.recv().await {
+                    seen += 1;
+                    if seen == FRAMES {
+                        break;
+                    }
+                }
+            });
+            let start = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                bus.publish_data(event.clone()).await;
+            }
+            consumer.await.unwrap();
+            time("one_hop", start.elapsed());
+        }
+
+        // Two hops: what production does today, the driver relaying each frame
+        // into the connection's own bounded queue.
+        {
+            let (bus, mut sub) = bus_with(SUBSCRIBER_QUEUE_CAPACITY, Duration::from_secs(60));
+            let (body, mut body_rx) = body_channel();
+            let event = PumpEvent::Data(crate::process::wire::DataEvent {
+                stdout: Some(payload.clone()),
+                ..Default::default()
+            });
+            let relay = tokio::spawn(async move {
+                let mut seen = 0usize;
+                let mut permit = None;
+                while let Ok(_event) = sub.recv().await {
+                    let slot = match permit.take() {
+                        Some(slot) => slot,
+                        None => body.reserve_data().await.expect("body open"),
+                    };
+                    slot.send(bytes::Bytes::from_static(b"frame"));
+                    seen += 1;
+                    if seen == FRAMES {
+                        break;
+                    }
+                }
+            });
+            let consumer = tokio::spawn(async move {
+                let mut seen = 0usize;
+                while body_rx.recv().await.is_some() {
+                    seen += 1;
+                    if seen == FRAMES {
+                        break;
+                    }
+                }
+            });
+            let start = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                bus.publish_data(event.clone()).await;
+            }
+            relay.await.unwrap();
+            consumer.await.unwrap();
+            time("two_hop", start.elapsed());
+        }
+    }
+
+    /// An uncontended publish takes the fast path, which must leave the stall
+    /// bookkeeping untouched (no marker for the reaper to act on).
+    #[tokio::test]
+    async fn an_uncontended_publish_leaves_no_stall_marker() {
+        let (bus, _sub) = bus_with(4, Duration::from_secs(60));
+        bus.publish_data(event()).await;
+        let subscriber = bus.snapshot()[0].clone();
+        assert_eq!(subscriber.stalled.load(Ordering::Acquire), 0);
+        assert!(lock(&subscriber.stalled_since).is_none());
+    }
+
+    /// The process-wide attachment budget had no test: a regression here either
+    /// leaks the budget (attachments refused forever) or fails to enforce it
+    /// (unbounded memory). The budget is injected so the test does not race
+    /// every other test's subscriptions.
+    #[tokio::test]
+    async fn the_global_attachment_budget_is_enforced_and_released() {
+        static GLOBAL: AtomicUsize = AtomicUsize::new(0);
+        let (bus, first) = OutputBus::with_global_limits(2, Duration::from_secs(60), 8, &GLOBAL, 2);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 1, "the first attach counts");
+        let second = bus.subscribe().unwrap();
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 2);
+        assert!(matches!(bus.subscribe(), Err(BusError::TooManySubscribers)));
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 2, "a refusal leaks nothing");
+
+        drop(second);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 1, "detach returns the slot");
+        let third = bus.subscribe().unwrap();
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 2);
+
+        // The cached one-shot a late `Connect` gets is not an attachment.
+        let cached = OutputBus::subscription_from_event(PumpEvent::DeadlineExceeded);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 2);
+        drop(cached);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 2, "one-shots are uncounted");
+
+        drop((first, third));
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 0);
+    }
+
+    /// Two processes share one budget, and a fresh bus always accepts its first
+    /// attachment: refusing it would leave the already-spawned child orphaned.
+    #[tokio::test]
+    async fn the_global_budget_is_shared_across_buses() {
+        static GLOBAL: AtomicUsize = AtomicUsize::new(0);
+        let (bus_a, first_a) =
+            OutputBus::with_global_limits(2, Duration::from_secs(60), 4, &GLOBAL, 3);
+        let (bus_b, first_b) =
+            OutputBus::with_global_limits(2, Duration::from_secs(60), 4, &GLOBAL, 3);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 2);
+        let second_a = bus_a.subscribe().unwrap();
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 3);
+        assert!(matches!(
+            bus_b.subscribe(),
+            Err(BusError::TooManySubscribers)
+        ));
+
+        // Exhausted budget, new process: the first attachment still succeeds.
+        let (bus_c, first_c) =
+            OutputBus::with_global_limits(2, Duration::from_secs(60), 4, &GLOBAL, 3);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 4);
+        drop(first_c);
+        drop(bus_c);
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 3);
+
+        drop(second_a);
+        assert_eq!(
+            GLOBAL.load(Ordering::Acquire),
+            2,
+            "bus A's slot is reusable"
+        );
+        let second_b = bus_b.subscribe().unwrap();
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 3);
+        drop((first_a, first_b, second_b));
+        assert_eq!(GLOBAL.load(Ordering::Acquire), 0);
     }
 
     /// A dropped wait must not leave a marker behind: the reaper would evict a

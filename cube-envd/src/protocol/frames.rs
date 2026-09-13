@@ -216,6 +216,42 @@ pub fn check_json_codec(headers: &axum::http::HeaderMap) -> Result<(), ConnectEr
 mod tests {
     use super::*;
 
+    /// `json_message_frame` frames the same JSON `message_frame(&to_value(..))`
+    /// does, without the `Value` tree. Key *order* inside an object is not part
+    /// of the Connect/JSON contract, and it is the one thing that differs: this
+    /// path emits the serializer's declaration order, the `Value` path emits
+    /// sorted keys. Everything a client observes must still match.
+    #[test]
+    fn json_message_frame_frames_the_same_json_as_the_value_path() {
+        #[derive(serde::Serialize)]
+        struct Probe {
+            payload: String,
+            empty: Option<String>,
+        }
+        for payload in [
+            String::new(),
+            "x".repeat(4096),
+            "quote \" backslash \\ newline \n tab \t unicode \u{1f600}".into(),
+        ] {
+            let probe = Probe {
+                payload,
+                empty: None,
+            };
+            let actual = json_message_frame(&probe);
+            assert_eq!(actual[0], 0, "a message frame is not an end-stream frame");
+            let len = u32::from_be_bytes([actual[1], actual[2], actual[3], actual[4]]) as usize;
+            assert_eq!(len, actual.len() - FRAME_HEADER_LEN, "length prefix");
+            let payload = &actual[FRAME_HEADER_LEN..];
+            let decoded: serde_json::Value = serde_json::from_slice(payload).unwrap();
+            let expected = serde_json::to_value(&probe).unwrap();
+            assert_eq!(decoded, expected, "same JSON value, whatever the key order");
+            // Same payload bytes as serializing straight into a buffer, which is
+            // what the header is glued in front of.
+            assert_eq!(payload, serde_json::to_vec(&probe).unwrap());
+            assert!(MAX_ENVELOPE_SIZE >= decoded.to_string().len());
+        }
+    }
+
     #[test]
     fn envelope_roundtrip() {
         let frame = encode_envelope(0, br#"{"a":1}"#);
