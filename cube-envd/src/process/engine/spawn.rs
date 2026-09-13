@@ -1,13 +1,15 @@
 // Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command configuration, privilege setup and pipe-backed process creation.
+//! Command configuration, privilege setup and process creation for both kinds of
+//! stdio: pipes and a pty.
 
 use std::collections::HashMap;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+use tokio::io::unix::AsyncFd;
 use tokio::sync::{oneshot, watch, Notify};
 
 use crate::process::OutputBus;
@@ -15,10 +17,11 @@ use crate::process::OutputBus;
 use crate::platform::config::Config;
 use crate::platform::identity::User;
 
-use super::child::{spawn_without_fork, ChildHandle, ChildSpec, SpawnFailure};
+use super::child::{spawn_without_fork, ChildHandle, ChildSpec, ChildStdio, SpawnFailure};
 use super::cleanup::kill_process_group;
 use super::io::{
-    decorate_terminal, pump_pipe, terminal_after_output, terminal_after_wait, OUTPUT_DRAIN_GRACE,
+    decorate_terminal, pump_pipe, pump_pty, terminal_after_output, terminal_after_wait, OutputKind,
+    OUTPUT_DRAIN_GRACE,
 };
 use super::{InputHandle, InputWriter, SpawnedProcess};
 
@@ -210,52 +213,100 @@ pub(super) fn child_pre_exec(
     })
 }
 
-/// Spawn a pipe-backed process and seed the cgroup metadata before the pump
-/// task starts. This closes the fast-exit race where an OOM/termination event
-/// could otherwise be decorated before the process service stores its leaf.
-///
-/// The child is created with `clone(CLONE_VM|CLONE_VFORK)`, which leaves the
-/// parent's page tables alone; `fork` copy-on-writes every writable page of the
-/// parent, so the daemon re-faults each page it writes after a command (see
-/// [`super::child`] for that mechanism and its constraints). `fork` is reached
-/// only when the host rejects the clone flags or cannot map the child stack, and
-/// by the test that guards that path. A failure that came back through the
-/// child's report pipe is a real command error and is not retried, or the
-/// command would run twice.
+/// One command to start, taking the request shape upstream's `handler.New` takes:
+/// the command with an optional pty, which upstream splits on at `handler.go:192`
+/// and branches on again in `Start` (`handler.go:425`). The child is created with
+/// `clone(CLONE_VM|CLONE_VFORK)` (see [`super::child`]), falling back to `fork`
+/// only when the host rejects it; a failure that came back through the child's
+/// report pipe is a real command error and is not retried, or the command would
+/// run twice.
 ///
 /// `posix_spawn` itself is not usable here because it cannot express the
 /// credential drop (the daemon runs as root and commands run as the requested
 /// user), so the child-side setup runs our own code — the same
 /// [`child_pre_exec`] closure both mechanisms install.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_with_cgroup(
-    cmd: &str,
-    args: &[String],
-    env: HashMap<String, String>,
-    cwd: String,
-    user: &User,
-    stdin_enabled: bool,
-    cgroup_fd: Option<RawFd>,
-    process_cgroup: Option<Arc<crate::process::cgroup::ProcessCgroup>>,
-) -> std::io::Result<SpawnedProcess> {
+pub struct Spawn<'a> {
+    pub cmd: &'a str,
+    pub args: &'a [String],
+    pub env: HashMap<String, String>,
+    pub cwd: String,
+    pub user: &'a User,
+    /// Pipe stdin. Ignored when `pty` is set: input goes to the terminal, as it
+    /// does upstream.
+    pub stdin: bool,
+    /// `(cols, rows)` for a pty, `None` for pipes.
+    pub pty: Option<(u16, u16)>,
+    pub cgroup_fd: Option<RawFd>,
+    pub process_cgroup: Option<Arc<crate::process::cgroup::ProcessCgroup>>,
+}
+
+/// The parent's end of a pty: what the pump reads, what input writes to, and the
+/// duplicate `Update` resizes through.
+struct PtyParts {
+    master: AsyncFd<std::fs::File>,
+    input: InputHandle,
+    resize: std::fs::File,
+}
+
+/// What the pump reads, which is the one thing the two kinds do not share.
+enum Streams {
+    Pipes {
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr: Option<tokio::process::ChildStderr>,
+    },
+    Pty(AsyncFd<std::fs::File>),
+}
+
+/// Spawn a command and seed the cgroup metadata before the pump task starts.
+/// This closes the fast-exit race where an OOM/termination event could otherwise
+/// be decorated before the process service stores its leaf.
+pub fn spawn(req: Spawn<'_>) -> std::io::Result<SpawnedProcess> {
+    // Stdio first: a pty pair is opened and its master registered before any
+    // child exists, so a registration failure cannot strand one.
+    let (child_stdio, slave, pty) = match req.pty {
+        Some((cols, rows)) => {
+            let (master, slave) = super::pty::open_pty(cols, rows)?;
+            let resize = master.try_clone()?;
+            let input_master = master.try_clone()?;
+            let master = AsyncFd::new(master)?;
+            let input = Arc::new(tokio::sync::Mutex::new(InputWriter::Pty(AsyncFd::new(
+                input_master,
+            )?)));
+            (
+                ChildStdio::Inherit(slave.as_raw_fd()),
+                Some(slave),
+                Some(PtyParts {
+                    master,
+                    input,
+                    resize,
+                }),
+            )
+        }
+        None => (ChildStdio::Pipes { stdin: req.stdin }, None, None),
+    };
+
     let fork_free = {
-        let mut before_exec = child_pre_exec(user, &cwd, cgroup_fd, false)?;
+        let mut before_exec = child_pre_exec(req.user, &req.cwd, req.cgroup_fd, req.pty.is_some())?;
         spawn_without_fork(ChildSpec {
-            cmd,
-            args,
-            env: &env,
-            path: env.get("PATH").map(String::as_str).unwrap_or(DEFAULT_PATH),
-            stdin_enabled,
+            cmd: req.cmd,
+            args: req.args,
+            env: &req.env,
+            path: req
+                .env
+                .get("PATH")
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_PATH),
+            stdio: child_stdio,
             before_exec: &mut before_exec,
         })
     };
-    let (mut child, input, stdout, stderr) = match fork_free {
+    let (mut child, stdin, stdout, stderr) = match fork_free {
         Ok(raw) => (
             ChildHandle::Raw {
                 pid: raw.pid,
                 pidfd: raw.pidfd,
             },
-            Arc::new(tokio::sync::Mutex::new(InputWriter::Pipe(raw.stdin))),
+            raw.stdin,
             raw.stdout,
             raw.stderr,
         ),
@@ -268,8 +319,28 @@ pub fn spawn_with_cgroup(
                      which costs a copy-on-write fault per page the daemon rewrites"
                 );
             });
-            spawn_forked(cmd, args, env, cwd, user, stdin_enabled, cgroup_fd)?
+            spawn_forked(&req, child_stdio)?
         }
+    };
+
+    // The child holds its own reference through fds 0/1/2 now; ours has to go,
+    // or the master never reports HUP when the child exits and every command
+    // waits out the output-drain grace.
+    drop(slave);
+
+    let (input, streams, pty_master, kind) = match pty {
+        Some(parts) => (
+            parts.input,
+            Streams::Pty(parts.master),
+            Some(parts.resize),
+            OutputKind::Pty,
+        ),
+        None => (
+            Arc::new(tokio::sync::Mutex::new(InputWriter::Pipe(stdin))),
+            Streams::Pipes { stdout, stderr },
+            None,
+            OutputKind::Process,
+        ),
     };
 
     // A successfully spawned child always has an id until it is awaited; the
@@ -297,7 +368,7 @@ pub fn spawn_with_cgroup(
     let reaped = Arc::new(Notify::new());
     let reaped_for_pump = reaped.clone();
     let termination = Arc::new(Mutex::new(None));
-    let cgroup = Arc::new(Mutex::new(process_cgroup));
+    let cgroup = Arc::new(Mutex::new(req.process_cgroup));
     let termination_for_pump = termination.clone();
     let cgroup_for_pump = cgroup.clone();
 
@@ -306,12 +377,25 @@ pub fn spawn_with_cgroup(
         // Keeps the drain stop channel open for as long as the pumps run, so a
         // closed sender can never be mistaken for "stop reading".
         let stop_tx = stop_tx;
-        let output = async {
-            tokio::try_join!(
-                pump_pipe(stdout, Arc::clone(&bus), stop_rx.clone(), false),
-                pump_pipe(stderr, Arc::clone(&bus), stop_rx.clone(), true)
-            )
-            .map(|_| ())
+        // The pumps get their own handle so the terminal event can still be
+        // published through `bus` once they finish.
+        let output_bus = Arc::clone(&bus);
+        // The pumps own a receiver clone; `stop_rx` stays here so the reap
+        // branch can read whether the grace already stopped them.
+        let output_stop = stop_rx.clone();
+        let output = async move {
+            match streams {
+                // `try_join!` awaits internally, so the pipe arm yields a
+                // `Result`; the pty arm has to be awaited to match it.
+                Streams::Pipes { stdout, stderr } => tokio::try_join!(
+                    pump_pipe(stdout, Arc::clone(&output_bus), output_stop.clone(), false),
+                    pump_pipe(stderr, Arc::clone(&output_bus), output_stop.clone(), true)
+                )
+                .map(|_| ()),
+                Streams::Pty(master) => {
+                    pump_pty(master, Arc::clone(&output_bus), output_stop.clone()).await
+                }
+            }
         };
         tokio::pin!(output);
         let wait = child.wait();
@@ -323,15 +407,19 @@ pub fn spawn_with_cgroup(
         // output a short chance to drain, then close our read ends.
         let terminal = tokio::select! {
             output_result = &mut output => {
-                if output_result.is_err() {
-                    let _ = kill_process_group(pid, libc::SIGKILL);
+                if let Err(error) = &output_result {
+                    if kind.read_error_is_fatal() {
+                        let _ = kill_process_group(pid, libc::SIGKILL);
+                    } else {
+                        tracing::warn!(pid, "error reading from pty: {error}");
+                    }
                 }
                 let wait_result = wait.await;
                 reaped_for_pump.notify_one();
                 // The child is reaped: process-table cleanup may proceed now.
                 // Draining the rest of the output stays independent of it.
                 let _ = completion_tx.send(());
-                terminal_after_output("process output", output_result, wait_result)
+                terminal_after_output(kind, output_result, wait_result)
             }
             wait_result = &mut wait => {
                 reaped_for_pump.notify_one();
@@ -349,7 +437,7 @@ pub fn spawn_with_cgroup(
                 });
                 let output_result = (&mut output).await;
                 let stopped = *stop_rx.borrow();
-                terminal_after_wait("process output", pid, wait_result, output_result, stopped)
+                terminal_after_wait(kind, pid, wait_result, output_result, stopped)
             }
         };
         let terminal = decorate_terminal(terminal, &termination_for_pump, &cgroup_for_pump);
@@ -365,7 +453,7 @@ pub fn spawn_with_cgroup(
         pid,
         initial,
         sender,
-        pty_master: None,
+        pty_master,
         input,
         completion,
         terminal,
@@ -375,57 +463,72 @@ pub fn spawn_with_cgroup(
     })
 }
 
+/// What the `fork` mechanism hands back: the child plus its standard streams,
+/// which the caller wraps according to the stdio it asked for.
+type ForkedChild = (
+    ChildHandle,
+    Option<tokio::process::ChildStdin>,
+    Option<tokio::process::ChildStdout>,
+    Option<tokio::process::ChildStderr>,
+);
+
+/// A close-on-exec duplicate of `fd`, for the `std::process` fallback, which
+/// has to own one descriptor per standard stream.
+fn dup_owned(fd: RawFd) -> std::io::Result<std::fs::File> {
+    // SAFETY: `fcntl` with a valid descriptor and flag; it returns a fresh fd.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is fresh and owned here.
+    Ok(unsafe { std::fs::File::from_raw_fd(dup) })
+}
+
 /// The `fork` mechanism: `std::process` runs the same [`child_pre_exec`] closure
 /// between `fork` and `exec`, and hands back the same handles the fork-free
 /// mechanism produces.
-#[allow(clippy::too_many_arguments)]
-fn spawn_forked(
-    cmd: &str,
-    args: &[String],
-    env: HashMap<String, String>,
-    cwd: String,
-    user: &User,
-    stdin_enabled: bool,
-    cgroup_fd: Option<RawFd>,
-) -> std::io::Result<(
-    ChildHandle,
-    InputHandle,
-    Option<tokio::process::ChildStdout>,
-    Option<tokio::process::ChildStderr>,
-)> {
-    let mut command = tokio::process::Command::new(cmd);
+fn spawn_forked(req: &Spawn<'_>, stdio: ChildStdio) -> std::io::Result<ForkedChild> {
+    let mut command = tokio::process::Command::new(req.cmd);
     command
-        .args(args)
+        .args(req.args)
         .env_clear()
-        .envs(&env)
-        .stdin(if stdin_enabled {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .envs(&req.env)
         .kill_on_drop(false);
+    match stdio {
+        ChildStdio::Pipes { stdin } => {
+            command
+                .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+        // `std` dups these onto 0/1/2 and closes the originals, exactly as the
+        // child does on the fork-free path.
+        ChildStdio::Inherit(fd) => {
+            command
+                .stdin(Stdio::from(dup_owned(fd)?))
+                .stdout(Stdio::from(dup_owned(fd)?))
+                .stderr(Stdio::from(dup_owned(fd)?));
+        }
+    }
     unsafe {
-        command.pre_exec(child_pre_exec(user, &cwd, cgroup_fd, false)?);
+        command.pre_exec(child_pre_exec(
+            req.user,
+            &req.cwd,
+            req.cgroup_fd,
+            matches!(stdio, ChildStdio::Inherit(_)),
+        )?);
     }
 
     let mut child = command.spawn()?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    Ok((
-        ChildHandle::Command(child),
-        Arc::new(tokio::sync::Mutex::new(InputWriter::Pipe(stdin))),
-        stdout,
-        stderr,
-    ))
+    Ok((ChildHandle::Command(child), stdin, stdout, stderr))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::engine::spawn_pty;
     use crate::process::engine::tests::current_user;
     use crate::process::engine::PumpEvent;
     use crate::process::wire::EndEvent;
@@ -434,16 +537,17 @@ mod tests {
     async fn spawn_captures_stdout_stderr_and_exit() {
         let user = current_user();
         let env = HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
-        let mut proc = spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "echo out1; echo err1 >&2; exit 3".into()],
+        let mut proc = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "echo out1; echo err1 >&2; exit 3".into()],
             env,
-            "/".into(),
-            &user,
-            false,
-            None,
-            None,
-        )
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         assert!(proc.pid > 0);
 
@@ -514,16 +618,17 @@ mod tests {
 
         let user = current_user();
         let dirfd = std::fs::File::open(&dir).unwrap();
-        let proc = spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "sleep 5".into()],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            false,
-            Some(dirfd.as_raw_fd()),
-            None,
-        )
+        let proc = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "sleep 5".into()],
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: Some(dirfd.as_raw_fd()),
+            process_cgroup: None,
+        })
         .unwrap();
 
         // pre_exec writes the pid before exec; poll cgroup.procs until the
@@ -595,21 +700,22 @@ mod tests {
         let dirfd = std::fs::File::open(&dir).unwrap();
         let cgroup = crate::process::cgroup::ProcessCgroup::new(dir.clone(), dirfd);
         let user = current_user();
-        let proc = spawn_with_cgroup(
-            "/bin/sh",
-            &[
+        let proc = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &[
                 "-c".into(),
                 // `setsid` + a plain background child: one stays in the
                 // command's process group, one leaves it.
                 "setsid sleep 30 & sleep 30 & wait".into(),
             ],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            false,
-            Some(cgroup.fd()),
-            None,
-        )
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: Some(cgroup.fd()),
+            process_cgroup: None,
+        })
         .unwrap();
 
         // Wait until the whole tree has landed: sh, its group child, and the
@@ -716,43 +822,47 @@ mod tests {
         let user = current_user();
         let dir = tempfile::tempdir().unwrap();
         let dirfd = std::fs::File::open(dir.path()).unwrap();
-        let err = spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "echo should-not-run".into()],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            false,
-            Some(dirfd.as_raw_fd()),
-            None,
-        )
+        let err = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "echo should-not-run".into()],
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: Some(dirfd.as_raw_fd()),
+            process_cgroup: None,
+        })
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 
         // An invalid fd fails the same way; the child never execs either way.
-        let err = spawn_with_cgroup(
-            "/bin/sh",
-            &["-c".into(), "echo should-not-run".into()],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            false,
-            Some(-1),
-            None,
-        )
+        let err = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &["-c".into(), "echo should-not-run".into()],
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: Some(-1),
+            process_cgroup: None,
+        })
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
 
         // PTY spawns must honor the same fail-fast placement contract.
-        let err = spawn_pty(
-            "/bin/sh",
-            &["-c".into(), "echo should-not-run".into()],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            (80, 24),
-            Some(-1),
-        )
+        let err = spawn(Spawn {
+            stdin: false,
+            cmd: "/bin/sh",
+            args: &["-c".into(), "echo should-not-run".into()],
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            pty: Some((80, 24)),
+            cgroup_fd: Some(-1),
+            process_cgroup: None,
+        })
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
@@ -792,17 +902,20 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let user = current_user();
-        let env = HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
-        let (mut child, _input, stdout, stderr) = spawn_forked(
-            "/bin/sh",
-            &["-c".into(), "echo out; echo err >&2; exit 4".into()],
-            env,
-            "/".into(),
-            &user,
-            false,
-            None,
-        )
-        .unwrap();
+        let args = ["-c".into(), "echo out; echo err >&2; exit 4".into()];
+        let req = Spawn {
+            cmd: "/bin/sh",
+            args: &args,
+            env: HashMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        };
+        let (mut child, _stdin, stdout, stderr) =
+            spawn_forked(&req, ChildStdio::Pipes { stdin: false }).unwrap();
         assert!(child.id().is_some_and(|pid| pid > 0));
 
         let mut out = String::new();

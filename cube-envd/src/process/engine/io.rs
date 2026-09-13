@@ -60,6 +60,31 @@ pub enum InputWriter {
 
 pub type InputHandle = Arc<tokio::sync::Mutex<InputWriter>>;
 
+/// Which stream a pump reads. The two things that differ because of it live
+/// here rather than being keyed off a string: the label a terminal message
+/// carries (client-visible), and whether a read error is a failure at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutputKind {
+    Process,
+    Pty,
+}
+
+impl OutputKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Process => "process output",
+            Self::Pty => "pty",
+        }
+    }
+
+    /// Reading a pty master fails with `EIO` once the last slave closes, which
+    /// is how an interactive session normally ends; a pipe that fails is a real
+    /// read failure.
+    pub(super) fn read_error_is_fatal(self) -> bool {
+        matches!(self, Self::Process)
+    }
+}
+
 pub(super) fn decorate_terminal(
     event: PumpEvent,
     termination: &Arc<Mutex<Option<String>>>,
@@ -104,14 +129,15 @@ pub(super) fn decorate_terminal(
 }
 
 pub(super) fn terminal_after_output(
-    output_name: &str,
+    kind: OutputKind,
     output_result: std::io::Result<()>,
     wait_result: std::io::Result<std::process::ExitStatus>,
 ) -> PumpEvent {
+    let output_name = kind.label();
     match (output_result, wait_result) {
         (Ok(()), Ok(status)) => PumpEvent::End(EndEvent::from_exit_status(status)),
         (Ok(()), Err(wait_error)) => PumpEvent::SpawnError(format!("wait failed: {wait_error}")),
-        (Err(_), Ok(status)) if output_name == "pty" => {
+        (Err(_), Ok(status)) if !kind.read_error_is_fatal() => {
             PumpEvent::End(EndEvent::from_exit_status(status))
         }
         (Err(read_error), Ok(_)) => {
@@ -135,12 +161,13 @@ pub(super) fn terminal_after_output(
 /// is logged below. A reader that needs the error instead has to decide what
 /// `sh -c 'daemon & echo done'` should return first.
 pub(super) fn terminal_after_wait(
-    output_name: &str,
+    kind: OutputKind,
     pid: u32,
     wait_result: std::io::Result<std::process::ExitStatus>,
     output_result: std::io::Result<()>,
     stopped_by_grace: bool,
 ) -> PumpEvent {
+    let output_name = kind.label();
     let status = match wait_result {
         Ok(status) => status,
         Err(wait_error) => return PumpEvent::SpawnError(format!("wait failed: {wait_error}")),
@@ -153,7 +180,7 @@ pub(super) fn terminal_after_wait(
     }
     match output_result {
         Ok(()) => PumpEvent::End(EndEvent::from_exit_status(status)),
-        Err(read_error) if output_name == "pty" => {
+        Err(read_error) if !kind.read_error_is_fatal() => {
             tracing::warn!(pid, "error reading from pty: {read_error}");
             PumpEvent::End(EndEvent::from_exit_status(status))
         }
@@ -286,8 +313,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::engine::spawn_with_cgroup;
     use crate::process::engine::tests::current_user;
+    use crate::process::engine::{spawn, Spawn};
     use std::collections::HashMap;
 
     /// `widen_pipe` is best effort by design (the kernel caps the request at
@@ -350,12 +377,17 @@ mod tests {
         }
     }
 
+    /// What a read error means, and the text the client sees, depend on the
+    /// output kind: reading a pty master fails with `EIO` once the last slave
+    /// closes, which is how an interactive session normally ends, while a pipe
+    /// read error is a real failure the terminal event has to report under the
+    /// `process output` label.
     #[test]
-    fn pty_read_errors_preserve_child_exit_status() {
+    fn read_errors_follow_the_output_kind() {
         use std::os::unix::process::ExitStatusExt;
 
         let terminal = terminal_after_output(
-            "pty",
+            OutputKind::Pty,
             Err(std::io::Error::from_raw_os_error(libc::EBADF)),
             Ok(std::process::ExitStatus::from_raw(libc::SIGTERM)),
         );
@@ -365,7 +397,7 @@ mod tests {
         assert_eq!(end.signal, Some(libc::SIGTERM));
 
         let terminal = terminal_after_wait(
-            "pty",
+            OutputKind::Pty,
             42,
             Ok(std::process::ExitStatus::from_raw(libc::SIGTERM)),
             Err(std::io::Error::from_raw_os_error(libc::EBADF)),
@@ -375,6 +407,19 @@ mod tests {
             panic!("PTY drain failure replaced child exit status: {terminal:?}");
         };
         assert_eq!(end.signal, Some(libc::SIGTERM));
+
+        let terminal = terminal_after_output(
+            OutputKind::Process,
+            Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            Ok(std::process::ExitStatus::from_raw(0)),
+        );
+        let PumpEvent::SpawnError(message) = terminal else {
+            panic!("a pipe read failure must be a spawn error: {terminal:?}");
+        };
+        assert!(
+            message.starts_with("process output read failed:"),
+            "label lost from the client-visible message: {message}"
+        );
     }
 
     #[tokio::test]
@@ -382,19 +427,20 @@ mod tests {
         use base64::Engine;
 
         let user = current_user();
-        let proc = spawn_with_cgroup(
-            "/bin/sh",
-            &[
+        let proc = spawn(Spawn {
+            cmd: "/bin/sh",
+            args: &[
                 "-c".into(),
                 "printf before; sleep 0.25; printf after; sleep 0.05".into(),
             ],
-            HashMap::new(),
-            "/".into(),
-            &user,
-            false,
-            None,
-            None,
-        )
+            env: HashMap::new(),
+            cwd: "/".into(),
+            user: &user,
+            stdin: false,
+            pty: None,
+            cgroup_fd: None,
+            process_cgroup: None,
+        })
         .unwrap();
         let sender = proc.sender.clone();
         drop(proc.initial);
