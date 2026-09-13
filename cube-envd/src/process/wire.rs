@@ -276,19 +276,29 @@ fn signal_name(signo: i32) -> String {
 
 /// Parse the Signal enum from its proto3 JSON name or number (both are
 /// valid proto3 JSON encodings of an enum).
-pub fn parse_signal(value: Option<&serde_json::Value>) -> Option<i32> {
-    match value? {
-        serde_json::Value::String(s) => match s.as_str() {
-            "SIGNAL_SIGKILL" | "9" => Some(libc::SIGKILL),
-            "SIGNAL_SIGTERM" | "15" => Some(libc::SIGTERM),
-            _ => None,
-        },
-        serde_json::Value::Number(n) => match n.as_i64() {
-            Some(9) => Some(libc::SIGKILL),
-            Some(15) => Some(libc::SIGTERM),
-            _ => None,
-        },
-        _ => None,
+/// proto3 JSON for an enum accepts the value *name* or an *integer*. Every other
+/// JSON type, a non-integral number and a number outside `int32` are decode
+/// errors (`invalid_argument`); an unknown *name* collapses to the zero value
+/// and an unknown *number* keeps its value, and the service rejects both
+/// (`unimplemented`). The two answers differ in status and wording, so the type
+/// has to be validated before the enum is interpreted.
+pub fn decode_signal(value: Option<&serde_json::Value>) -> Result<i32, String> {
+    const DECODE_ERROR: &str = "unmarshal message: invalid value for enum field signal";
+    match value {
+        // An absent field and an explicit null both mean the zero value.
+        None | Some(serde_json::Value::Null) => Ok(0),
+        Some(serde_json::Value::String(name)) => Ok(match name.as_str() {
+            "SIGNAL_SIGKILL" => 9,
+            "SIGNAL_SIGTERM" => 15,
+            // Unknown names — and the explicit zero — decode to the zero value;
+            // a numeric *string* is not a number and lands here too.
+            _ => 0,
+        }),
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .ok_or_else(|| DECODE_ERROR.to_string()),
+        Some(_) => Err(DECODE_ERROR.to_string()),
     }
 }
 
@@ -426,16 +436,40 @@ mod tests {
         let sk = serde_json::json!("SIGNAL_SIGKILL");
         let st = serde_json::json!("SIGNAL_SIGTERM");
         let su = serde_json::json!("SIGNAL_UNSPECIFIED");
-        let n9 = serde_json::json!(9);
-        let n15 = serde_json::json!(15);
+        assert_eq!(decode_signal(Some(&sk)), Ok(9));
+        assert_eq!(decode_signal(Some(&st)), Ok(15));
+        assert_eq!(decode_signal(Some(&su)), Ok(0));
+        // An unknown name collapses to the zero value …
+        assert_eq!(
+            decode_signal(Some(&serde_json::json!("SIGNAL_NOPE"))),
+            Ok(0)
+        );
+        // … a numeric string is not a name either …
+        assert_eq!(decode_signal(Some(&serde_json::json!("15"))), Ok(0));
+        // … while numbers keep their value, in range or not.
+        assert_eq!(decode_signal(Some(&serde_json::json!(15))), Ok(15));
+        assert_eq!(decode_signal(Some(&serde_json::json!(99))), Ok(99));
+        assert_eq!(
+            decode_signal(Some(&serde_json::json!(2147483647))),
+            Ok(2147483647)
+        );
+        assert_eq!(decode_signal(None), Ok(0));
+        assert_eq!(decode_signal(Some(&serde_json::Value::Null)), Ok(0));
+        // Malformed types and out-of-range numbers are decode errors.
+        for bad in [
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(1.5),
+            serde_json::json!(2147483648i64),
+        ] {
+            assert!(
+                decode_signal(Some(&bad)).is_err(),
+                "{bad} should not decode"
+            );
+        }
         let n0 = serde_json::json!(0);
-        assert_eq!(parse_signal(Some(&sk)), Some(libc::SIGKILL));
-        assert_eq!(parse_signal(Some(&st)), Some(libc::SIGTERM));
-        assert_eq!(parse_signal(Some(&su)), None);
-        // proto3 JSON numeric enum encoding.
-        assert_eq!(parse_signal(Some(&n9)), Some(libc::SIGKILL));
-        assert_eq!(parse_signal(Some(&n15)), Some(libc::SIGTERM));
-        assert_eq!(parse_signal(Some(&n0)), None);
-        assert_eq!(parse_signal(None), None);
+        // The zero value is a *service* rejection, not a decode failure.
+        assert_eq!(decode_signal(Some(&n0)), Ok(0));
     }
 }

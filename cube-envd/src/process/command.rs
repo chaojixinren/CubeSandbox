@@ -23,7 +23,7 @@ use crate::process::cgroup::{self, ProcType};
 use crate::process::engine;
 use crate::process::table::{ProcEntry, ProcessTable, PtyResizeError};
 use crate::process::wire::{
-    parse_signal, CloseStdinRequest, ConnectRequest, ListResponse, ProcessInfo, ProcessInput,
+    decode_signal, CloseStdinRequest, ConnectRequest, ListResponse, ProcessInfo, ProcessInput,
     ProcessSelector, SendInputRequest, SendSignalRequest, StartRequest, StreamInputRequest,
     UpdateRequest,
 };
@@ -302,17 +302,27 @@ pub fn send_signal(
             // sees the same text: "process with pid N not found" / "... tag X ...".
             not_found(pid, tag.as_deref())
         })?;
-    // Upstream decodes an unknown enum name to the proto3 zero value and the
-    // service layer rejects it, so the client sees `unimplemented` with the
-    // same text for every bad name (`invalid signal: SIGNAL_UNSPECIFIED`).
-    // Mirroring that keeps the status code and the message a client may match
-    // on identical, and keeps a Rust `Option`/`String` debug repr out of it.
-    let signo = parse_signal(req.signal.as_ref()).ok_or_else(|| {
-        ConnectError::new(
-            ConnectCode::Unimplemented,
-            "invalid signal: SIGNAL_UNSPECIFIED",
-        )
-    })?;
+    // Three outcomes, matching upstream: a malformed JSON value is a decode
+    // error (`invalid_argument`); the zero value — an absent field, `null`, the
+    // explicit `SIGNAL_UNSPECIFIED`, or any unknown *name* — is rejected with
+    // the enum's own name; any other number is rejected with that number. A
+    // Rust debug repr never reaches the wire.
+    let signo = match decode_signal(req.signal.as_ref()) {
+        Err(message) => return Err(ConnectError::new(ConnectCode::InvalidArgument, message)),
+        Ok(0) => {
+            return Err(ConnectError::new(
+                ConnectCode::Unimplemented,
+                "invalid signal: SIGNAL_UNSPECIFIED",
+            ))
+        }
+        Ok(signo) if signo == libc::SIGKILL || signo == libc::SIGTERM => signo,
+        Ok(other) => {
+            return Err(ConnectError::new(
+                ConnectCode::Unimplemented,
+                format!("invalid signal: {other}"),
+            ))
+        }
+    };
     // The table can still hold a pid whose process exited but was not yet
     // reaped; kill(-pid) then fails with ESRCH. Report that as not_found
     // (the process is gone from the caller's perspective, matching Go),
@@ -750,6 +760,27 @@ mod tests {
         let err = send_signal(&table, &req).unwrap_err();
         assert_eq!(err.code, ConnectCode::Unimplemented);
         assert_eq!(err.message, "invalid signal: SIGNAL_UNSPECIFIED");
+
+        // A malformed JSON value is a *decode* error upstream, not an unknown
+        // enum: the status must stay 400 for these.
+        for bad in ["true", "{}", "[]", "1.5", "2147483648"] {
+            let raw = format!(r#"{{"process":{{"pid":7}},"signal":{bad}}}"#);
+            let req: SendSignalRequest = serde_json::from_str(&raw).unwrap();
+            let err = send_signal(&table, &req).unwrap_err();
+            assert_eq!(err.code, ConnectCode::InvalidArgument, "{bad}");
+            assert!(
+                err.message.starts_with("unmarshal message:"),
+                "{bad}: {}",
+                err.message
+            );
+        }
+
+        // An unknown *number* keeps its value and is named in the message.
+        let req: SendSignalRequest =
+            serde_json::from_str(r#"{"process":{"pid":7},"signal":99}"#).unwrap();
+        let err = send_signal(&table, &req).unwrap_err();
+        assert_eq!(err.code, ConnectCode::Unimplemented);
+        assert_eq!(err.message, "invalid signal: 99");
     }
 
     #[test]
