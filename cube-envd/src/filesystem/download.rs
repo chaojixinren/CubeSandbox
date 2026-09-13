@@ -648,13 +648,14 @@ impl ReadPool {
         if buf.len() != self.len {
             return;
         }
-        match self.free.lock() {
-            Ok(mut free) => {
-                if free.len() < self.keep {
-                    free.push(buf);
-                }
-            }
-            Err(poisoned) => poisoned.into_inner().push(buf),
+        // Bound both arms: a poisoned lock must not turn the pool into an
+        // unbounded one (same reasoning as `take`'s poison handling).
+        let mut free = match self.free.lock() {
+            Ok(free) => free,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if free.len() < self.keep {
+            free.push(buf);
         }
     }
 
@@ -965,7 +966,7 @@ mod tests {
         file: tokio::fs::File,
         limit: Option<u64>,
     ) -> Vec<Result<bytes::Bytes, std::io::Error>> {
-        reader_stream_with(budgets(), file, limit, None)
+        reader_stream_with(test_budgets(), file, limit, None)
             .await
             .collect()
             .await

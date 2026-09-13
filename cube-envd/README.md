@@ -282,13 +282,14 @@ Configuration:
 - `CUBE_ENVD_BLOCKING_THREADS`: blocking-pool thread cap, default `64`,
   clamped to `4..=256` (an invalid value warns and keeps the default rather
   than failing startup). The pool serves process reaping, upload writers,
-  filesystem RPCs and the `/files` body pipeline; platform/limits.rs derives
-  that pipeline's two budgets from it — at most `pool / 4` blocking producers
-  (threads pinned for a stalled body) and at most `pool / 2` bodies buffering
-  ahead with 1 MiB slices; a body that gets neither streams 256 KiB slices
-  without read-ahead, so a storm of stalled downloads cannot grow the daemon's
-  memory with the connection count. Lowering the cap lowers both budgets. Raise it on guests with a larger memory budget (~13 KiB
-  touched RSS per thread), lower it under memory pressure.
+  filesystem RPCs and the `/files` body pipeline; `platform/limits.rs` derives
+  that pipeline's budgets from it: at most `pool / 2` bodies may buffer ahead
+  (1 MiB slices with read-ahead), of which at most `pool / 4` may also hold a
+  pool thread, and a body that gets neither streams 256 KiB slices without
+  read-ahead, so a storm of stalled downloads cannot grow the daemon's memory
+  with the connection count. Lowering the cap lowers all of them. Raise it on
+  guests with a larger memory budget (~13 KiB touched RSS per thread), lower it
+  under memory pressure.
 - `CUBE_ENVD_DOWNLOAD_MAX_BODIES`: global cap on concurrent *large* `/files`
   downloads (a body that fits in one chunk is exempt), default twice the pool
   size (`128` at the default pool), never below what the pipeline itself needs
