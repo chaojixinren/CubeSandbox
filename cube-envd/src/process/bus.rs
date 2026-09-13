@@ -296,7 +296,8 @@ impl OutputBus {
     }
 
     /// A subscription that yields exactly one cached event and then closes.
-    /// Used when a `Connect` arrives after the process terminated.
+    /// Used when a `Connect` arrives after the terminal event was published but
+    /// before the process entry was removed (removal happens at child reap).
     pub fn subscription_from_event(event: PumpEvent) -> Subscription {
         let (q, rx) = TerminalChannel::new(2);
         let _ = q.send_terminal(event);
@@ -323,16 +324,17 @@ impl OutputBus {
     pub async fn publish_data(&self, event: PumpEvent) {
         for subscriber in self.snapshot() {
             // Fast path: room is available, so this publish neither waits nor
-            // can be evicted mid-flight. It skips the eviction receiver, the
-            // stall marker and the select entirely — the cost of those per
-            // frame is what the sandbox's handoff overhead makes visible.
+            // can be evicted mid-flight. It skips the eviction receiver and the
+            // select — the per-frame cost the sandbox's handoff overhead makes
+            // visible. It must not touch the stall marker either: stdout and
+            // stderr publish to the same subscriber, so another publisher can be
+            // entering `begin_wait` right now, and a `take()` here would erase a
+            // wait that is about to start and leave it invisible to the reaper
+            // forever. The marker is maintained by `begin_wait`/`StallWait`
+            // alone, which keeps "marker is set" and "somebody is waiting" in
+            // step.
             if let Ok(permit) = subscriber.q.try_reserve_data() {
                 permit.send(event.clone());
-                // A publish that never waited also proves any earlier marker is
-                // stale — but only when nobody is waiting right now.
-                if subscriber.stalled.load(Ordering::Acquire) == 0 {
-                    let _ = lock(&subscriber.stalled_since).take();
-                }
                 continue;
             }
             let mut evicted = subscriber.evicted.subscribe();
@@ -394,8 +396,13 @@ impl OutputBus {
             .snapshot()
             .iter()
             .filter(|subscriber| {
-                lock(&subscriber.stalled_since)
-                    .is_some_and(|since| now.duration_since(since) >= self.evict_after)
+                // A waiter is required, not just a marker: the marker is
+                // dropped a moment after the count reaches zero, and evicting
+                // in that window would disconnect a subscriber whose publisher
+                // has just made progress.
+                subscriber.stalled.load(Ordering::Acquire) > 0
+                    && lock(&subscriber.stalled_since)
+                        .is_some_and(|since| now.duration_since(since) >= self.evict_after)
             })
             .map(|subscriber| subscriber.id)
             .collect();
@@ -407,7 +414,10 @@ impl OutputBus {
                 );
                 // Wakes the publisher's wait and the connection's driver. The
                 // connection reports `resource_exhausted` on its own terminal
-                // slot, because it owns the encoding.
+                // slot, because it owns the encoding. Frames still queued for
+                // this subscriber are abandoned with it (the client keeps
+                // whatever already reached its connection queue), which is the
+                // point: the subscriber is the reason the queue filled up.
                 let _ = subscriber.evicted.send(true);
             }
         }
@@ -600,6 +610,61 @@ mod tests {
         assert_eq!(outcome, "published");
         assert_eq!(bus.subscriber_count(), 0, "the stalled subscriber is gone");
         assert!(subscription.is_evicted());
+    }
+
+    /// A publish that did not wait must leave the marker alone. This is the
+    /// state a concurrent publisher leaves behind while it is inside
+    /// `begin_wait`, and clearing it here used to make that wait invisible to
+    /// the reaper for good (the subscriber could then never be evicted).
+    #[tokio::test]
+    async fn a_publish_that_did_not_wait_leaves_the_stall_marker_alone() {
+        let (bus, _sub) = bus_with(4, Duration::from_secs(60));
+        let subscriber = bus.snapshot()[0].clone();
+        *lock(&subscriber.stalled_since) = Some(Instant::now() - Duration::from_secs(1));
+
+        bus.publish_data(event()).await; // uncontended: takes the fast path
+
+        assert!(
+            lock(&subscriber.stalled_since).is_some(),
+            "a publish that never waited must not clear a marker it did not set"
+        );
+    }
+
+    /// The reaper needs a waiter, not just a marker: between the last waiter's
+    /// decrement and its clear the marker is briefly set with nobody waiting.
+    #[tokio::test]
+    async fn the_reaper_ignores_a_marker_with_no_waiter() {
+        let (bus, _sub) = bus_with(4, Duration::from_millis(1));
+        let subscriber = bus.snapshot()[0].clone();
+        *lock(&subscriber.stalled_since) = Some(Instant::now() - Duration::from_secs(60));
+
+        bus.evict_stalled();
+
+        assert_eq!(
+            bus.subscriber_count(),
+            1,
+            "no waiter means no eviction, whatever the marker says"
+        );
+        assert!(lock(&subscriber.stalled_since).is_some());
+    }
+
+    /// The invariant the fast path relies on: a wait that completes clears both
+    /// the count and the marker, so no cleanup is needed on the publish path.
+    #[tokio::test]
+    async fn a_completed_wait_clears_the_marker_and_the_count() {
+        let (bus, mut sub) = bus_with(2, Duration::from_secs(60));
+        bus.publish_data(event()).await; // fills the only data slot
+        let mut blocked = Box::pin(bus.publish_data(event()));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        let subscriber = bus.snapshot()[0].clone();
+        assert_eq!(subscriber.stalled.load(Ordering::Acquire), 1);
+        assert!(lock(&subscriber.stalled_since).is_some());
+
+        let _ = sub.recv().await; // frees the slot for the waiting publisher
+        blocked.await;
+
+        assert_eq!(subscriber.stalled.load(Ordering::Acquire), 0);
+        assert!(lock(&subscriber.stalled_since).is_none());
     }
 
     /// A dropped wait must not leave a marker behind: the reaper would evict a
