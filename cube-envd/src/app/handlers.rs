@@ -111,11 +111,14 @@ pub(crate) async fn process_start(
     body: axum::body::Body,
 ) -> axum::response::Response {
     // Streaming surface: every failure is an EndStream error frame on 200.
-    if let Err(e) = protocol::check_json_codec(&headers) {
-        return proc_svc::stream_error_response(e);
-    }
+    // Upstream authenticates in an HTTP middleware that runs before the
+    // handler, so a request with a bad or missing token never reaches codec
+    // negotiation; keep that order here too.
     if let Some(resp) = rpc_token_check(&state.config, &headers) {
         return resp;
+    }
+    if let Err(e) = protocol::check_json_codec(&headers) {
+        return proc_svc::stream_error_response(e);
     }
     let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
         Ok(b) => b,
@@ -170,11 +173,14 @@ pub(crate) async fn process_connect(
     body: axum::body::Body,
 ) -> axum::response::Response {
     // Streaming surface: every failure is an EndStream error frame on 200.
-    if let Err(e) = protocol::check_json_codec(&headers) {
-        return proc_svc::stream_error_response(e);
-    }
+    // Upstream authenticates in an HTTP middleware that runs before the
+    // handler, so a request with a bad or missing token never reaches codec
+    // negotiation; keep that order here too.
     if let Some(resp) = rpc_token_check(&state.config, &headers) {
         return resp;
+    }
+    if let Err(e) = protocol::check_json_codec(&headers) {
+        return proc_svc::stream_error_response(e);
     }
     let bytes = match axum::body::to_bytes(body, protocol::MAX_ENVELOPE_SIZE + 5).await {
         Ok(b) => b,
@@ -277,11 +283,14 @@ pub(crate) async fn process_stream_input(
 ) -> axum::response::Response {
     // StreamInput is a streaming surface in both directions: request parsing
     // and service failures are returned as an EndStream error on HTTP 200.
-    if let Err(e) = protocol::check_json_codec(&headers) {
-        return proc_svc::stream_error_response(e);
-    }
+    // Upstream authenticates in an HTTP middleware that runs before the
+    // handler, so a request with a bad or missing token never reaches codec
+    // negotiation; keep that order here too.
     if let Some(resp) = rpc_token_check(&state.config, &headers) {
         return resp;
+    }
+    if let Err(e) = protocol::check_json_codec(&headers) {
+        return proc_svc::stream_error_response(e);
     }
 
     let mut chunks = body.into_data_stream();

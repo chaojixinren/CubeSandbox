@@ -144,7 +144,9 @@ impl Config {
             return None; // no token configured: everything is allowed
         }
         match header {
-            None => Some(TokenFailure::Missing),
+            // Go's `Header.Get` cannot tell an absent header from an empty one,
+            // so `X-Access-Token:` takes the "missing" branch as well.
+            None | Some("") => Some(TokenFailure::Missing),
             Some(got) => match self.check_access_token(Some(got)) {
                 Ok(()) => None,
                 Err(()) => Some(TokenFailure::Mismatch),

@@ -562,6 +562,23 @@ def cap_init_token():
         "POST", "/init",
         json.dumps({"envVars": {"INIT_A": "1"}, "accessToken": tok}).encode(),
         {"Content-Type": "application/json"}))
+    # `/files` is excluded from the auth middleware, so its handler decides the
+    # wording: an absent *or empty* header is `missing signature query parameter`,
+    # a wrong one is `access token present in header but does not match`.
+    record("rest_files_token_absent", http_req("GET", "/files?path=/etc/hostname&username=root"))
+    record("rest_files_token_empty", http_req(
+        "GET", "/files?path=/etc/hostname&username=root", None, {"X-Access-Token": ""}))
+    record("rest_files_token_wrong", http_req(
+        "GET", "/files?path=/etc/hostname&username=root", None, {"X-Access-Token": "tok-other"}))
+    record("rest_files_token_ok", http_req(
+        "GET", "/files?path=/etc/hostname&username=root", None, {"X-Access-Token": tok}))
+    # Every other path is rejected by the middleware with its own message and a
+    # plain REST body, before codec negotiation.
+    record("proc_list_token_absent", connect_unary("process.Process/List", {}))
+    record("proc_list_bad_codec_token_absent", http_req(
+        "POST", "/process.Process/List", b"\x00\x00\x00\x00\x00",
+        {"Content-Type": "application/connect+proto"}))
+
     # Token set + different body token -> 401 "access token validation failed".
     record("rest_init_token_mismatch", http_req(
         "POST", "/init",
@@ -1095,6 +1112,16 @@ def cap_process():
         record("proc_send_signal_invalid_name", connect_unary(
             "process.Process/SendSignal",
             {"process": {"pid": sig_pid}, "signal": "SIGNAL_NOT_A_SIGNAL"}))
+        # protojson accepts an enum *name* or an *integer*. These shapes are
+        # decode errors (400 / invalid_argument); only a well-formed but unusable
+        # enum reaches the service's `unimplemented`.
+        for label, value in (("bool", True), ("object", {}), ("array", []),
+                             ("float", 1.5), ("out_of_range", 2147483648),
+                             ("unknown_number", 99), ("zero", 0),
+                             ("string_number", "15"), ("null", None)):
+            record("proc_send_signal_%s" % label, connect_unary(
+                "process.Process/SendSignal",
+                {"process": {"pid": sig_pid}, "signal": value}))
         connect_unary("process.Process/SendSignal",
                       {"process": {"pid": sig_pid}, "signal": "SIGNAL_SIGKILL"})
     t_sig.join(timeout=10)
