@@ -302,10 +302,15 @@ pub fn send_signal(
             // sees the same text: "process with pid N not found" / "... tag X ...".
             not_found(pid, tag.as_deref())
         })?;
+    // Upstream decodes an unknown enum name to the proto3 zero value and the
+    // service layer rejects it, so the client sees `unimplemented` with the
+    // same text for every bad name (`invalid signal: SIGNAL_UNSPECIFIED`).
+    // Mirroring that keeps the status code and the message a client may match
+    // on identical, and keeps a Rust `Option`/`String` debug repr out of it.
     let signo = parse_signal(req.signal.as_ref()).ok_or_else(|| {
         ConnectError::new(
-            ConnectCode::InvalidArgument,
-            format!("unsupported signal: {:?}", req.signal),
+            ConnectCode::Unimplemented,
+            "invalid signal: SIGNAL_UNSPECIFIED",
         )
     })?;
     // The table can still hold a pid whose process exited but was not yet
@@ -717,6 +722,34 @@ mod tests {
                 .unwrap();
         let err = send_signal(&table, &req).unwrap_err();
         assert_eq!(err.code, ConnectCode::NotFound);
+    }
+
+    /// An unknown enum name decodes to the proto3 zero value upstream and the
+    /// service answers `unimplemented`; ours must not answer a different code
+    /// or leak a Rust debug repr of the value.
+    #[test]
+    fn send_signal_invalid_name_is_unimplemented() {
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
+        // The signal is parsed only after the process is found, so the entry has
+        // to exist for this shape to be reachable at all.
+        let (sender, _rx) = broadcast::channel::<engine::PumpEvent>(1);
+        table.insert_process(ProcEntry {
+            pid: 7,
+            tag: None,
+            config: crate::process::wire::ProcessConfig::default(),
+            sender,
+            pty_master: None,
+            input: disabled_input(),
+            cgroup: None,
+            termination: Arc::new(std::sync::Mutex::new(None)),
+            terminal: Arc::new(std::sync::Mutex::new(None)),
+        });
+        let req: SendSignalRequest =
+            serde_json::from_str(r#"{"process":{"pid":7},"signal":"SIGNAL_NOT_A_SIGNAL"}"#)
+                .unwrap();
+        let err = send_signal(&table, &req).unwrap_err();
+        assert_eq!(err.code, ConnectCode::Unimplemented);
+        assert_eq!(err.message, "invalid signal: SIGNAL_UNSPECIFIED");
     }
 
     #[test]

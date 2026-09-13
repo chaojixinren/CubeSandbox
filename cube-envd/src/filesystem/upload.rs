@@ -253,6 +253,16 @@ pub(crate) fn spawn_upload_writer(
                 create_dirs_owned(parent, &user)?;
             }
         }
+        // Upstream stats the target before writing and rejects a directory as a
+        // *caller* error (`processFile`: `path is a directory: <path>`, 400).
+        // Without the pre-check `open` fails with EISDIR and map_write_error
+        // turns a client mistake into a 500.
+        if target.is_dir() {
+            return Err(RestError::new(
+                StatusCode::BAD_REQUEST,
+                format!("path is a directory: {path}"),
+            ));
+        }
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
