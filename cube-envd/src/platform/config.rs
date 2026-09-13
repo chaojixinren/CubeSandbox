@@ -41,6 +41,20 @@ pub struct Config {
     pub initialized: AtomicBool,
 }
 
+/// Which case an access-token check failed in (see `Config::token_failure`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenFailure {
+    /// No `X-Access-Token` header at all.
+    Missing,
+    /// Header present but not the configured token.
+    Mismatch,
+}
+
+/// Upstream's `WithAuthorization` middleware message, used by every path that
+/// is not `/health`, `/init` or `/files`.
+pub const MIDDLEWARE_UNAUTHORIZED: &str =
+    "unauthorized access, please provide a valid access token or method signing if supported";
+
 impl Config {
     pub fn new() -> Self {
         let mut env_vars = HashMap::new();
@@ -119,6 +133,25 @@ impl Config {
     /// the check always passes (baseline: uninitialized envd ignores
     /// X-Access-Token entirely). The comparison is constant-time so a caller
     /// cannot recover the token byte-by-byte from response timing.
+    /// Why an access-token check failed. Upstream words the two cases
+    /// differently on `/files` (`validateSigning`: a missing header is
+    /// "missing signature query parameter", a wrong one is "access token
+    /// present in header but does not match"), while every other path is
+    /// rejected earlier by the `WithAuthorization` middleware with one fixed
+    /// message (`MIDDLEWARE_UNAUTHORIZED`).
+    pub fn token_failure(&self, header: Option<&str>) -> Option<TokenFailure> {
+        if self.check_access_token(None).is_ok() {
+            return None; // no token configured: everything is allowed
+        }
+        match header {
+            None => Some(TokenFailure::Missing),
+            Some(got) => match self.check_access_token(Some(got)) {
+                Ok(()) => None,
+                Err(()) => Some(TokenFailure::Mismatch),
+            },
+        }
+    }
+
     pub fn check_access_token(&self, header: Option<&str>) -> Result<(), ()> {
         match read(&self.access_token).as_deref() {
             None => Ok(()),
