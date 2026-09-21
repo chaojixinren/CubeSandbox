@@ -141,10 +141,7 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 	} else {
 		originReq.Request.RequestID = requestID
 	}
-	createReq, storedReq, err := buildSnapshotRequests(originReq, "")
-	if err != nil {
-		return nil, err
-	}
+
 	var jobID string
 	reusedExistingJob := false
 	if err := withSnapshotWriteLocks([]string{
@@ -155,6 +152,12 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 			if existing.Operation != JobOperationSnapshotCreate {
 				return fmt.Errorf("%w: request %s is already bound to %s", ErrTemplateAttemptInProgress, requestID, existing.Operation)
 			}
+			_, storedReq, err := buildSnapshotRequests(originReq, existing.TemplateID)
+			if err != nil {
+				return err
+			}
+			storedReq.Annotations[constants.CubeAnnotationStorageBackend] = normalizedBackend
+			storedReq.Backend = normalizedBackend
 			if !snapshotCreateRequestMatches(existing.RequestJSON, requestID, sandboxID, nodeID, nodeIP, displayName, normalizedBackend, storedReq) {
 				return fmt.Errorf("%w: request %s payload does not match existing snapshot create job", ErrTemplateAttemptInProgress, requestID)
 			}
@@ -176,8 +179,10 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 		}
 
 		snapshotID := generateSnapshotID()
-		createReq.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = snapshotID
-		storedReq.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = snapshotID
+		createReq, storedReq, err := buildSnapshotRequests(originReq, snapshotID)
+		if err != nil {
+			return err
+		}
 		createReq.Annotations[constants.CubeAnnotationStorageBackend] = normalizedBackend
 		storedReq.Annotations[constants.CubeAnnotationStorageBackend] = normalizedBackend
 		createReq.Backend = normalizedBackend
@@ -751,6 +756,8 @@ func DeleteSnapshot(ctx context.Context, requestID, snapshotID, instanceType str
 	return executeSnapshotDeleteJob(ctx, info, snapshotID)
 }
 
+var runSnapshotReferenceCleanup = releaseSnapshotArtifactReferences
+
 func runSnapshotDeleteJob(ctx context.Context, jobID, snapshotID string) error {
 	success := false
 	defer func() {
@@ -763,20 +770,31 @@ func runSnapshotDeleteJob(ctx context.Context, jobID, snapshotID string) error {
 	})
 	targets, err := discoverTemplateCleanupTargets(ctx, snapshotID, "")
 	if err != nil {
-		return failSnapshotDeleteJob(ctx, jobID, snapshotID, err)
+		return errors.Join(err, failSnapshotDeleteJob(ctx, jobID, snapshotID, err))
 	}
 	locators, err := snapshotDeleteLocators(targets)
 	if err != nil {
-		return failSnapshotDeleteJob(ctx, jobID, snapshotID, err)
+		return errors.Join(err, failSnapshotDeleteJob(ctx, jobID, snapshotID, err))
 	}
 	if err := abortSnapshotDeleteIfRefsReappeared(ctx, jobID, snapshotID); err != nil {
 		return err
 	}
-	if err := runReplicaCleanup(ctx, snapshotID, locators, cleanupBackendFromTargets(targets)); err != nil {
-		return failSnapshotDeleteJob(ctx, jobID, snapshotID, err)
+	// A saved plan means replica cleanup and reference release already
+	// committed. Resume artifact cleanup without depending on those nodes
+	// still being reachable after an earlier failure or process restart.
+	if targets.Snapshot == nil || strings.TrimSpace(targets.Snapshot.CleanupArtifactIDsJSON) == "" {
+		if err := runReplicaCleanup(ctx, snapshotID, locators, cleanupBackendFromTargets(targets)); err != nil {
+			return errors.Join(err, failSnapshotDeleteJob(ctx, jobID, snapshotID, err))
+		}
+		if err := runSnapshotReferenceCleanup(ctx, snapshotID, targets); err != nil {
+			return errors.Join(err, failSnapshotDeleteJob(ctx, jobID, snapshotID, err))
+		}
+	}
+	if err := runArtifactCleanup(ctx, snapshotID, targets); err != nil {
+		return errors.Join(err, failSnapshotDeleteJob(ctx, jobID, snapshotID, err))
 	}
 	if err := runMetadataCleanup(ctx, snapshotID); err != nil {
-		return failSnapshotDeleteJob(ctx, jobID, snapshotID, err)
+		return errors.Join(err, failSnapshotDeleteJob(ctx, jobID, snapshotID, err))
 	}
 	invalidateTemplateCaches(snapshotID)
 	// Mirror template delete: drop job rows so ListTemplates does not

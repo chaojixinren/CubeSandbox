@@ -7,6 +7,7 @@ on:
       - 'CubeAPI/**'
       - 'CubeOps/**'
       - 'pkgs/cubedb/**'
+      - 'pkgs/blobstore/**'
       - 'CubeProxy/**'
       - 'CubeMaster/**'
       - 'CubeTemplateCenter/**'
@@ -16,10 +17,12 @@ on:
       - 'pkgs/proto/**'
       - 'cube-lifecycle-manager/**'
       - 'Cubelet/**'
+      - 'cubecow/**'
       - 'agent/**'
       - 'cube-envd/**'
       - 'hypervisor/**'
       - 'examples/volume/s3/**'
+      - 'tests/perf/**'
       - 'docker/Dockerfile.builder'
       - '.github/workflows/build-builder-image.yml'
       - '.github/workflows/unit-test-check.yml'
@@ -29,6 +32,7 @@ on:
       - 'CubeAPI/**'
       - 'CubeOps/**'
       - 'pkgs/cubedb/**'
+      - 'pkgs/blobstore/**'
       - 'CubeProxy/**'
       - 'CubeMaster/**'
       - 'CubeTemplateCenter/**'
@@ -38,10 +42,12 @@ on:
       - 'pkgs/proto/**'
       - 'cube-lifecycle-manager/**'
       - 'Cubelet/**'
+      - 'cubecow/**'
       - 'agent/**'
       - 'cube-envd/**'
       - 'hypervisor/**'
       - 'examples/volume/s3/**'
+      - 'tests/perf/**'
       - 'docker/Dockerfile.builder'
       - '.github/workflows/build-builder-image.yml'
       - '.github/workflows/unit-test-check.yml'
@@ -64,6 +70,7 @@ on:
           - cubecow
           - cubelog
           - cubedb
+          - blobstore
           - cube-lifecycle-manager
           - cubelet
           - agent
@@ -72,6 +79,7 @@ on:
           - volume-s3
           - volume-cos-rpc
           - proto
+          - cubebench
 
 concurrency:
   group: unit-test-${{ github.event.pull_request.number || github.ref }}
@@ -125,6 +133,7 @@ jobs:
             add_component "cubecow"
             add_component "cubelog"
             add_component "cubedb"
+            add_component "blobstore"
             add_component "cube-lifecycle-manager"
             add_component "cubelet"
             add_component "agent"
@@ -133,6 +142,7 @@ jobs:
             add_component "volume-s3"
             add_component "volume-cos-rpc"
             add_component "proto"
+            add_component "cubebench"
           }
 
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
@@ -148,6 +158,7 @@ jobs:
               cubecow) add_component "cubecow" ;;
               cubelog) add_component "cubelog" ;;
               cubedb) add_component "cubedb" ;;
+              blobstore) add_component "blobstore" ;;
               cube-lifecycle-manager) add_component "cube-lifecycle-manager" ;;
               cubelet) add_component "cubelet" ;;
               agent) add_component "agent" ;;
@@ -156,6 +167,7 @@ jobs:
               volume-s3) add_component "volume-s3" ;;
               volume-cos-rpc) add_component "volume-cos-rpc" ;;
               proto) add_component "proto" ;;
+              cubebench) add_component "cubebench" ;;
               *)
                 echo "::error::unsupported component input: ${selected_component}"
                 exit 1
@@ -195,6 +207,12 @@ jobs:
                   # CubeTemplateCenter (replace => ../pkgs/cubedb), so its
                   # changes must re-run their test sets too.
                   add_component "cubedb"
+                  add_component "CubeOps"
+                  add_component "CubeMaster"
+                  add_component "CubeTemplateCenter"
+                  ;;
+                pkgs/blobstore/*)
+                  add_component "blobstore"
                   add_component "CubeOps"
                   add_component "CubeMaster"
                   add_component "CubeTemplateCenter"
@@ -251,9 +269,13 @@ jobs:
                 cube-lifecycle-manager/*)
                   add_component "cube-lifecycle-manager"
                   ;;
+                cubecow/*)
+                  add_component "cubecow"
+                  ;;
                 Cubelet/*)
-                  # cubecow lives under Cubelet/ (pkg/cubecow), so Cubelet
-                  # changes exercise both the cubelet and cubecow test sets.
+                  # Cubelet's Go bindings consume the cubecow crate
+                  # (Cubelet/pkg/cubecow), so Cubelet changes exercise both the
+                  # cubelet and cubecow test sets.
                   add_component "cubelet"
                   add_component "cubecow"
                   ;;
@@ -275,6 +297,9 @@ jobs:
                   # the only example consuming pkgs/proto), not covered by any
                   # component build above.
                   add_component "volume-cos-rpc"
+                  ;;
+                tests/perf/*)
+                  add_component "cubebench"
                   ;;
               esac
             done <<< "${changed_files}"
@@ -301,6 +326,7 @@ jobs:
                     elif . == "cubecow" then "CubeCow"
                     elif . == "cubelog" then "CubeLog"
                     elif . == "cubedb" then "CubeDB"
+                    elif . == "blobstore" then "Blobstore"
                     elif . == "cube-lifecycle-manager" then "Cube Lifecycle Manager"
                     elif . == "cubelet" then "Cubelet"
                     elif . == "cubevs" then "CubeVS"
@@ -310,6 +336,7 @@ jobs:
                     elif . == "volume-s3" then "S3 Volume Plugin"
                     elif . == "volume-cos-rpc" then "COS RPC Volume Plugin"
                     elif . == "proto" then "Proto"
+                    elif . == "cubebench" then "CubeBench"
                     else error("unsupported component: " + .)
                     end
                   ),
@@ -323,6 +350,7 @@ jobs:
                     elif . == "cubecow" then "cubecow-test-native"
                     elif . == "cubelog" then "cubelog-test"
                     elif . == "cubedb" then "cubedb-test"
+                    elif . == "blobstore" then "blobstore-test"
                     elif . == "cube-lifecycle-manager" then "cube-lifecycle-manager-test"
                     elif . == "cubelet" then "cubelet-test"
                     elif . == "cubevs" then "cubevs-test"
@@ -332,10 +360,11 @@ jobs:
                     elif . == "volume-s3" then "cube-volume-s3-test"
                     elif . == "volume-cos-rpc" then "cube-volume-cos-rpc-test"
                     elif . == "proto" then "proto-test"
+                    elif . == "cubebench" then "cubebench-test"
                     else error("unsupported component: " + .)
                     end
                   ),
-                  requires_builder: (. != "CubeProxy" and . != "cubelog" and . != "cubedb" and . != "proto"),
+                  requires_builder: (. != "CubeProxy" and . != "cubelog" and . != "cubedb" and . != "blobstore" and . != "proto" and . != "cubebench"),
                   run_mode: "root_make"
                 })
               | [

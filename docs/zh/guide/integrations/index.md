@@ -51,3 +51,5 @@ lang: zh-CN
 | [Claude Code 集成指南](./claude-code.md) | shsaihdsaiudh | 2026-07-06 | integration, claude-code, coding-agent |
 | [LangChain 集成指南](./langchain.md) | peerless-hero | 2026-07-07 | integration, langchain, agent |
 | [OpenAI Agents SDK 集成指南](./openai-agents-sdk.md) | ZedingZhang | 2026-08-19 | integration, openai-agents-sdk, agent |
+| [Ubuntu 桌面沙箱指南](./ubuntu-desktop.md) | jinlong | 2026-09-15 | integration, ubuntu-desktop, novnc, gui-automation |
+| [OpenCode 集成指南（插件钩子方案）](./opencode-plugin.md) | Tantanovo | 2026-07-31 | integration, opencode, coding-agent, plugin |

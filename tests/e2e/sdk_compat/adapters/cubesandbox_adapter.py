@@ -54,11 +54,17 @@ class CubeSandboxAdapter(SandboxAdapter):
         cls,
         sandbox_id: str,
         config: SdkE2EConfig,
+        *,
+        timeout: int | None = None,
     ) -> "CubeSandboxAdapter":
         from cubesandbox import Sandbox
 
         sdk_config = cls._sdk_config(config)
-        return cls(Sandbox.connect(sandbox_id, config=sdk_config), sdk_config=sdk_config, e2e_config=config)
+        return cls(
+            Sandbox.connect(sandbox_id, timeout=timeout, config=sdk_config),
+            sdk_config=sdk_config,
+            e2e_config=config,
+        )
 
     @classmethod
     def list_sandboxes(cls, config: SdkE2EConfig) -> list[dict[str, Any]]:
@@ -184,8 +190,17 @@ class CubeSandboxAdapter(SandboxAdapter):
             raise errors[0]
         return events
 
-    def run_code(self, code: str, *, timeout: int = 60) -> CodeResult:
-        execution = self._sandbox.run_code(code, timeout=timeout)
+    def run_code(
+        self,
+        code: str,
+        *,
+        env_vars: dict[str, str] | None = None,
+        timeout: int = 60,
+    ) -> CodeResult:
+        kwargs = {"timeout": timeout}
+        if env_vars is not None:
+            kwargs["envs"] = env_vars
+        execution = self._sandbox.run_code(code, **kwargs)
         stdout = _normalize_log_lines(execution.logs.stdout) if execution.logs else []
         stderr = _normalize_log_lines(execution.logs.stderr) if execution.logs else []
         return CodeResult(

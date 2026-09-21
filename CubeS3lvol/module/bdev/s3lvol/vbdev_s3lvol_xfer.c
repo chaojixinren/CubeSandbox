@@ -924,6 +924,7 @@ s3lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
 	struct s3lvol_lvstore *lvs;
 	struct s3lvol_import *imp;
 	struct s3_client *client = NULL;
+	struct s3_cache *shared_cache = NULL;
 	struct s3_target target;
 	char uuid_str[SPDK_UUID_STRING_LEN];
 	int rc;
@@ -965,7 +966,11 @@ s3lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
 
 	/* Ownership of the client reference moves into the bs_dev, which releases
 	 * it from destroy(). */
-	rc = s3_export_bs_dev_create(client, imp->m, bs_dev);
+	if (lvs && imp->lvs == lvs) {
+		shared_cache =
+			s3_bs_dev_get_cache(s3lvol_lvstore_get_bs_dev(lvs));
+	}
+	rc = s3_export_bs_dev_create(client, imp->m, shared_cache, bs_dev);
 	if (rc != 0) {
 		s3_client_put(client);
 		return rc;
@@ -1394,6 +1399,77 @@ blob_by_id(struct spdk_lvol_store *store, spdk_blob_id id)
 		}
 	}
 	return NULL;
+}
+
+uint32_t
+s3lvol_import_readahead_kb(struct spdk_lvol *lvol, uint32_t base_kb)
+{
+	struct s3lvol_lvstore *lvs;
+	struct spdk_lvol_store *store;
+	struct spdk_blob *cur;
+
+	/* Values other than the normal one-chunk policy are operator choices.
+	 * In particular, do not turn a random-workload 128 KiB override into
+	 * 4 MiB merely because its backing snapshot happens to be dense. */
+	if (base_kb != RCOW_DEFAULT_READ_AHEAD_KB || !lvol || !lvol->blob) {
+		return base_kb;
+	}
+
+	lvs = s3lvol_lvstore_of_lvol(lvol);
+	store = lvs ? s3lvol_lvstore_get_lvs(lvs) : NULL;
+	if (!store) {
+		return base_kb;
+	}
+
+	/* The lvol directly created by import is an esnap clone. After taking a
+	 * snapshot, blobstore can move that external parent onto an older layer,
+	 * so follow the local parent chain rather than testing only lvol->blob. */
+	cur = lvol->blob;
+	while (cur) {
+		if (spdk_blob_is_esnap_clone(cur)) {
+			const void *id = NULL;
+			size_t id_len = 0;
+			char uuid_str[SPDK_UUID_STRING_LEN];
+			struct s3lvol_import *imp;
+			const struct s3_export_manifest *m;
+			uint64_t half;
+
+			if (spdk_blob_get_esnap_id(cur, &id, &id_len) != 0 ||
+			    id_len == 0 || id_len >= sizeof(uuid_str)) {
+				return base_kb;
+			}
+			memcpy(uuid_str, id, id_len);
+			uuid_str[id_len] = '\0';
+			imp = import_find(lvs, uuid_str);
+			if (!imp) {
+				return base_kb;
+			}
+
+			m = imp->m;
+			if (m->num_chunks == 0) {
+				return base_kb;
+			}
+			/* ceil(num_chunks / 2), written without num_chunks + 1
+			 * so even a theoretical UINT64_MAX-sized manifest cannot
+			 * overflow the density calculation. */
+			half = m->num_chunks / 2 + m->num_chunks % 2;
+			return m->present_chunks >= half ?
+			       S3LVOL_DENSE_IMPORT_READ_AHEAD_KB : base_kb;
+		}
+
+		{
+			spdk_blob_id parent =
+				spdk_blob_get_parent_snapshot(store->blobstore,
+							 spdk_blob_get_id(cur));
+
+			if (parent == SPDK_BLOBID_INVALID) {
+				break;
+			}
+			cur = blob_by_id(store, parent);
+		}
+	}
+
+	return base_kb;
 }
 
 /* Collect the snapshot's clone chain, nearest first.
@@ -3014,6 +3090,8 @@ struct s3lvol_decouple {
 	uint64_t                   done;
 
 	int                        status;
+	bool                       bdev_quiesced;
+	bool                       parent_cleared;
 
 	/* Set to abort at the next cluster boundary. Checked by decouple_next(),
 	 * which is the one place this can safely happen: it is entered only from
@@ -3457,6 +3535,12 @@ decouple_finish_complete(struct s3lvol_decouple *d)
 			       "after %" PRIu64 " of %" PRIu64 " cluster(s); the "
 			       "%" PRIu64 " already materialised are kept\n",
 			       d->lvol_name, d->uuid_str, d->done, d->total, d->done);
+	} else if (d->parent_cleared) {
+		/* Clearing the parent is the point of no return. Do not claim this
+		 * remains an esnap clone merely because a later operation failed. */
+		SPDK_ERRLOG("Lvol '%s' was detached from export %s, but post-detach "
+			    "processing failed: %s\n",
+			    d->lvol_name, d->uuid_str, spdk_strerror(-status));
 	} else {
 		SPDK_ERRLOG("Decoupling lvol '%s' from export %s failed after %" PRIu64
 			    " of %" PRIu64 " cluster(s): %s. The volume still reads "
@@ -3464,6 +3548,10 @@ decouple_finish_complete(struct s3lvol_decouple *d)
 			    d->lvol_name, d->uuid_str, d->done, d->total,
 			    spdk_strerror(-status));
 	}
+
+	/* Freeing d while the bdev is still quiesced would discard the only state
+	 * recording why host I/O is queued. */
+	assert(!d->bdev_quiesced);
 
 	if (d->lvol) {
 		d->lvol->action_in_progress = false;
@@ -3494,12 +3582,17 @@ decouple_finish_complete(struct s3lvol_decouple *d)
 }
 
 static void
-decouple_cleared(void *cb_arg, int bserrno)
+decouple_remember_status(struct s3lvol_decouple *d, int status)
 {
-	struct s3lvol_decouple *d = cb_arg;
+	if (status != 0 && d->status == 0) {
+		d->status = status;
+	}
+}
 
-	if (bserrno != 0) {
-		d->status = bserrno;
+static void
+decouple_after_unquiesce(struct s3lvol_decouple *d)
+{
+	if (!d->parent_cleared) {
 		decouple_finish(d);
 		return;
 	}
@@ -3510,6 +3603,77 @@ decouple_cleared(void *cb_arg, int bserrno)
 	 * export that no attach can resolve. */
 	s3lvol_imports_recheck(d->lvs, d->uuid_str);
 	decouple_rewrite_exports(d);
+}
+
+static void
+decouple_unquiesced(void *cb_arg, int status)
+{
+	struct s3lvol_decouple *d = cb_arg;
+
+	/* This callback runs after every channel has been unlocked and its queued
+	 * I/O resubmitted. */
+	d->bdev_quiesced = false;
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to fully unquiesce lvol '%s' after detaching "
+			    "export %s: %s; host I/O may remain queued, restart the "
+			    "lvstore target if it does\n",
+			    d->lvol_name, d->uuid_str, spdk_strerror(-status));
+		decouple_remember_status(d, status);
+	}
+
+	decouple_after_unquiesce(d);
+}
+
+static void
+decouple_cleared(void *cb_arg, int bserrno)
+{
+	struct s3lvol_decouple *d = cb_arg;
+	int rc;
+
+	/* clear_external_parent freezes blob I/O, but that is below the bdev layer:
+	 * an unallocated 4 KiB write can already be doing its parent-read RMW when
+	 * the freeze starts. Destroying that esnap channel races the RMW and completes
+	 * the host write with -EIO. The bdev was quiesced before the clear, so release
+	 * it on both success and failure; writes submitted during this short metadata
+	 * transition have been queued by the bdev layer and resume normally. */
+	d->status = bserrno;
+	d->parent_cleared = bserrno == 0;
+	rc = spdk_bdev_unquiesce(d->lvol->bdev, vbdev_s3lvol_get_module(),
+				 decouple_unquiesced, d);
+	if (rc != 0) {
+		SPDK_ERRLOG("Could not unquiesce lvol '%s' after detaching export "
+			    "%s: %s; the public quiesce handle is gone but host I/O "
+			    "may remain queued, restart the lvstore target\n",
+			    d->lvol_name, d->uuid_str, spdk_strerror(-rc));
+		decouple_remember_status(d, rc);
+		/* spdk_bdev_unquiesce() removes the public quiesce record before
+		 * starting the unlock. If the unlock submission then fails, an
+		 * internal locked range may remain but there is no safe public retry.
+		 * Keeping d alive cannot recover that handle either: it only strands
+		 * the RPC, ingest callback and lvstore. Finish with an explicit error;
+		 * a target restart is the recovery if host I/O remains queued. */
+		d->bdev_quiesced = false;
+		decouple_after_unquiesce(d);
+	}
+}
+
+static void
+decouple_quiesced(void *cb_arg, int status)
+{
+	struct s3lvol_decouple *d = cb_arg;
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(d->lvs);
+
+	if (status != 0) {
+		d->status = status;
+		decouple_finish(d);
+		return;
+	}
+
+	d->bdev_quiesced = true;
+	spdk_bs_blob_clear_external_parent(store->blobstore,
+					   spdk_blob_get_id(d->lvol->blob),
+					   decouple_cleared, d);
 }
 
 static void decouple_next(struct s3lvol_decouple *d);
@@ -3524,8 +3688,6 @@ static void
 decouple_cluster_done(void *cb_arg, int bserrno)
 {
 	struct s3lvol_decouple *d = cb_arg;
-
-	spdk_blob_allow_esnap_copy(d->lvol->blob, false);
 
 	if (bserrno != 0) {
 		d->status = bserrno;
@@ -3595,7 +3757,7 @@ decouple_next(struct s3lvol_decouple *d)
 	}
 
 	if (d->cluster >= d->num_clusters) {
-		struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(d->lvs);
+		int rc;
 
 		/* Every cluster that was supposed to be copied has to have been copied
 		 * before the tie to the export is cut, because cutting it is the point
@@ -3624,15 +3786,31 @@ decouple_next(struct s3lvol_decouple *d)
 			return;
 		}
 
-		spdk_bs_blob_clear_external_parent(store->blobstore,
-						   spdk_blob_get_id(d->lvol->blob),
-						   decouple_cleared, d);
+		/* Drain I/O that may still be using the old esnap channel before
+		 * clear_external_parent freezes the blob and destroys that channel.
+		 * New host I/O remains queued in the bdev layer until decouple_cleared()
+		 * has installed the zeroes backing device and unquiesces it. */
+		if (!d->lvol->bdev) {
+			SPDK_ERRLOG("Cannot detach lvol '%s' from export %s: its bdev is "
+				    "not registered\n", d->lvol_name, d->uuid_str);
+			d->status = -ENODEV;
+			decouple_finish(d);
+			return;
+		}
+
+		rc = spdk_bdev_quiesce(d->lvol->bdev, vbdev_s3lvol_get_module(),
+				      decouple_quiesced, d);
+		if (rc != 0) {
+			SPDK_ERRLOG("Could not quiesce lvol '%s' before detaching export %s: %s\n",
+				    d->lvol_name, d->uuid_str, spdk_strerror(-rc));
+			d->status = rc;
+			decouple_finish(d);
+		}
 		return;
 	}
 
 	cluster = d->cluster++;
 
-	spdk_blob_allow_esnap_copy(d->lvol->blob, true);
 	spdk_blob_materialize_cluster(d->lvol->blob, d->channel, cluster,
 				      decouple_cluster_done, d);
 }
@@ -3755,6 +3933,25 @@ s3lvol_lvol_decouple_pending(const struct spdk_lvol *lvol)
 	return decouple_queued_find(lvol) != NULL || decouple_find(lvol) != NULL;
 }
 
+bool
+s3lvol_lvstore_decouple_pending(const struct s3lvol_lvstore *lvs)
+{
+	struct s3lvol_decouple *d;
+	struct decouple_queued *q;
+
+	TAILQ_FOREACH(d, &g_decouples, link) {
+		if (d->lvs == lvs) {
+			return true;
+		}
+	}
+	TAILQ_FOREACH(q, &g_decouple_queue, link) {
+		if (q->lvs == lvs) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* Start materialising now. The caller has already established that this volume is
  * an esnap clone, not already running or queued, and that nothing else is
  * decoupling the same export. It may be read-only: a snapshot is what a reference
@@ -3858,7 +4055,7 @@ decouple_start(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	if (bs && bucket && bucket[0] != '\0' && d->m->src.bucket[0] != '\0' &&
 	    strcmp(bucket, d->m->src.bucket) == 0 &&
 	    s3_bs_dev_get_chunk_size(bs) == d->chunk_size &&
-	    s3_bs_dev_ingest_begin(bs, d->m->src.bucket,
+	    s3_bs_dev_ingest_begin(bs, d->m->src.endpoint, d->m->src.bucket,
 				   decouple_ingest_src, d) == 0) {
 		d->ingest = true;
 		SPDK_NOTICELOG("Decoupling lvol '%s' from export %s via CopyObject "

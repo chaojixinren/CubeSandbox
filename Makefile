@@ -171,6 +171,7 @@ help:
 	@printf "  shim-test     Run CubeShim unit tests in Docker\n"
 	@printf "  cubelog-test  Run cubelog unit tests on the host\n"
 	@printf "  cubedb-test   Run CubeDB unit tests on the host\n"
+	@printf "  blobstore-test Run pkgs/blobstore unit tests on the host\n"
 	@printf "  proto-test    Run pkgs/proto unit tests on the host\n"
 	@printf "  cube-lifecycle-manager-test Run cube-lifecycle-manager unit tests in Docker\n"
 	@printf "  agent-test    Run cube-agent unit tests in Docker\n"
@@ -189,7 +190,6 @@ help:
 	@printf "  web-fmt       Format WebUI sources\n"
 	@printf "  fmt           Format all component directories\n"
 	@printf "  web-api-sync  Export OpenAPI and regenerate WebUI schema types\n"
-	@printf "  web-sync-dev-env Build and deploy WebUI into dev-env VM\n"
 	@printf "\nNotes:\n"
 	@printf "  - builder-shell forwards ~/.git-credentials when present\n"
 	@printf "  - builder-run reuses the same mounted workspace and persisted HOME\n"
@@ -373,9 +373,12 @@ cubecow-smoke: builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/Cubelet && go mod download && go build -a -o /workspace/_output/bin/cubecow-smoke ./pkg/cubecow/cmd/cubecow-smoke'
 
+# Both halves of the cubecow test set: the crate's own #[test]s via cargo, and
+# the Go bindings that link it. Nothing else in the tree runs the first half --
+# cubecow-sdk only builds the crate.
 .PHONY: cubecow-test-native
 cubecow-test-native: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/Cubelet && go mod download && go test -a ./pkg/cubecow -run Test -count=1'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk && cd /workspace/cubecow && cargo test -p cubecow --lib && cd /workspace/Cubelet && go mod download && go test -a ./pkg/cubecow -run Test -count=1'
 
 .PHONY: cubemaster
 cubemaster: builder-image
@@ -528,6 +531,12 @@ cubelog-test:
 cubedb-test:
 	cd pkgs/cubedb && go mod download && go test ./...
 
+# pkgs/blobstore is pure Go (no CGO). Consumers compile it via replace;
+# the module's own tests must run here.
+.PHONY: blobstore-test
+blobstore-test:
+	cd pkgs/blobstore && go mod download && go test ./...
+
 # pkgs/proto runs on the host: pure Go (generated .pb.go + grpc/protobuf
 # deps, no CGO/builder-only deps), like cubelog/cubedb. Consumers only
 # compile its non-test code via replace, so the module's own _test.go files
@@ -536,6 +545,10 @@ cubedb-test:
 .PHONY: proto-test
 proto-test:
 	cd pkgs/proto && go mod download && go vet ./... && go test ./...
+
+.PHONY: cubebench-test
+cubebench-test:
+	bash tests/perf/cubebench_test.sh
 
 .PHONY: cube-lifecycle-manager-test
 cube-lifecycle-manager-test: builder-image
@@ -631,10 +644,6 @@ web-fmt:
 web-api-sync:
 	cd "$(WEB_DIR)" && npm run api:sync
 
-.PHONY: web-sync-dev-env
-web-sync-dev-env:
-	"$(ROOT_DIR)/dev-env/internal/sync_web_to_vm.sh"
-
 # Run make fmt in each component directory that has a fmt target.
 # Components without formattable code (e.g. CubeProxy) are skipped.
 # Outside the builder, Go/Rust fmt routes through builder-run so
@@ -660,6 +669,8 @@ ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
 	@$(MAKE) -C pkgs/CubeLog fmt
 	@printf '  %-8s %s\n' "FMT" "proto"
 	@$(MAKE) -C pkgs/proto fmt
+	@printf '  %-8s %s\n' "FMT" "blobstore"
+	@$(MAKE) -C pkgs/blobstore fmt
 	@printf '  %-8s %s\n' "FMT" "CubeMaster"
 	@$(MAKE) -C CubeMaster fmt
 	@printf '  %-8s %s\n' "FMT" "CubeTemplateCenter"

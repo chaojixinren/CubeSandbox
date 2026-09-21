@@ -28,7 +28,8 @@ s3lvol-<version>/
 ├── bin/s3lvol_tgt
 ├── scripts/
 │   ├── rcow_start.sh rcow_stop.sh rcow_recovery.sh rcow_common.sh
-│   ├── rcow_purge.sh  s3lvol_rpc.py  s3_prefix_rm.py
+│   ├── rcow_cpumask.sh               # default SPDK -m (last two allowed CPUs)
+│   ├── rcow_upgrade.sh  rcow_purge.sh  s3lvol_rpc.py  s3_prefix_rm.py
 │   ├── rpc.py         # this repo's launcher (3.8 argparse shim)
 │   ├── rpc_compat.py  # BooleanOptionalAction backfill for Python 3.8
 │   ├── spdk_rpc.py    # SPDK's rpc.py, unmodified
@@ -110,12 +111,31 @@ forfeited its previous state.
 ```sh
 scripts/rcow_start.sh          # start target, create/attach lvstore, export nvmf, connect host
 scripts/rcow_stop.sh           # reverse order: disconnect, flush, unload, stop process
+scripts/rcow_upgrade.sh        # stop the target alone, for upgrades: no disconnect, no unload
 scripts/rcow_recovery.sh       # use this after an unclean exit
 scripts/rcow_purge.sh          # delete the whole lvstore back to a clean state (irreversible)
 ```
 
 `rcow_start.sh` is idempotent: if already running it tells you and exits rather
 than starting a second instance.
+
+`rcow_upgrade.sh` is the upgrade path and not a general stop. It flushes and
+checkpoints the lvstore online, pins the initiator timeouts the pause depends on,
+then kills the target so the host keeps its namespaces and only pauses I/O,
+leaving the state for a replacement to pick up.
+
+`--candidate <binary>` is required on a real run: it is the binary the upgrade
+will start, and the version gate refuses if the two builds cannot share the
+on-disk state. There is nowhere to take a default from -- an upgrade switches the
+versioned directory in only after the old process is confirmed dead, so
+`RCOW_TGT_BIN` still names the outgoing binary while the stop is running. The
+systemd path reads it from the hot-restart marker instead. `--dry-run` rehearses
+the online steps and may leave it out, because nothing is risked either way.
+
+With no target running, there is nothing to pause: it clears the target-side
+residue and exits 0. With one that does not answer RPC, it touches nothing at all
+and exits non-zero, so the operator still has a process to talk to. Use
+`rcow_stop.sh` for anything else.
 
 Credentials are read from `s3.cfg` and passed on **only through the target
 process's environment** — never on the command line, never into logs.
@@ -149,8 +169,10 @@ used ones:
 | `RCOW_LVS_NAME` | derived `rcow-<identity-hash>`; a pre-existing `rcow` entry is honoured | lvstore name, also the prefix in S3 |
 | `RCOW_CAPACITY_GB` | `16384` | used only at first create; thin, unused space costs nothing |
 | `RCOW_CACHE_MB` | `490496` | chunk cache on the WAL image; only matters before the first start |
+| `RCOW_CACHE_HOT_BUFS` | `1024` | whole-object RAM-cache slots per lvstore; 1 GiB at the default 1 MiB chunk size, `0` disables the RAM tier |
+| `RCOW_READ_AHEAD_KB` | `1024` | host block-device readahead; dense imports promote this default to 4096, `0` disables tuning |
 | `RCOW_LISTEN_ADDR` / `RCOW_LISTEN_PORT` | `127.0.0.1` / `4420` | |
-| `RCOW_TGT_CPUMASK` | `0x3` | |
+| `RCOW_TGT_CPUMASK` | last two allowed CPUs | SPDK `-m`; override with an explicit hex mask |
 | `RCOW_NO_HUGE` | `1` | no hugepages by default, a deliberate choice |
 | `RCOW_RPC_SOCK` | `/var/run/s3lvol.sock` | |
 
@@ -315,6 +337,19 @@ the **lvol name**, not the `<lvs>/<lvol>` bdev name. `rcow_deactive_bdev` is
 idempotent: deactivating a volume that is not active succeeds, because "not
 active" is the desired end state.
 
+Automatic namespace placement uses the free NSID that has been idle longest,
+rather than immediately reusing the lowest slot. This avoids presenting a new
+UUID at the NSID the Linux NVMe host just removed. Explicit recovery placements
+still win and reserve their NSID while the asynchronous attach is in progress.
+
+The local cache has a disk tier in the WAL image and a native whole-object RAM
+tier. The RAM tier is allocated per lvstore with `MAP_POPULATE`: the default
+`RCOW_CACHE_HOT_BUFS=1024` therefore adds 1 GiB of resident memory at the
+default 1 MiB chunk size, including during attach. Set it to `0` for disk-only
+cache operation. `rcow_get_lvstores` exposes native RAM/disk hit, miss,
+populate, eviction, residency and byte counters, plus separate imported-object
+cache and CopyObject-alias counters under each lvstore's `write_path`.
+
 Logs default to `/data/log/rcow/s3lvol_tgt.log` (overridable with `RCOW_LOG`, or
 `RCOW_LOG_DIR`). The CRT log level is set with
 `S3LVOL_CRT_LOG_LEVEL=trace|debug|info|warn|error|none`; `trace` prints every
@@ -386,11 +421,12 @@ For a local MinIO the config must also set `path_style = "true"` and
 
 `s3lvol_tgt` runs SPDK reactor threads in busy-poll mode: they spin at 100% of
 the cores they are pinned to and never sleep. The current deployment starts
-with **2 reactors on 2 dedicated cores** (e.g. `-m 0x3` pins them to CPU 0 and
-CPU 1). Those two cores are fully consumed by the target, so **other
-(application/business) processes must be kept off them** — pin them elsewhere
-with `taskset`/`numactl` (or a cpuset/cgroup) so the target's request latency
-is not disturbed by scheduler contention.
+with **2 reactors on the last two allowed CPUs** (for `Cpus_allowed_list: 0-7`
+that is `-m 0xc0`, CPU 6 and CPU 7). Those two cores are fully consumed by the
+target, so **other (application/business) processes must be kept off them** —
+pin them elsewhere with `taskset`/`numactl` (or a cpuset/cgroup) so the
+target's request latency is not disturbed by scheduler contention. Set
+`RCOW_TGT_CPUMASK` to an explicit hex mask when the cores are isolated.
 
 ## LIMITATIONS and TODOs
 
@@ -416,6 +452,9 @@ is not disturbed by scheduler contention.
   while the decouple still reads through it"*. Wait for the decouple to finish
   (`rcow_get_decouple` status -- its list emptying is the signal) before taking
   the snapshot or clone.
+- `rcow_unload_lvstore` returns `-EBUSY` while any decouple is in flight. Wait
+  for `rcow_get_decouple` to become empty; unloading cannot safely destroy the
+  export parent or its channels underneath materialisation.
 
 ## Retrying a refused snapshot delete (`--retry-pending`)
 

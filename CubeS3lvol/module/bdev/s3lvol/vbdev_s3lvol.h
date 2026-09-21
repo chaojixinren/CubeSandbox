@@ -385,28 +385,31 @@ bool s3lvol_nvmf_udev_settled(void);
  * eight requests where one would do, and a single threaded one has no other way
  * to get queue depth.
  *
- * Deliberately a compile-time constant rather than an RPC parameter: it is a
- * property of the chunk size, not of a volume. The operator-facing knob is
- * RCOW_READ_AHEAD_KB in scripts/rcow_common.sh, which can override this per
- * device afterwards -- including setting it back to the kernel default for a
- * purely random workload, where reading ahead a whole chunk is waste.
+ * This is the baseline rather than the complete policy: an imported manifest
+ * with at least 50% of its chunks present is promoted to 4 MiB. The
+ * operator-facing RCOW_READ_AHEAD_KB in scripts/rcow_common.sh can override
+ * that policy -- including setting it back to the kernel default for a purely
+ * random workload, where reading ahead whole chunks is waste.
  */
 #define RCOW_DEFAULT_READ_AHEAD_KB 1024
+
+/* Dense imports favour throughput over small-read amplification. Four chunks
+ * gives a single fault enough outstanding work to hide S3 latency while the
+ * transport still keeps every NVMe command at one chunk. */
+#define S3LVOL_DENSE_IMPORT_READ_AHEAD_KB 4096
 
 /* The kernel's own default, which is what "nobody has touched this device" looks
  * like. Used to tell an untuned device from one somebody set deliberately; see
  * s3lvol_nvmf_set_readahead(). */
 #define S3LVOL_KERNEL_DEFAULT_READ_AHEAD_KB 128
 
-/* Overrides RCOW_DEFAULT_READ_AHEAD_KB for this target. 0 disables the tuning
- * altogether, leaving every device as the kernel made it.
+/* Overrides the automatic policy for this target when set to a value other
+ * than RCOW_DEFAULT_READ_AHEAD_KB. 0 disables the tuning altogether, leaving
+ * every device as the kernel made it.
  *
- * An environment variable rather than an RPC parameter because it is a property
- * of the deployment, not of a volume, and because it has to agree with the
- * operator-facing RCOW_READ_AHEAD_KB in scripts/rcow_common.sh -- which exports
- * it, so the two cannot drift. Making that the single source of truth is what
- * keeps the two layers from writing different values to the same sysfs file and
- * silently undoing each other. */
+ * The script exports the operator-facing RCOW_READ_AHEAD_KB as this environment
+ * variable. The target reports its final per-volume decision from get_bdev so
+ * the script cannot subsequently overwrite a dense import's promotion. */
 #define S3LVOL_READ_AHEAD_ENV "S3LVOL_READ_AHEAD_KB"
 
 /**
@@ -423,12 +426,10 @@ uint32_t s3lvol_nvmf_readahead_kb(void);
 /**
  * Set a host block device's readahead, given the sysfs leaf name (e.g. "nvme0n1").
  *
- * **Only ever moves a device off the kernel default.** A device already at \c kb
- * is left alone, and so is one at any *other* non-default value: that means
- * somebody chose it on purpose -- the operator through RCOW_READ_AHEAD_KB, or a
- * tuning layer above -- and overwriting it would make their setting silently
- * temporary, undone by the next lookup of the device. This is what makes the
- * function safe to call on every lookup.
+ * A device already at \c kb is left alone. The kernel default and values managed
+ * by this module (the normal and dense-import policies) may transition between
+ * one another as an nsid is reused or its policy changes. Any other current
+ * value is treated as an external tuning decision and is not overwritten.
  *
  * Best effort: this is a performance knob, and every failure mode -- no such
  * attribute, a read-only /sys, the device already gone -- leaves a working
@@ -470,6 +471,13 @@ struct s3lvol_active_entry {
 	char     uuid[SPDK_UUID_STRING_LEN];
 	uint32_t subsys;
 	uint32_t nsid;
+	/** Whether a namespace for this entry exists in *this* process. The file
+	 * records the layout a restart has to reproduce; it says nothing about
+	 * whether that layout is up yet, and the loader fills the list with a
+	 * backing file that predates the process. Only a completed attach sets
+	 * this, so a restore attaches instead of answering "already active" off
+	 * a record it has just read. */
+	bool     attached;
 };
 
 /**
@@ -485,14 +493,28 @@ int s3lvol_active_load(void);
 /** Which subsystem a name belongs on: crc32c(name) % RCOW_NUM_SUBSYS. */
 uint32_t s3lvol_active_hash_subsys(const char *name);
 
-/** Lowest free nsid in a subsystem, or 0 when it is full. */
+/**
+ * Next free nsid in a subsystem, or 0 when it is full.
+ *
+ * Picks the free slot unused for the longest (never-used first, then the
+ * one freed earliest). The Linux NVMe host treats an in-place UUID change
+ * as "identifiers changed" and may never republish a /dev node, so a
+ * just-vacated nsid is the last candidate. Recovery that asks for an
+ * explicit nsid still gets that slot. The only-free-slot case still
+ * returns the cooled-down nsid rather than failing.
+ */
 uint32_t s3lvol_active_alloc_nsid(uint32_t subsys);
+
+/** Remember an explicit (recovery) placement so auto-alloc treats it as just used. */
+void s3lvol_active_note_nsid(uint32_t subsys, uint32_t nsid);
 
 const struct s3lvol_active_entry *s3lvol_active_find(const char *name);
 const struct s3lvol_active_entry *s3lvol_active_find_by_nsid(uint32_t subsys,
 							uint32_t nsid);
 
-/** Add or update an entry and persist. Rolls back in memory if the write fails. */
+/** Add or update an entry, mark it attached and persist. Rolls back in memory
+ * if the write fails. Called from the completion of a successful attach, which
+ * is what makes "attached" the right thing to set here. */
 int s3lvol_active_add(const char *name, const char *uuid, uint32_t subsys,
 		      uint32_t nsid);
 
@@ -1094,6 +1116,11 @@ int s3lvol_lvol_import(struct s3lvol_lvstore *lvs,
 int s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		       spdk_lvol_op_complete cb_fn, void *cb_arg);
 
+/* True while a decouple belonging to this lvstore is running or queued. Both
+ * states retain raw lvol/lvstore pointers, so the lvstore must not be unloaded
+ * until they have left their respective lists. */
+bool s3lvol_lvstore_decouple_pending(const struct s3lvol_lvstore *lvs);
+
 /* Drop a volume from the decouple queue because it is being deleted.
  *
  * A queued volume does not hold action_in_progress -- it may wait minutes behind
@@ -1355,5 +1382,15 @@ struct s3lvol_import *s3lvol_import_first(struct s3lvol_lvstore *lvs);
 struct s3lvol_import *s3lvol_import_next(struct s3lvol_import *prev);
 const struct s3_export_manifest *s3lvol_import_get_manifest(
 	const struct s3lvol_import *imp);
+
+/**
+ * Select host readahead for an lvol which may ultimately read from an import.
+ *
+ * The parent chain is followed to its external snapshot. When that import has
+ * at least half of its chunks present, the ordinary one-chunk default is
+ * promoted to four chunks. An operator override (including 0 or 128 KiB) is
+ * returned unchanged.
+ */
+uint32_t s3lvol_import_readahead_kb(struct spdk_lvol *lvol, uint32_t base_kb);
 
 #endif /* VBDEV_S3LVOL_H */

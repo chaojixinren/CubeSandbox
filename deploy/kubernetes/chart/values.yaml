@@ -315,6 +315,16 @@ controlPlane:
   #     attach on several nodes anyway) unless the claim is ReadWriteMany.
   artifactStore:
     s3Backed: false
+    # Durable blob backend for template rootfs artifacts. Default s3 keeps
+    # today's behaviour (incomplete CUBE_S3_* falls back to local disk).
+    # Set backend=fs to store objects on the shared artifact PVC via
+    # pkgs/blobstore without MinIO. Do not combine backend=fs with s3Backed=true.
+    # backend=fs requires master.persistence.enabled=true (emptyDir is lost
+    # on restart) and fsRoot, when set, must stay under /data/CubeMaster/storage.
+    backend: s3
+    # Optional override of CUBE_ARTIFACT_STORE_FS_ROOT. Empty uses the
+    # existing CUBEMASTER_ROOTFS_ARTIFACT_STORE_DIR mount.
+    fsRoot: ""
 
   # Standalone template build service (CubeTemplateCenter). REQUIRED.
   #
@@ -524,6 +534,29 @@ cubeOps:
     region: us-east-1
     pathStyle: true
     createBucket: true
+  # Blob backend for the component warehouse. Default s3 keeps today's
+  # behaviour (no S3 credentials → warehouse APIs return 501).
+  # Set backend=fs plus store.fs.publicURL (node-reachable CubeOps URL)
+  # to run the warehouse without MinIO/COS.
+  store:
+    backend: s3
+    fs:
+      root: /var/lib/cubeops/blobs
+      # Empty defaults to http://<ops Service FQDN>:<port>. Override with an
+      # internal CLB URL when compute nodes are outside the cluster.
+      publicURL: ""
+      # Hex-encoded signing key (>=32 bytes = 64 hex chars). Leave empty to
+      # generate one (32 random bytes, hex-encoded) and persist it across
+      # helm upgrade via lookup on the chart Secret. Multi-replica fs must
+      # share this key.
+      signingKey: ""
+      persistence:
+        enabled: true
+        size: 20Gi
+        accessModes:
+          - ReadWriteOnce
+        storageClass: ""
+        existingClaim: ""
   warehouse:
     presignTTL: 5m
     # Empty lists omit the env vars so CubeOps built-in allow-lists apply.
@@ -781,6 +814,21 @@ cubeNode:
     # Skip host-network conflict checks (cube-node-init) and the Service CIDR
     # preflight Hook. Use only when you accept blackhole / routing risk.
     cidrSkipConflictCheck: false
+    # Guest MTU patched into Cubelet config.toml mvm_mtu
+    # (CUBE_SANDBOX_NETWORK_MTU). The sandbox tap is created with this value and
+    # the hypervisor advertises it to the guest over VIRTIO_NET_F_MTU, so it is
+    # effectively the guest's MTU and must not exceed the MTU of the interface
+    # the traffic leaves through. cube-node runs on the Pod network by default,
+    # where an encapsulating CNI is smaller than 1500 (Flannel VXLAN is 1450;
+    # Calico's documented IPIP default is 1480), and the guest cannot recover
+    # on its own: oversized frames are dropped on egress and inbound ICMP
+    # fragmentation-needed is not forwarded into the guest, so connections
+    # stall instead of failing.
+    # "auto" lowers mvm_mtu to the detected NIC's MTU and never raises it, so it
+    # is a no-op wherever the uplink is already >= the packaged value. Set an
+    # integer in 1280..65535 to pin it, or 0 to keep the packaged Cubelet
+    # config.toml value.
+    mtu: "auto"
 
   dns:
     clusterDomain: cluster.local
@@ -1124,7 +1172,9 @@ cubeEgress:
 # Optional CubeS3lvol NVMe/TCP target sidecar (S3-backed cross-node snapshots)
 # in the cube-node Big Pod. Off by default, same as one-click. Enabling it
 # recreates the Big Pod (interrupting sandboxes on the node) and adds ~2 CPU
-# + 18 GiB RAM plus a ~512 GiB sparse WAL per compute node; x86_64 needs AVX2.
+# + 19 GiB RAM plus a ~512 GiB sparse WAL per compute node; x86_64 needs AVX2.
+# The 19 GiB request is 16 GiB tgtMemMB plus the default 1 GiB RAM cache and
+# process overhead, still under the 20 GiB limit.
 cubeS3lvol:
   enabled: false
   # Optional cluster-wide pin. Empty: the sidecar hashes the full Kubernetes
@@ -1132,10 +1182,13 @@ cubeS3lvol:
   # cluster — every node would share one S3 prefix.
   lvsName: ""
   socketPath: /var/run/s3lvol/s3lvol.sock
-  # Empty: rcow default 0x3 (CPU0+1). Set when the container is pinned to
-  # isolated cores.
+  # Empty: last two CPUs from Cpus_allowed_list (keeps CPU0 free when the
+  # set is 0..N-1). Set a hex mask when the container is pinned to isolated cores.
   cpuMask: ""
   tgtMemMB: 16384
+  # Whole-object RAM cache slots per lvstore. With 1 MiB chunks, 1024 is
+  # 1 GiB of resident memory; set 0 to keep only the disk cache.
+  cacheHotBufs: 1024
   journalMB: 1024
   walMB: 32768
   cacheMB: 490496
@@ -1172,7 +1225,7 @@ cubeS3lvol:
   resources:
     requests:
       cpu: "2"
-      memory: "18Gi"
+      memory: "19Gi"
     limits:
       memory: "20Gi"
 

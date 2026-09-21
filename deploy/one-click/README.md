@@ -222,22 +222,52 @@ If `CUBE_SANDBOX_NODE_IP` is explicitly set, the installation script will use th
 
 ### CubeS3lvol stop/upgrade semantics
 
-CubeS3lvol (s3lvol) is managed as a `Wants=` member of the `cube-sandbox-*`
-role target:
+CubeS3lvol (s3lvol) is a `Wants=` member of the `cube-sandbox-*` role target. It
+is deliberately **not** `PartOf=` it (see the unit): stopping a role target does
+not stop s3lvol, because a stop here is a full teardown and an upgrade must not
+inherit one.
 
-- **Stopping** (`down.sh` / `systemctl stop cube-sandbox-{control,compute}.target`):
-  the s3lvol unit goes through `cube-s3lvol-stop.sh`'s **conditional unload** —
-  when the target process is alive it runs the full `rcow_stop.sh` (disconnect
-  initiators -> flush/unload lvstore -> stop the target); when the target has
-  already crashed it only clears target-side residue and **never disconnects
-  the NVMf initiators**. `down.sh` only stops services, it does **not delete
-  any data** (`/data/cubelet/rcow/wal_bdev.img` and the bstore metadata are
-  kept); the next start recovers via attach/replay.
-- **Upgrading** (`install.sh` upgrade mode): the old `CubeS3lvol/` directory is
-  replaced (the new binary takes effect), then the target restarts with the
-  role target. `wal_bdev.img` is **never overwritten** (created only on first
-  install; its size fixes the journal/WAL layout), and the `RCOW_*` settings in
-  `.one-click.env` are merged and kept across the upgrade.
+- **Stopping** (`down.sh`): `down.sh` stops the role target and then stops
+  s3lvol explicitly. That goes through `cube-s3lvol-stop.sh`'s **conditional
+  unload** — when the target process is alive it runs the full `rcow_stop.sh`
+  (disconnect initiators -> flush/unload lvstore -> stop the target); when the
+  target has already crashed it only clears target-side residue and **never
+  disconnects the NVMf initiators**. `down.sh` only stops services, it does
+  **not delete any data** (`/data/cubelet/rcow/wal_bdev.img` and the bstore
+  metadata are kept); the next start recovers via attach/replay.
+- **Upgrading** (`install.sh --mode=upgrade`): nothing to configure and nothing
+  to remember between releases. The component is installed into a **versioned
+  directory** (`CubeS3lvol-<version>/`) with the bare name `CubeS3lvol` as a
+  symlink to it; the version just replaced is kept beside it and older ones are
+  pruned.
+  - **The first upgrade of an install from before this**, or of a target too old
+    to describe its own on-disk formats, or one whose scripts predate the rename
+    to `rcow_upgrade.sh`: the target is **stopped and started** — an
+    interruption, for that one upgrade only. `install.sh` says why.
+  - **Every upgrade after that** is done **in place**: the target is flushed and
+    checkpointed online, killed outright, and the replacement rebuilds the same
+    NQN/(subsys, nsid)/UUID grid, so the host reconnects to the same
+    `/dev/nvmeXnY` and a sandbox's I/O only pauses (about 40s). The initiator is
+    never disconnected and the lvstore never unloaded. This runs
+    `cube-s3lvol-hot-upgrade.sh` **before** the rest of the install stops
+    anything, because an online flush needs both the running target and the S3
+    endpoint.
+  - A swap that does not come back with the layout intact is **rolled back** to
+    the previous version; `install.sh` still finishes the rest and then exits
+    non-zero. The node is complete but on the old s3lvol.
+  - `wal_bdev.img` is **never overwritten** (created only on first install; its
+    size fixes the journal/WAL layout), and the `RCOW_*` settings in
+    `.one-click.env` are merged and kept across the upgrade.
+- **If a stop is refused** — a live target the stop script will not touch — the
+  unit ends stopped while the target keeps running and serving. Nothing was
+  disconnected and the lvstore is still loaded, and the marker is kept, so the
+  next upgrade picks the same target up and stops it in place: with no unit
+  running there is none to be asked, and the upgrade drives that stop itself.
+  `rcow_stop.sh` by hand is the **planned** stop instead — it disconnects the
+  initiator and unloads the lvstore — so it is only for when that outage is what
+  is wanted. The one refusal that asks for operator work is a marker naming a
+  target this host cannot confirm: the stop script says so, and that marker has
+  to be resolved before anything will start.
 - **Enable/disable**: preferred `ONE_CLICK_ENABLE_S3LVOL=0|1 ./install.sh`
   (honored on upgrade as well). Or put only that key in the bundle `.env`
   and re-run `install.sh`. Do not `cp env.example .env` as a full copy
@@ -422,6 +452,10 @@ MinIO runs under `cube-sandbox-minio.service`; after startup, readiness is
 verified via `curl http://<node-ip>:9000/minio/health/live` (a `200` response
 means it is healthy).
 
+Template artifacts and the CubeOps warehouse can use `CUBE_ARTIFACT_STORE_BACKEND=fs`
+and `CUBE_OPS_STORE_BACKEND=fs` instead of MinIO (S3 volumes still need MinIO
+or external S3).
+
 To use an existing S3-compatible store instead, set
 `CUBE_SANDBOX_MINIO_ENABLED=0` and `CUBE_S3_*` before `install.sh`:
 
@@ -511,7 +545,7 @@ export E2B_API_KEY=e2b_000000
 
 Required commands:
 
-- `docker` (cube-egress runs as a docker container; the installer installs it automatically — this is a hard prerequisite, so in offline/air-gapped environments where automatic installation isn't possible, install Docker beforehand)
+- `docker` (cube-egress runs as a docker container; the installer installs it automatically — this is a hard prerequisite, so in offline/air-gapped environments where automatic installation isn't possible, install Docker beforehand). Snap Docker is rejected: it cannot read `/usr/local/services` (`sudo snap remove docker`, then install docker-ce).
 - `tar`
 - `ss`
 - `bash`
@@ -561,7 +595,7 @@ sudo yum install -y python3 libaio libnuma libuuid
 
 Required commands:
 
-- `docker`
+- `docker` (snap Docker is rejected; install docker-ce / docker.io)
 - `tar`
 - `ss`
 - `bash`
@@ -640,6 +674,7 @@ sudo yum install -y python3 libaio libnuma libuuid
 - If the `deploy/guest-image/Dockerfile` build fails, or the build machine's `mkfs.ext4` does not support the `-d` flag, guest image generation will fail immediately.
 - `cube-snapshot/spec.json` is not a mandatory artifact in the current first release of one-click. If absent, the related plugin degrades to a warning rather than blocking the basic startup.
 - The default `NetworkManager + dnsmasq` fallback relies on NetworkManager to spawn the `dnsmasq` child. On hosts where NetworkManager initializes the plugin but never spawns it (for example bonded interfaces managed via `ifcfg` + `assume`), set `CUBE_PROXY_DNSMASQ_MODE=standalone` so the DNS scripts launch and manage `dnsmasq` themselves. Standalone mode does not require a restartable `NetworkManager`, but on hosts with no resolver manager at all you must ensure nothing else overwrites `/etc/resolv.conf` afterwards. In this mode `dnsmasq` runs as a bare child that systemd does not supervise, so if it later crashes nothing restarts it automatically; recover with `systemctl restart cube-sandbox-dns`.
+- **Snap Docker is not supported.** Ubuntu Server's installer (Subiquity) offers Docker as a "Featured Snap" during OS setup; users who check that option — or later run `snap install docker` — end up with a sandboxed Docker daemon that cannot access paths outside its AppArmor confinement (e.g. `/usr/local/services`). The install scripts detect this automatically and abort with remediation steps. Fix: `sudo snap remove docker`, then install docker-ce per <https://docs.docker.com/engine/install/ubuntu/>.
 
 ## DNS Troubleshooting
 

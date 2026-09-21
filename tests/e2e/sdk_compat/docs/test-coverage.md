@@ -30,7 +30,7 @@ pytest --run-e2e -m "lifecycle and slow"
 | File | Main Behavior | Capability / Prerequisite | Risk And Execution Guidance |
 | --- | --- | --- | --- |
 | `cases/lifecycle/test_create.py` | `info` after creation and Linux command smoke | `lifecycle` | P0 / PR gate candidate |
-| `cases/lifecycle/test_connect.py` | connect to an existing sandbox, ID and file/command usability | `lifecycle` | P1 |
+| `cases/lifecycle/test_connect.py` | connect to an existing sandbox, ID and file/command usability, and explicit timeout application for running/paused sandboxes | `lifecycle`; paused case also requires `pause_resume` | P1 |
 | `cases/lifecycle/test_create_options.py` | metadata, env vars, timeout, command after create options | `lifecycle` | P1 |
 | `cases/lifecycle/test_pause_resume.py` | SDK pause, connect resume, file/env/kernel preservation | `pause_resume`, partially Code Interpreter | P1 |
 | `cases/lifecycle/test_pause_resume_network.py` | pause/resume keeps egress deny/allowlist and restricted public-access token | `pause_resume` + network capabilities; CubeProxy for ingress token case | P1 + `requires_internet` |
@@ -97,10 +97,10 @@ covered yet.
 - expression result text;
 - stdout and stderr capture;
 - Python errors and syntax errors;
+- create-time env inheritance and temporary per-call env overrides, enabled with `SDK_E2E_RUN_CODE_ENV_INHERITANCE=true` for compatible templates;
 - stateful kernel variable preservation.
 
-These scenarios require Code Interpreter support and validate normalized
-`CodeResult` values rather than SDK-private response objects.
+These scenarios require Code Interpreter support and validate normalized `CodeResult` values rather than SDK-private response objects. The environment-inheritance case is skipped unless explicitly enabled because the default template may not provide that behavior.
 
 ### 2.5 Network
 

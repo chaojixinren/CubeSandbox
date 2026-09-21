@@ -38,8 +38,20 @@ const (
 
 	DefaultCubeRuntimePath = "/usr/local/services/cubetoolbox/cube-shim/bin/cube-runtime"
 
-	SnapshotStatusPath = "/data/cube-shim/snapshot"
+	snapshotDefaultWorkTimeout = 5 * time.Minute
+	snapshotResumeTimeout      = 30 * time.Second
 )
+
+// detachedSnapshotWorkContext lets an in-flight frozen snapshot finish after
+// client cancellation, while preserving the upstream deadline. When none is
+// supplied, a five-minute default bounds the frozen work.
+func detachedSnapshotWorkContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(snapshotDefaultWorkTimeout)
+	if parentDeadline, ok := ctx.Deadline(); ok {
+		deadline = parentDeadline
+	}
+	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
+}
 
 type CubeboxSnapshotSpec struct {
 	Resource    json.RawMessage `json:"resource,omitempty"`
@@ -301,31 +313,55 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 	// no base memory blob to overlay onto, so we always ask for a full memory
 	// snapshot. Incremental is reserved for CommitSandbox where the running
 	// sandbox is bound to a prior snapshot whose memory file we can clone.
-	if err := s.executeCubeRuntimeSnapshot(ctx, sandboxID, spec, layout.MetaWork, memoryObject.DevPath, snapshotTypeFull); err != nil {
-		stepLog.Errorf("Failed to execute cube-runtime snapshot: %v", err)
-
+	frozenCtx, frozenCancel := detachedSnapshotWorkContext(ctx)
+	defer frozenCancel()
+	keepPaused, err := s.runtimeSnapshotSupportsKeepPaused(frozenCtx, sandboxID)
+	if err != nil {
 		cleanupSnapshotObjects()
 		layout.discardTmpDir()
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
-		rsp.Ret.RetMsg = fmt.Sprintf("failed to execute cube-runtime snapshot: %v", err)
+		rsp.Ret.RetMsg = fmt.Sprintf("failed to check snapshot runtime capabilities: %v", err)
 		return rsp, nil
 	}
-	stepLog.Info("cube-runtime snapshot executed successfully")
-	// Do not write memory.dev: host-local /dev paths must not be baked into
-	// packages. Restore resolves memory via catalog vol name + ResolveDevPath.
-
-	rootfsObject, err = storage.CommitRootfsFromBuildFor(ctx, backend, templateID)
-	if err != nil {
-		stepLog.Errorf("Failed to create template rootfs snapshot: %v", err)
+	if !keepPaused {
 		cleanupSnapshotObjects()
 		layout.discardTmpDir()
-		if errors.Is(err, storage.ErrCowObjectAlreadyExists) {
-			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
-			rsp.Ret.RetMsg = fmt.Sprintf("template rootfs already exists: %v", err)
-			return rsp, nil
-		}
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = incompatibleSnapshotRuntimeMessage
+		return rsp, nil
+	}
+	snapshotErr, rootfsErr, resumeErr := runSnapshotWithRootfs(func() error {
+		return s.executeCubeRuntimeSnapshotWithPause(frozenCtx, sandboxID, spec, layout.MetaWork, memoryObject.DevPath, snapshotTypeFull, true)
+	}, func() error {
+		var commitErr error
+		rootfsObject, commitErr = storage.CommitRootfsFromBuildFor(frozenCtx, backend, templateID)
+		return commitErr
+	}, func() error {
+		return s.resumeCubeRuntimeSnapshot(ctx, sandboxID)
+	})
+	if snapshotErr != nil || rootfsErr != nil {
+		cleanupSnapshotObjects()
+		layout.discardTmpDir()
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
-		rsp.Ret.RetMsg = fmt.Sprintf("failed to create template rootfs snapshot: %v", err)
+		if snapshotErr != nil {
+			rsp.Ret.RetMsg = fmt.Sprintf("failed to execute cube-runtime snapshot: %v", snapshotErr)
+		} else if errors.Is(rootfsErr, storage.ErrCowObjectAlreadyExists) {
+			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+			rsp.Ret.RetMsg = fmt.Sprintf("template rootfs already exists: %v", rootfsErr)
+		} else {
+			rsp.Ret.RetMsg = fmt.Sprintf("failed to create template rootfs snapshot: %v", rootfsErr)
+		}
+		if resumeErr != nil {
+			rsp.Ret.RetMsg += fmt.Sprintf("; additionally failed to resume sandbox: %v", resumeErr)
+		}
+		return rsp, nil
+	}
+	if resumeErr != nil {
+		stepLog.Errorf("Failed to resume cubebox after snapshot: %v", resumeErr)
+		cleanupSnapshotObjects()
+		layout.discardTmpDir()
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("failed to resume sandbox after snapshot: %v", resumeErr)
 		return rsp, nil
 	}
 
@@ -396,12 +432,6 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 		return rsp, nil
 	}
 
-	stepLog.Info("Step 7: Writing snapshot status flag file...")
-	if err := writeSnapshotFlag(stepLog); err != nil {
-		stepLog.Warnf("Failed to write snapshot flag: %v", err)
-
-	}
-
 	snapshotSuccess = true
 	rsp.RootfsVol = rootfsObject.Name
 	rsp.MemoryVol = memoryObject.Name
@@ -462,32 +492,6 @@ func inheritIncomingMetadata(dst context.Context, src context.Context) context.C
 		return metadata.NewIncomingContext(dst, md.Copy())
 	}
 	return dst
-}
-
-func writeSnapshotFlag(stepLog *log.CubeWrapperLogEntry) error {
-
-	if _, err := os.Stat(SnapshotStatusPath); err == nil {
-		stepLog.Info("Snapshot status flag file already exists, skipping")
-		return nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(SnapshotStatusPath), 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	file, err := os.Create(SnapshotStatusPath)
-	if err != nil {
-		return fmt.Errorf("failed to create flag file: %w", err)
-	}
-	file.Close()
-
-	cmd := exec.Command("chattr", "+i", SnapshotStatusPath)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set immutable attribute: %w", err)
-	}
-
-	stepLog.Infof("Snapshot status flag file created: %s", SnapshotStatusPath)
-	return nil
 }
 
 func validateAppSnapshotAnnotations(req *cubebox.RunCubeSandboxRequest) error {
@@ -627,6 +631,10 @@ func normalizeSnapshotType(snapshotType string) string {
 // so tests can assert on the exact argv that will be passed to cube-runtime
 // without touching exec or the filesystem.
 func buildCubeRuntimeSnapshotArgs(sandboxID string, spec *CubeboxSnapshotSpec, snapshotPath, memoryVol, snapshotType string) []string {
+	return buildCubeRuntimeSnapshotArgsWithPause(sandboxID, spec, snapshotPath, memoryVol, snapshotType, false)
+}
+
+func buildCubeRuntimeSnapshotArgsWithPause(sandboxID string, spec *CubeboxSnapshotSpec, snapshotPath, memoryVol, snapshotType string, keepPaused bool) []string {
 	args := []string{
 		"snapshot",
 		"--app-snapshot",
@@ -634,6 +642,9 @@ func buildCubeRuntimeSnapshotArgs(sandboxID string, spec *CubeboxSnapshotSpec, s
 		"--path", snapshotPath,
 		"--force",
 		"--snapshot-type", normalizeSnapshotType(snapshotType),
+	}
+	if keepPaused {
+		args = append(args, "--keep-paused")
 	}
 	if spec != nil {
 		if len(spec.Resource) > 0 {
@@ -659,6 +670,10 @@ func buildCubeRuntimeSnapshotArgs(sandboxID string, spec *CubeboxSnapshotSpec, s
 }
 
 func (s *service) executeCubeRuntimeSnapshot(ctx context.Context, sandboxID string, spec *CubeboxSnapshotSpec, snapshotPath, memoryVol, snapshotType string) error {
+	return s.executeCubeRuntimeSnapshotWithPause(ctx, sandboxID, spec, snapshotPath, memoryVol, snapshotType, false)
+}
+
+func (s *service) executeCubeRuntimeSnapshotWithPause(ctx context.Context, sandboxID string, spec *CubeboxSnapshotSpec, snapshotPath, memoryVol, snapshotType string, keepPaused bool) error {
 	snapshotType = normalizeSnapshotType(snapshotType)
 	stepLog := log.G(ctx).WithFields(CubeLog.Fields{
 		"sandboxID":    sandboxID,
@@ -666,7 +681,7 @@ func (s *service) executeCubeRuntimeSnapshot(ctx context.Context, sandboxID stri
 		"snapshotType": snapshotType,
 	})
 
-	args := buildCubeRuntimeSnapshotArgs(sandboxID, spec, snapshotPath, memoryVol, snapshotType)
+	args := buildCubeRuntimeSnapshotArgsWithPause(sandboxID, spec, snapshotPath, memoryVol, snapshotType, keepPaused)
 
 	runtimePath, err := s.resolveCubeRuntimePath(ctx, sandboxID)
 	if err != nil {
@@ -683,6 +698,29 @@ func (s *service) executeCubeRuntimeSnapshot(ctx context.Context, sandboxID stri
 
 	stepLog.Infof("cube-runtime snapshot output: %s", string(output))
 	return nil
+}
+
+func (s *service) executeCubeRuntimeSnapshotResume(ctx context.Context, sandboxID string) error {
+	stepLog := log.G(ctx).WithFields(CubeLog.Fields{"sandboxID": sandboxID})
+	runtimePath, err := s.resolveCubeRuntimePath(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	args := []string{"snapshot-resume", "--vm-id", sandboxID}
+	stepLog.Infof("Executing: %s %v", runtimePath, args)
+	cmd := exec.CommandContext(ctx, runtimePath, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		stepLog.Errorf("cube-runtime snapshot resume failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("cube-runtime snapshot resume failed: %w, output: %s", err, string(output))
+	}
+	return nil
+}
+
+func (s *service) resumeCubeRuntimeSnapshot(ctx context.Context, sandboxID string) error {
+	resumeCtx, resumeCancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotResumeTimeout)
+	defer resumeCancel()
+	return s.executeCubeRuntimeSnapshotResume(resumeCtx, sandboxID)
 }
 
 // resolveCubeRuntimePath picks cube-runtime matching the sandbox shim version,

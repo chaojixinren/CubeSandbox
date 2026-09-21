@@ -119,6 +119,7 @@ flowchart TB
 | Third-party Redis | Non-empty `redis.host` → do not install built-in Redis |
 | Built-in MinIO | `minio.enabled=true` → deploy StatefulSet + Headless Service (`minio.*` only deploys MinIO itself; an empty `rootPassword` is auto-generated). If `volumeS3.endpoint` / `existingSecret` are not set, the chart derives the S3 config from the built-in MinIO and writes `volume-s3.conf` |
 | External S3 | `minio.enabled=false` plus `volumeS3.endpoint` / `volumeS3.existingSecret` → do not deploy the built-in MinIO; `volume-s3.conf` is generated from `volumeS3.*` |
+| Local-disk blobstore | `artifactStore.backend=fs` / `cubeOps.store.backend=fs` for templates and warehouse (default `s3`); S3 volumes unchanged |
 
 ### 2.3 Compute plane: four DaemonSets
 
@@ -421,7 +422,7 @@ Does not install built-in Master / API / MySQL / Redis / MinIO / WebUI; by defau
 | `cubeProxy.enabled` / `ingress.enabled` | `true` | Proxy / Ingress |
 | `lifecycleManager.enabled` | `true` | Required when Proxy is enabled |
 | `cubeEgress.enabled` | `true` | Big Pod egress sidecar |
-| `cubeS3lvol.enabled` | `false` | Big Pod s3lvol sidecar (recreates the Pod; ~2 CPU / 18 GiB / 512 GiB sparse WAL) |
+| `cubeS3lvol.enabled` | `false` | Big Pod s3lvol sidecar (recreates the Pod; ~2 CPU / 19 GiB / 512 GiB sparse WAL, including the default 1 GiB RAM cache) |
 | `cubeOps.enabled` | `true` | CubeOps (JWT ops API; WebUI upstream) |
 | `webui.enabled` | `true` | WebUI (requires `cubeOps.enabled=true`) |
 

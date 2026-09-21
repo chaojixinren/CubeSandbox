@@ -50,8 +50,8 @@ class Commands:
     ) -> CommandResult:
         """Run a shell command inside the sandbox through envd's process API.
 
-        The Connect-JSON decoder preserves CubeSandbox termination metadata
-        independently of whether the optional E2B protocol package is installed.
+        The SDK always uses envd's Connect RPC endpoint directly so it does
+        not rely on optional external protobuf/runtime packages.
 
         Args:
             env: Alias for envs, matching the E2B SDK command API.
@@ -61,7 +61,7 @@ class Commands:
         """
         process_envs = envs if envs is not None else (env or {})
         effective_user = user or DEFAULT_ENVD_USER
-        return self._run_with_connect_fallback(
+        return self._run_with_connect_api(
             cmd,
             timeout=timeout,
             cwd=cwd,
@@ -69,7 +69,7 @@ class Commands:
             user=effective_user,
         )
 
-    def _run_with_connect_fallback(
+    def _run_with_connect_api(
         self,
         cmd: str,
         *,
@@ -86,11 +86,10 @@ class Commands:
                 "cmd": "/bin/bash",
                 "args": ["-l", "-c", cmd],
                 "envs": envs,
+                "cwd": cwd or "",
             },
             "stdin": False,
         }
-        if cwd:
-            payload["process"]["cwd"] = cwd
 
         headers = {
             "Content-Type": CONNECT_CONTENT_TYPE,
@@ -195,8 +194,14 @@ def _parse_process_start_stream(chunks) -> CommandResult:
     if exit_code is None:
         raise RuntimeError("process stream ended without EndEvent")
 
-    return CommandResult(stdout="".join(stdout), stderr="".join(stderr), exit_code=exit_code,
-                         signal=signal, oom_killed=oom_killed, killed_by=killed_by)
+    return CommandResult(
+        stdout="".join(stdout),
+        stderr="".join(stderr),
+        exit_code=exit_code,
+        signal=signal,
+        oom_killed=oom_killed,
+        killed_by=killed_by,
+    )
 
 
 def _encode_connect_envelope(data: bytes, flags: int = 0) -> bytes:

@@ -155,6 +155,7 @@ can set it to `false`.
 - runtime tools are available through `/usr/local/bin/containerd-shim-cube-rs`, `/usr/local/bin/cube-runtime`, `/usr/local/bin/cubecli`, and `/usr/local/bin/cubevsmapdump`;
 - `cubeNode.network.autoDetectEthName=true` auto-detects the primary host NIC and patches Cubelet `eth_name`;
 - `cubeNode.network.cidr` patches Cubelet cubevs/sandbox CIDR (default `172.16.0.0/18`, chosen to avoid common cluster Service CIDR `192.168.0.0/16` while keeping a /18 pool). A Helm `pre-install`/`pre-upgrade` Hook fails fast when this range overlaps the cluster Service CIDR or existing ClusterIPs; set `cubeNode.network.cidrSkipConflictCheck=true` only if you accept that risk.
+- `cubeNode.network.mtu` patches Cubelet `mvm_mtu`, the MTU the sandbox tap is created with and, via `VIRTIO_NET_F_MTU`, the MTU the guest configures. It must not exceed the MTU of the interface the traffic leaves through: `cube-node` runs on the Pod network by default, where an encapsulating CNI is below 1500 (Flannel VXLAN is 1450; Calico's documented IPIP default is 1480), and a guest on a 1500 tap emits frames the uplink drops. The guest cannot recover on its own, because inbound ICMP fragmentation-needed is not forwarded into it, so connections stall rather than fail. The default `auto` lowers `mvm_mtu` to the detected NIC's MTU and never raises it, so it is a no-op wherever the uplink is already >= the packaged value; set an integer in `1280`..`65535` to pin it, or `0` to keep the packaged Cubelet `config.toml` value.
 
 The `cube-node` Pod defaults `kubectl exec` to its `cubelet` container, where `cubecli` uses the node-local Cubelet and containerd sockets. In a multi-node cluster, select the Pod scheduled on the compute node you want to inspect:
 
@@ -612,6 +613,8 @@ Chart MinIO is a single StatefulSet. For warehouse HA, set `cubeOps.s3.endpoint`
 
 When no cubeOps.s3 / volumeS3 / MinIO endpoint is set, Helm still renders; CubeOps starts and returns `501 warehouse_disabled` on warehouse routes. Helm fails when an endpoint is set without CubeOps credentials.
 
+Template artifacts and the CubeOps warehouse default to S3. For disk/PVC instead, set `controlPlane.artifactStore.backend: fs` and `cubeOps.store.backend: fs` (see `values.yaml`). S3 volumes and CubeS3lvol still need a real S3 API.
+
 CubeAPI serves external E2B-compatible SDK clients.
 
 Expose the WebUI externally by changing `webui.service.type` or by adding your platform's ingress/load balancer configuration.
@@ -658,7 +661,7 @@ Do not rotate the CubeEgress CA casually: templates baked with the old CA and sa
 
 ## CubeS3lvol
 
-`cubeS3lvol.enabled=false` by default, same as one-click. Enabling it injects a `cube-s3lvol` sidecar into the Cube Node Big Pod and **recreates that Pod, interrupting sandboxes on the node** — budget about 2 CPU, 18 GiB RAM, and a 512 GiB sparse WAL per compute node (x86_64 needs AVX2).
+`cubeS3lvol.enabled=false` by default, same as one-click. Enabling it injects a `cube-s3lvol` sidecar into the Cube Node Big Pod and **recreates that Pod, interrupting sandboxes on the node** — budget about 2 CPU, 19 GiB RAM, and a 512 GiB sparse WAL per compute node (x86_64 needs AVX2).
 
 When enabled, the sidecar:
 
@@ -668,11 +671,14 @@ When enabled, the sidecar:
 - reads S3 config from a chart Secret mounted at `/etc/s3lvol/s3.cfg`; an `existingSecret` must contain that key in s3lvol format (not `volume-s3.conf`);
 - reuses chart MinIO or `volumeS3` endpoint and credentials by default. The bucket is `cube-s3lvol` and must not be the volume plugin's `cube-volumes` (Helm fails on a shared bucket);
 - identifies the node by hashing the full Kubernetes node name (`spec.nodeName`) to `rcow-<8hex>`, so a Pod recreate is not a new machine and IP / dotted node names stay unique. `cubeS3lvol.lvsName` pins the same name on every node — do not set it when more than one node runs the sidecar;
-- uses rcow's default CPU mask (`0x3`); set `cubeS3lvol.cpuMask` when cores are isolated.
+- uses the last two allowed CPUs by default; set `cubeS3lvol.cpuMask` when cores are isolated.
+- reserves 1024 whole-object RAM-cache slots (1 GiB at the default chunk size)
+  per lvstore; set `cubeS3lvol.cacheHotBufs: 0` for disk-only caching.
 
 ```yaml
 cubeS3lvol:
   enabled: true
+  cacheHotBufs: 1024
   # Optional: explicit S3 (otherwise chart MinIO or volumeS3 is reused).
   # s3:
   #   existingSecret: my-s3lvol-cfg   # key must be s3.cfg
