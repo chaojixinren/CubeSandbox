@@ -192,6 +192,40 @@ def load(dirname, name):
         return json.load(f)
 
 
+def normalize_fixture(name, fixture):
+    """Ignore only Go's decoder context for specific invalid Signal fixtures.
+
+    Preserve HTTP status, error code, headers, extra fields and the error
+    reason. Match the offending token for each fixture, so an unrelated
+    decoding error or a different signal error cannot become a passing test.
+    """
+    result = normalize(norm_stream_frames(fixture))
+    tokens = {"bool": "true", "object": "{", "array": "[",
+              "float": "1.5", "out_of_range": "2147483648"}
+    fixtures = {f"proc_send_signal_{selector}{kind}": token
+                for selector in ("", "missing_", "empty_")
+                for kind, token in tokens.items()}
+    if name not in fixtures or result.get("status") != 400:
+        return result
+    try:
+        body = json.loads(result["body"])
+    except (KeyError, TypeError, ValueError):
+        return result
+    if not isinstance(body, dict) or body.get("code") != "invalid_argument":
+        return result
+    reason = "unmarshal message: invalid value for enum field signal"
+    pattern = (
+        r"unmarshal message: unmarshal into \*process\.SendSignalRequest: "
+        r"proto:\s+\(line [1-9][0-9]*:[1-9][0-9]*\): "
+        r"invalid value for enum field signal: " + re.escape(fixtures[name])
+    )
+    message = body.get("message")
+    if isinstance(message, str) and re.fullmatch(pattern, message):
+        body["message"] = reason
+        result["body"] = json.dumps(body, sort_keys=True)
+    return result
+
+
 def main():
     import os
     names = sorted(
@@ -208,8 +242,8 @@ def main():
             missing.append(name)
             continue
         go = load(GO_DIR, name)
-        go_n = normalize(norm_stream_frames(go))
-        rs_n = normalize(norm_stream_frames(rs))
+        go_n = normalize_fixture(name, go)
+        rs_n = normalize_fixture(name, rs)
         if go_n == rs_n:
             passed.append(name)
         elif name in DECLARED_DIFFERENT:

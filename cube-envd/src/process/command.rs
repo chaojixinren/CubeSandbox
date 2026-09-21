@@ -304,6 +304,11 @@ pub fn send_signal(
     table: &ProcessTable,
     req: &SendSignalRequest,
 ) -> Result<serde_json::Value, ConnectError> {
+    // Go's protobuf decoder rejects malformed enum values before the service
+    // validates the selector or looks up the process. Keep this separate from
+    // rejecting a well-formed but unsupported signal, which happens afterwards.
+    let decoded_signal = decode_signal(req.signal.as_ref())
+        .map_err(|message| ConnectError::new(ConnectCode::InvalidArgument, message))?;
     let (pid, tag) = validated_selector(&req.process)?;
     let (target, process_cgroup, termination) =
         table.process_control(pid, tag.as_deref()).ok_or_else(|| {
@@ -316,16 +321,15 @@ pub fn send_signal(
     // explicit `SIGNAL_UNSPECIFIED`, or any unknown *name* — is rejected with
     // the enum's own name; any other number is rejected with that number. A
     // Rust debug repr never reaches the wire.
-    let signo = match decode_signal(req.signal.as_ref()) {
-        Err(message) => return Err(ConnectError::new(ConnectCode::InvalidArgument, message)),
-        Ok(0) => {
+    let signo = match decoded_signal {
+        0 => {
             return Err(ConnectError::new(
                 ConnectCode::Unimplemented,
                 "invalid signal: SIGNAL_UNSPECIFIED",
             ))
         }
-        Ok(signo) if signo == libc::SIGKILL || signo == libc::SIGTERM => signo,
-        Ok(other) => {
+        signo if signo == libc::SIGKILL || signo == libc::SIGTERM => signo,
+        other => {
             return Err(ConnectError::new(
                 ConnectCode::Unimplemented,
                 format!("invalid signal: {other}"),
@@ -743,14 +747,43 @@ mod tests {
         assert_eq!(err.code, ConnectCode::NotFound);
     }
 
+    #[test]
+    fn send_signal_decode_errors_precede_selector_and_process_errors() {
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
+        for selector in [r#"{"pid":7}"#, r#"{"tag":"missing"}"#, "{}"] {
+            for bad in ["true", "{}", "[]", "1.5", "2147483648"] {
+                let raw = format!(r#"{{"process":{selector},"signal":{bad}}}"#);
+                let req: SendSignalRequest = serde_json::from_str(&raw).unwrap();
+                let err = send_signal(&table, &req).unwrap_err();
+                assert_eq!(err.code, ConnectCode::InvalidArgument, "{raw}");
+                assert_eq!(
+                    err.message, "unmarshal message: invalid value for enum field signal",
+                    "{raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn send_signal_unsupported_values_still_follow_process_lookup() {
+        let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
+        for selector in [r#"{"pid":7}"#, r#"{"tag":"missing"}"#] {
+            for signal in ["99", "0", "null", r#""SIGNAL_NOPE""#, r#""15""#] {
+                let raw = format!(r#"{{"process":{selector},"signal":{signal}}}"#);
+                let req: SendSignalRequest = serde_json::from_str(&raw).unwrap();
+                let err = send_signal(&table, &req).unwrap_err();
+                assert_eq!(err.code, ConnectCode::NotFound, "{raw}");
+            }
+        }
+    }
+
     /// An unknown enum name decodes to the proto3 zero value upstream and the
     /// service answers `unimplemented`; ours must not answer a different code
     /// or leak a Rust debug repr of the value.
     #[test]
     fn send_signal_invalid_name_is_unimplemented() {
         let table = ProcessTable::new(Arc::new(crate::process::cgroup::NoopManager));
-        // The signal is parsed only after the process is found, so the entry has
-        // to exist for this shape to be reachable at all.
+        // Unsupported (but well-formed) signals are rejected only after lookup.
         let (sender, _rx) = crate::process::OutputBus::new().expect("a fresh bus");
         table.insert_process(ProcEntry {
             pid: 7,

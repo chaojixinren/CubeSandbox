@@ -93,6 +93,15 @@ python3 perf.py
 
 ## Termination metadata extension
 
+For the malformed `SendSignal` enum cases (including missing-process and
+empty-selector requests), the comparator normalizes only Go's protobuf decoder
+context: request type and line/column, with the exact invalid token checked for
+each fixture. HTTP status must remain 400, the code must be `invalid_argument`,
+and the reason must identify the invalid `signal` enum. Other fields still
+compare normally. These cases are not allowlisted; returning `not_found` or
+`unimplemented` fails the comparison. Well-formed unsupported signal values
+remain subject to process lookup before the service rejects the signal.
+
 `signal`, `oomKilled` and `killedBy` are CubeSandbox extensions to upstream's
 EndEvent. The comparison removes only these fields from EndEvent objects,
 including nested captured streams, while still comparing exit status/error.

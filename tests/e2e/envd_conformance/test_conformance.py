@@ -1,7 +1,50 @@
 import copy
+import json
 import unittest
 
-from conformance import norm_stream_frames, normalize
+from conformance import norm_stream_frames, normalize, normalize_fixture
+
+
+class SignalErrorNormalizationTests(unittest.TestCase):
+    def response(self, message):
+        return {"status": 400, "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"code": "invalid_argument", "message": message})}
+
+    def test_only_decoder_context_is_normalized(self):
+        rust = self.response("unmarshal message: invalid value for enum field signal")
+        for selector in ("", "missing_", "empty_"):
+            for kind, token in (("bool", "true"), ("object", "{"), ("array", "["),
+                                ("float", "1.5"), ("out_of_range", "2147483648")):
+                name = f"proc_send_signal_{selector}{kind}"
+                for position in ("1:36", "3:8"):
+                    go = self.response(
+                        "unmarshal message: unmarshal into *process.SendSignalRequest: "
+                        f"proto: (line {position}): invalid value for enum field signal: {token}")
+                    self.assertEqual(normalize_fixture(name, go), normalize_fixture(name, rust))
+
+    def test_status_code_reason_token_and_other_fields_remain_checked(self):
+        name = "proc_send_signal_bool"
+        message = ("unmarshal message: unmarshal into *process.SendSignalRequest: "
+                   "proto: (line 1:36): invalid value for enum field signal: true")
+        go = self.response(message)
+        expected = normalize_fixture(name, go)
+        for status in (200, 404, 501):
+            actual = copy.deepcopy(go)
+            actual["status"] = status
+            self.assertNotEqual(expected, normalize_fixture(name, actual))
+        for key, value in (("code", "not_found"), ("extra", "unexpected"),
+                           ("message", message.replace("signal:", "pid:")),
+                           ("message", message.replace("true", "false")),
+                           ("message", message + " unexpected")):
+            actual = copy.deepcopy(go)
+            body = json.loads(actual["body"])
+            body[key] = value
+            actual["body"] = json.dumps(body)
+            self.assertNotEqual(expected, normalize_fixture(name, actual))
+        actual = copy.deepcopy(go)
+        actual["headers"]["Content-Type"] = "text/plain"
+        self.assertNotEqual(expected, normalize_fixture(name, actual))
+        self.assertNotEqual(expected, normalize_fixture("unrelated_fixture", go))
 
 
 class ExtensionNormalizationTests(unittest.TestCase):

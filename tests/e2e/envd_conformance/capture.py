@@ -1179,7 +1179,8 @@ def cap_process():
         "process.Process/Connect", {"process": {"selector": {"pid": 99999}}}, timeout=8, read_deadline=5))
     # SendSignal with an unknown enum name. Upstream decodes it to the proto3
     # zero value and the service answers `unimplemented` with a fixed message;
-    # the process has to be alive for the signal to be parsed at all.
+    # the process has to be alive for this service-level rejection. Malformed
+    # enum values must instead fail decoding even when the process is missing.
     def run_bad_signal_target():
         connect_stream("process.Process/Start",
                        start_req("sleep 30", tag="baseline-bad-signal",
@@ -1205,6 +1206,17 @@ def cap_process():
         connect_unary("process.Process/SendSignal",
                       {"process": {"pid": sig_pid}, "signal": "SIGNAL_SIGKILL"})
     t_sig.join(timeout=10)
+
+    # Decode errors must precede selector validation and process lookup. Keep
+    # well-formed unsupported values as controls: those still reach lookup.
+    for selector_name, selector in (("missing", {"tag": "missing-signal-target"}),
+                                    ("empty", {})):
+        for label, value in (("bool", True), ("object", {}), ("array", []),
+                             ("float", 1.5), ("out_of_range", 2147483648),
+                             ("unknown_number", 99), ("invalid_name", "SIGNAL_NOPE"),
+                             ("null", None)):
+            record(f"proc_send_signal_{selector_name}_{label}", connect_unary(
+                "process.Process/SendSignal", {"process": selector, "signal": value}))
 
     # SendInput to non-stdin process (error shape)
     record("proc_sendinput_probe", connect_unary(
